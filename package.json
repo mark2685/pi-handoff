@@ -1,0 +1,40 @@
+{
+	"name": "pi-handoff",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"typecheck": "tsc --noEmit",
+		"test": "node --test",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"smoke": "pi --no-extensions -e . -p --no-tools \"/handoff status\"",
+		"check": "npm run typecheck && npm run test && npm run format:check && npm run smoke"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "0.85.1",
+		"@earendil-works/pi-ai": "0.85.1",
+		"@earendil-works/pi-coding-agent": "0.85.1",
+		"@earendil-works/pi-tui": "0.85.1",
+		"prettier": "^3.6.2",
+		"typebox": "^1.0.55",
+		"typescript": "^5.8.3"
+	}
+}
