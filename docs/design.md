@@ -270,15 +270,15 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 
 ## 12. Task Breakdown
 
-- [ ] T1: Scaffold package, manifest, tsconfig, test runner, layering skeleton, and `.gitignore`.
-- [ ] T2: Implement `domain/rubric` (defaults, resolution, validation) with tests.
-- [ ] T3: Implement `domain/draft` (JSON parsing, slug, feedback append) with tests.
-- [ ] T4: Implement `WorkerRunner` port and child-process adapter with abort handling.
-- [ ] T5: Implement `Git` port and adapter (checkpoint, diffstat, discard-since-checkpoint).
-- [ ] T6: Implement `HandoffMachine` and session-entry persistence with schemas.
-- [ ] T7: Implement DraftService, the drafting prompt, and Gate A including Run externally.
-- [ ] T8: Implement RunService, the running widget, and Gate B with Accept and Discard.
+- [x] T1: Scaffold package, manifest, tsconfig, test runner, layering skeleton, and `.gitignore`.
+- [x] T2: Implement `domain/rubric` (defaults, resolution, validation) with tests.
+- [x] T3: Implement `domain/draft` (JSON parsing, slug, feedback append) with tests.
+- [x] T4: Implement `WorkerRunner` port and child-process adapter with abort handling.
+- [x] T5: Implement `Git` port and adapter (checkpoint, diffstat, discard-since-checkpoint).
+- [x] T6: Implement `HandoffMachine` and session-entry persistence with schemas.
+- [x] T7: Implement DraftService, the drafting prompt, and Gate A including Run externally.
+- [x] T8: Implement RunService, the running widget, and Gate B with Accept and Discard.
 - [x] T9: Implement Review here injection, the `agent_end` reopen of Gate B, and the bounded feedback loop.
 - [x] T10: Implement `session_start` rehydration and `session_shutdown` cleanup.
-- [ ] T11: Write README and extension load test; run `npm run check`.
+- [x] T11: Write README and extension load test; run `npm run check`.
 - [ ] T12: End-to-end test in a scratch repository, including the Discard safety check.
