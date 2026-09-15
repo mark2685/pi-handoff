@@ -1,0 +1,600 @@
+/**
+ * Behavioral tests for the worker run, Discard, and their refusals.
+ *
+ * Every dependency is a fake, so these assert the decisions T8 owns rather than
+ * the behavior of Git or a child process. The safety-shaped ones matter most: a
+ * vanished model and a failed checkpoint must refuse *before* a worker spawns,
+ * an aborted run must never invent a report, and Discard must report the paths
+ * it deliberately left alone.
+ *
+ * The ordering assertions use a shared event log rather than call counts,
+ * because "the checkpoint was taken before the spawn" is the property that makes
+ * Discard safe, and a count cannot express it.
+ */
+
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { createHandoffMachine, type HandoffMachine, type HandoffState } from "../../src/app/handoff-machine.ts";
+import { createRunService, type RunOutcome, type RunProgress, type RunService } from "../../src/app/run-service.ts";
+import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
+import { err, ok, type Result } from "../../src/domain/result.ts";
+import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
+import type { Clock } from "../../src/ports/clock.ts";
+import type { DiscardOutcome, Git, GitFailure } from "../../src/ports/git.ts";
+import type { WorkerRunOutcome, WorkerRunRequest, WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
+
+const DRAFT: Draft = {
+	slug: "add-retry-logic",
+	prompt: "Implement the retry logic in src/client.ts and run `npm test`.",
+	tier: "standard",
+	rationale: "Two files, fully specified, one decisive validation command.",
+};
+
+const CHOICE: ModelChoice = { provider: "bifrost-openai", model: "gpt-5.6-terra", thinking: "high" };
+
+const CHECKPOINT: Checkpoint = {
+	repositoryRoot: "/repo",
+	head: "abc1234",
+	statuses: [{ indexStatus: " ", worktreeStatus: "M", path: "already-dirty.ts" }],
+};
+
+const USAGE: WorkerUsage = {
+	inputTokens: 100,
+	outputTokens: 50,
+	cacheReadTokens: 10,
+	cacheWriteTokens: 5,
+	cost: 0.25,
+	contextTokens: 1_200,
+	turns: 3,
+};
+
+const PROMPT_PATH = "/tmp/pi-handoff-add-retry-logic.md";
+const CWD = "/repo";
+const DIFFSTAT = " src/client.ts | 12 +++++--\n 1 file changed, 9 insertions(+), 3 deletions(-)";
+
+/** A worker outcome that completed normally, overridable per test. */
+function workerOutcome(overrides: Partial<WorkerRunOutcome> = {}): WorkerRunOutcome {
+	return {
+		exitCode: 0,
+		report: "## Summary\nAdded retry logic.",
+		usage: USAGE,
+		toolResults: [],
+		stopReason: "endTurn",
+		errorMessage: undefined,
+		stderr: "",
+		aborted: false,
+		...overrides,
+	};
+}
+
+interface Harness {
+	service: RunService;
+	machine: HandoffMachine;
+	recorded: HandoffState[];
+	requests: WorkerRunRequest[];
+	events: string[];
+	progress: RunProgress[];
+}
+
+interface HarnessOptions {
+	outcome?: WorkerRunOutcome;
+	/** Replaces the whole worker implementation, for abort and progress tests. */
+	run?: (request: WorkerRunRequest, events: string[]) => Promise<WorkerRunOutcome>;
+	checkpoint?: Result<Checkpoint, GitFailure>;
+	diffstat?: Result<string, GitFailure>;
+	discard?: Result<DiscardOutcome, GitFailure>;
+	runnable?: boolean;
+	/** Fixed millisecond readings, consumed in order, so elapsed time is deterministic. */
+	msReadings?: number[];
+	/** Skips Gate A's transitions, leaving the machine idle to test the refusal. */
+	startIdle?: boolean;
+}
+
+function createHarness(options: HarnessOptions = {}): Harness {
+	const machine = createHandoffMachine();
+	const recorded: HandoffState[] = [];
+	const requests: WorkerRunRequest[] = [];
+	const events: string[] = [];
+	const progress: RunProgress[] = [];
+
+	if (options.startIdle !== true) {
+		machine.beginDraft("add retries");
+		machine.propose(DRAFT, CHOICE);
+	}
+
+	const recorder: HandoffStateRecorder = {
+		record: (state) => {
+			recorded.push(state);
+			events.push(`record:${state.kind}`);
+		},
+	};
+
+	const runner: WorkerRunner = {
+		run: async (request) => {
+			requests.push(request);
+			events.push("spawn");
+			if (options.run !== undefined) return options.run(request, events);
+			return options.outcome ?? workerOutcome();
+		},
+	};
+
+	const git: Git = {
+		repositoryRoot: async () => ok("/repo"),
+		checkpoint: async () => {
+			events.push("checkpoint");
+			return options.checkpoint ?? ok(CHECKPOINT);
+		},
+		diffstat: async () => {
+			events.push("diffstat");
+			return options.diffstat ?? ok(DIFFSTAT);
+		},
+		discardSinceCheckpoint: async () => {
+			events.push("discard");
+			return options.discard ?? ok({ restoredPaths: [], removedPaths: [], skippedPaths: [] });
+		},
+	};
+
+	const readings = [...(options.msReadings ?? [])];
+	const clock: Clock = {
+		nowIso: () => "2026-03-09T09:00:00.000Z",
+		nowMs: () => readings.shift() ?? 0,
+	};
+
+	const service = createRunService({
+		machine,
+		runner,
+		git,
+		clock,
+		recorder,
+		isChoiceRunnable: () => options.runnable ?? true,
+	});
+
+	return { service, machine, recorded, requests, events, progress };
+}
+
+/** Starts a run with the standard options, collecting progress for assertions. */
+async function start(harness: Harness): Promise<RunOutcome> {
+	return harness.service.start({
+		promptPath: PROMPT_PATH,
+		cwd: CWD,
+		onProgress: (update) => harness.progress.push(update),
+	});
+}
+
+describe("RunService.start", () => {
+	it("reaches a completed review carrying the worker's verbatim report", async () => {
+		const harness = createHarness();
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "completed");
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.completion, "completed");
+		assert.equal(outcome.state.report, "## Summary\nAdded retry logic.");
+	});
+
+	it("records the diffstat and usage on the review state", async () => {
+		const harness = createHarness();
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.diffstat, DIFFSTAT);
+		assert.deepEqual(outcome.state.usage, USAGE);
+	});
+
+	it("leaves the machine reviewing after a clean run", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("passes the approved prompt path and cwd to the worker", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.equal(harness.requests[0]?.promptPath, PROMPT_PATH);
+		assert.equal(harness.requests[0]?.cwd, CWD);
+	});
+
+	it("spawns the worker on the approved model choice", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.deepEqual(harness.requests[0]?.choice, CHOICE);
+	});
+
+	it("takes the checkpoint before spawning the worker", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		const checkpointIndex = harness.events.indexOf("checkpoint");
+		const spawnIndex = harness.events.indexOf("spawn");
+		assert.ok(checkpointIndex >= 0 && spawnIndex >= 0);
+		assert.ok(checkpointIndex < spawnIndex, `checkpoint (${checkpointIndex}) must precede spawn (${spawnIndex})`);
+	});
+
+	it("records the running state before the worker finishes", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.equal(harness.recorded[0]?.kind, "running");
+	});
+
+	it("supplies the worker an abort signal, since the command context has none", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.ok(harness.requests[0]?.signal instanceof AbortSignal);
+	});
+
+	it("forwards worker progress with an elapsed reading for the widget", async () => {
+		const harness = createHarness({
+			msReadings: [1_000, 3_500],
+			run: async (request) => {
+				request.onProgress?.({
+					report: "partial",
+					usage: USAGE,
+					toolResults: [],
+					stopReason: undefined,
+					errorMessage: undefined,
+				});
+				return workerOutcome();
+			},
+		});
+		await start(harness);
+
+		assert.equal(harness.progress.length, 1);
+		assert.equal(harness.progress[0]?.elapsedMs, 2_500);
+	});
+});
+
+describe("RunService.start refusals", () => {
+	it("refuses a model that vanished from the registry between Gate A and spawn", async () => {
+		const harness = createHarness({ runnable: false });
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "model_unavailable");
+	});
+
+	it("does not spawn a worker when the model is unavailable", async () => {
+		const harness = createHarness({ runnable: false });
+		await start(harness);
+
+		assert.deepEqual(harness.requests, []);
+	});
+
+	it("does not take a checkpoint when the model is unavailable", async () => {
+		const harness = createHarness({ runnable: false });
+		await start(harness);
+
+		assert.ok(!harness.events.includes("checkpoint"));
+	});
+
+	it("refuses when the working directory is not a repository", async () => {
+		const harness = createHarness({
+			checkpoint: err({ kind: "not_repository", detail: "/repo is not a git repository" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "checkpoint_failed");
+		assert.equal(outcome.failure.kind, "not_repository");
+	});
+
+	it("refuses when the repository has no commit to anchor a checkpoint", async () => {
+		const harness = createHarness({ checkpoint: err({ kind: "no_head", detail: "no HEAD" }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "checkpoint_failed");
+		assert.equal(outcome.failure.kind, "no_head");
+	});
+
+	it("does not spawn a worker when the checkpoint fails", async () => {
+		const harness = createHarness({ checkpoint: err({ kind: "no_head", detail: "no HEAD" }) });
+		await start(harness);
+
+		assert.deepEqual(harness.requests, []);
+	});
+
+	it("leaves the proposal intact when a checkpoint failure refuses the run", async () => {
+		const harness = createHarness({ checkpoint: err({ kind: "no_head", detail: "no HEAD" }) });
+		await start(harness);
+
+		assert.equal(harness.machine.current().kind, "proposed");
+	});
+
+	it("refuses to start from a state that has no approved proposal", async () => {
+		const harness = createHarness({ startIdle: true });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "refused");
+		assert.equal(outcome.conflict.current, "idle");
+	});
+});
+
+describe("RunService.start interruptions", () => {
+	it("does not fabricate a report when the run was aborted", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.report, null);
+	});
+
+	it("leaves null usage and diffstat on an interrupted state rather than zeroes", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.usage, null);
+		assert.equal(outcome.state.diffstat, null);
+	});
+
+	it("explains an abort in the interruption note", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.interruptionNote, "The worker was stopped before it reported a result.");
+	});
+
+	it("marks an aborted run as aborted rather than merely reportless", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.aborted, true);
+	});
+
+	it("still reads a diffstat after an interruption, since the state stores none", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.diffstat, DIFFSTAT);
+	});
+
+	it("interrupts rather than completes when the worker fails with no report", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ report: "", exitCode: 1, errorMessage: "model overloaded" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.interruptionNote, "The worker failed: model overloaded");
+	});
+
+	it("reports a non-zero exit that produced nothing", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", exitCode: 2, stopReason: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.interruptionNote, "The worker exited with code 2 without producing a report.");
+	});
+
+	it("treats a whitespace-only report as no report at all", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "   \n  " }) });
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "interrupted");
+	});
+
+	/**
+	 * A killed worker often has already emitted assistant text. Treating that as a
+	 * completed review would let a partial, abandoned result reach Gate B as though
+	 * the worker had finished, which is the exact thing an interrupted state exists
+	 * to prevent.
+	 */
+	it("interrupts an aborted run even when the worker had already emitted text", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ report: "## Summary\nHalf-done work.", aborted: true, exitCode: undefined }),
+		});
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "interrupted");
+	});
+
+	it("does not keep an aborted run's partial text as its report", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ report: "## Summary\nHalf-done work.", aborted: true, exitCode: undefined }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.report, null);
+	});
+
+	it("says the partial output was discarded, since the user watched it appear", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ report: "## Summary\nHalf-done work.", aborted: true, exitCode: undefined }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(
+			outcome.state.interruptionNote,
+			"The worker was stopped mid-run. Its partial output is not treated as a report.",
+		);
+	});
+
+	it("keeps a report the worker produced before exiting non-zero", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ exitCode: 1, report: "## Summary\nPartial work." }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.report, "## Summary\nPartial work.");
+	});
+
+	it("surfaces a diffstat failure instead of failing the whole run", async () => {
+		const harness = createHarness({
+			diffstat: err({ kind: "command_failed", command: "git diff --stat", detail: "index locked" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.diffstatFailure?.kind, "command_failed");
+	});
+
+	it("leaves the diffstat empty rather than storing an error message as one", async () => {
+		const harness = createHarness({
+			diffstat: err({ kind: "command_failed", command: "git diff --stat", detail: "index locked" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.diffstat, "");
+	});
+});
+
+describe("RunService.abortActiveRun", () => {
+	it("aborts the signal the worker is watching, which is what kills the child", async () => {
+		let observed: AbortSignal | undefined;
+		const harness = createHarness({
+			run: async (request) => {
+				observed = request.signal;
+				// The real adapter resolves only after SIGTERM/SIGKILL; this stands in for that.
+				return new Promise<WorkerRunOutcome>((resolve) => {
+					request.signal?.addEventListener("abort", () => {
+						resolve(workerOutcome({ report: "", aborted: true, exitCode: undefined }));
+					});
+				});
+			},
+		});
+
+		const running = start(harness);
+		await Promise.resolve();
+		const stopped = harness.service.abortActiveRun();
+		const outcome = await running;
+
+		assert.equal(stopped, true);
+		assert.equal(observed?.aborted, true);
+		assert.equal(outcome.kind, "interrupted");
+	});
+
+	it("reports that nothing was stopped when no worker is running", () => {
+		const harness = createHarness();
+
+		assert.equal(harness.service.abortActiveRun(), false);
+	});
+
+	it("reports no active run once a worker has finished", async () => {
+		const harness = createHarness();
+		await start(harness);
+
+		assert.equal(harness.service.isRunning(), false);
+	});
+
+	it("reports an active run while the worker is in flight", async () => {
+		let release: (() => void) | undefined;
+		const harness = createHarness({
+			run: async () =>
+				new Promise<WorkerRunOutcome>((resolve) => {
+					release = () => resolve(workerOutcome());
+				}),
+		});
+
+		const running = start(harness);
+		await Promise.resolve();
+		const duringRun = harness.service.isRunning();
+		release?.();
+		await running;
+
+		assert.equal(duringRun, true);
+	});
+});
+
+describe("RunService.discard", () => {
+	it("reports the paths it deliberately left alone", async () => {
+		const harness = createHarness({
+			discard: ok({
+				restoredPaths: ["src/client.ts"],
+				removedPaths: ["src/new-file.ts"],
+				skippedPaths: ["already-dirty.ts"],
+			}),
+		});
+		await start(harness);
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(discarded.ok);
+		assert.deepEqual(discarded.value.skippedPaths, ["already-dirty.ts"]);
+	});
+
+	it("reports restored and removed paths separately", async () => {
+		const harness = createHarness({
+			discard: ok({
+				restoredPaths: ["src/client.ts"],
+				removedPaths: ["src/new-file.ts"],
+				skippedPaths: [],
+			}),
+		});
+		await start(harness);
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(discarded.ok);
+		assert.deepEqual(discarded.value.restoredPaths, ["src/client.ts"]);
+		assert.deepEqual(discarded.value.removedPaths, ["src/new-file.ts"]);
+	});
+
+	it("returns to idle after a successful discard", async () => {
+		const harness = createHarness();
+		await start(harness);
+		await harness.service.discard(CWD);
+
+		assert.equal(harness.machine.current().kind, "idle");
+	});
+
+	it("refuses to discard when HEAD moved since the checkpoint", async () => {
+		const harness = createHarness({
+			discard: err({ kind: "head_changed", checkpointHead: "abc1234", currentHead: "def5678" }),
+		});
+		await start(harness);
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(!discarded.ok);
+		assert.equal(discarded.error.kind, "head_changed");
+	});
+
+	it("stays in review when a discard is refused, so the changes remain recoverable", async () => {
+		const harness = createHarness({
+			discard: err({ kind: "head_changed", checkpointHead: "abc1234", currentHead: "def5678" }),
+		});
+		await start(harness);
+		await harness.service.discard(CWD);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("refuses to discard with no checkpointed handoff", async () => {
+		const harness = createHarness({ startIdle: true });
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(!discarded.ok);
+		assert.equal(discarded.error.kind, "conflict");
+	});
+
+	it("discards against the checkpoint taken before the run", async () => {
+		const harness = createHarness();
+		await start(harness);
+		await harness.service.discard(CWD);
+
+		assert.ok(harness.events.includes("discard"));
+	});
+});
+
+describe("RunService.diffstat", () => {
+	it("reads the diffstat for the pending review", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const result = await harness.service.diffstat(CWD);
+
+		assert.ok(result.ok);
+		assert.equal(result.value, DIFFSTAT);
+	});
+
+	it("refuses with no checkpointed handoff", async () => {
+		const harness = createHarness({ startIdle: true });
+		const result = await harness.service.diffstat(CWD);
+
+		assert.ok(!result.ok);
+		assert.equal(result.error.kind, "conflict");
+	});
+});
