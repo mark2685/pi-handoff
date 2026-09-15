@@ -63,23 +63,34 @@ export type GateBOptionId = "accept" | "discard" | "review" | "feedback" | "dism
 /**
  * Builds Gate B's options in the design's order.
  *
- * Review here and Send feedback to worker belong to a later task. They are shown
- * as explicitly blocked rather than omitted, following the same convention as
- * Gate A's blocked Run: the design describes four options, and a gate that
- * silently offers two would read as the feature being absent rather than pending.
- * The caller refuses them and says which task owns them.
+ * `interrupted` drops Review here entirely rather than blocking it, because there
+ * is no report to review; offering it at all would imply one exists. Send feedback
+ * survives an interrupted run on purpose — re-running after a crash is exactly
+ * what a user wants there — so it is shown as long as the bound allows it.
  *
- * `interrupted` drops Review here even as a blocked entry, because there is no
- * report to review; offering it at all would imply one exists.
+ * When the iteration bound is reached, feedback is shown as explicitly blocked
+ * rather than omitted, following the same convention as Gate A's blocked Run: a
+ * silently missing option reads as a broken gate, while a blocked one states the
+ * rule. The caller refuses it either way, because a label is a hint and the
+ * service is the guarantee.
  */
-export function gateBMenu(options: { interrupted: boolean }): MenuOption<GateBOptionId>[] {
+export function gateBMenu(options: {
+	interrupted: boolean;
+	/** Present when a review is pending, describing whether another iteration is allowed. */
+	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
+}): MenuOption<GateBOptionId>[] {
 	const reviewOptions: MenuOption<GateBOptionId>[] = options.interrupted
 		? []
-		: [{ id: "review", label: "Review here (not implemented yet)" }];
+		: [{ id: "review", label: "Review here" }];
+
+	const feedbackLabel =
+		options.feedback !== undefined && !options.feedback.allowed
+			? `Send feedback to worker (blocked: iteration ${options.feedback.iteration} of ${options.feedback.maxIterations} is the last)`
+			: "Send feedback to worker";
 
 	return [
 		...reviewOptions,
-		{ id: "feedback", label: "Send feedback to worker (not implemented yet)" },
+		{ id: "feedback", label: feedbackLabel },
 		{ id: "discard", label: "Discard changes" },
 		{ id: "accept", label: options.interrupted ? "Accept (keep the tree as it is)" : "Accept" },
 		{ id: "dismiss", label: "Leave this for later" },

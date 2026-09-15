@@ -6,30 +6,34 @@
  * than fall through to a decision. Every branch that ends the handoff routes
  * through the service so the machine and its session entries stay consistent.
  *
- * Two guards are deliberate. Non-interactive modes never open a gate, so
- * `/handoff status` keeps working headlessly while drafting refuses cleanly. And
- * Run re-checks the chosen model against the live registry at the moment of the
- * click, not just when the tier resolved, because a provider can disappear while
- * the gate sits open.
+ * Gate B's own loop lives in `gate-b-flow.ts`, because the `agent_end` reopen and
+ * `/handoff` while a review is pending both need it and neither goes through
+ * drafting.
+ *
+ * Three guards are deliberate. Non-interactive modes never open a gate, so
+ * `/handoff status` keeps working headlessly while drafting refuses cleanly. Run
+ * re-checks the chosen model against the live registry at the moment of the click,
+ * not just when the tier resolved, because a provider can disappear while the gate
+ * sits open. And a pending review short-circuits before drafting: the machine
+ * would refuse a new draft anyway, so reopening the gate the user already has is
+ * the only useful thing `/handoff` can do there.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DraftOutcome, DraftReady, DraftService } from "../app/draft-service.ts";
 import type { HandoffMachine } from "../app/handoff-machine.ts";
 import type { RunOutcome, RunService } from "../app/run-service.ts";
-import type { HandoffReportRecorder } from "../app/state-recorder.ts";
 import { buildLaunchCommand, formatModelChoice } from "../domain/draft/launch.ts";
-import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Clipboard } from "../ports/clipboard.ts";
-import type { GitFailure } from "../ports/git.ts";
 import { withLoader } from "../presentation/drafting-loader.ts";
 import { openGateA } from "../presentation/gate-a.ts";
-import { openAcknowledgement, openGateB, type GateBView } from "../presentation/gate-b.ts";
-import { confirmDiscardMenu, selectOption, unparseableMenu } from "../presentation/menus.ts";
+import { describeGitFailure } from "../presentation/git-failure.ts";
+import { selectOption, unparseableMenu } from "../presentation/menus.ts";
 import { pickModel } from "../presentation/model-picker.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
+import type { GateBFlow } from "./gate-b-flow.ts";
 import { parseHandoffCommand } from "./parse.ts";
 import { formatHandoffStatus } from "./status.ts";
 
@@ -37,31 +41,14 @@ export interface HandoffCommandDeps {
 	machine: HandoffMachine;
 	/** Constructed per invocation, because the drafting model depends on the live context. */
 	createService: (ctx: ExtensionContext) => DraftService | undefined;
-	/** Constructed per invocation for the same reason, since Run re-checks the live registry. */
-	createRunService: (ctx: ExtensionContext, service: DraftService) => RunService;
+	/** Session-scoped, so a reopened gate and the shutdown hook reach the same run. */
+	runService: RunService;
+	/** Session-scoped for the same reason: `agent_end` has no invocation to build one in. */
+	gateBFlow: GateBFlow;
+	/** Re-checked at every click, so a vanished provider blocks the spawn. */
+	isChoiceRunnable: (ctx: ExtensionContext, choice: ModelChoice | undefined) => boolean;
 	clipboard: Clipboard;
-	reportRecorder: HandoffReportRecorder;
 	clock: Clock;
-}
-
-/** Renders a Git failure as a sentence a user can act on. */
-function describeGitFailure(failure: GitFailure): string {
-	switch (failure.kind) {
-		case "not_repository":
-			return `This directory is not a Git repository (${failure.detail})`;
-		case "no_head":
-			return `This repository has no commit to check against (${failure.detail})`;
-		case "repository_changed":
-			return `The repository moved from ${failure.checkpointRoot} to ${failure.currentRoot}`;
-		case "head_changed":
-			return `HEAD moved from ${failure.checkpointHead} to ${failure.currentHead} since the checkpoint`;
-		case "invalid_checkpoint":
-			return `The checkpoint could not be used (${failure.detail})`;
-		case "invalid_porcelain":
-			return `Git reported a status this extension could not read (${failure.detail})`;
-		case "command_failed":
-			return `\`${failure.command}\` failed: ${failure.detail}`;
-	}
 }
 
 /** Renders a draft outcome that ends the flow before Gate A. */
@@ -120,7 +107,7 @@ async function runExternally(ctx: ExtensionContext, clipboard: Clipboard, view: 
 
 /** Creates the `/handoff` handler. */
 export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
-	const { machine, createService, createRunService, clipboard, reportRecorder, clock } = deps;
+	const { machine, createService, runService, gateBFlow, isChoiceRunnable, clipboard, clock } = deps;
 
 	/**
 	 * Runs the worker behind the live widget and returns its outcome.
@@ -131,7 +118,6 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 	 */
 	async function runWorker(
 		ctx: ExtensionContext,
-		runService: RunService,
 		view: DraftReady,
 		choice: ModelChoice,
 	): Promise<RunOutcome | undefined> {
@@ -139,7 +125,13 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 			ctx,
 			{ slug: view.draft.slug, choice, promptPath: view.promptPath },
 			{ nowMs: () => clock.nowMs(), onAbort: () => runService.abortActiveRun() },
-			(onProgress) => runService.start({ promptPath: view.promptPath, cwd: ctx.cwd, onProgress }),
+			(onProgress) =>
+				runService.start({
+					promptPath: view.promptPath,
+					cwd: ctx.cwd,
+					onProgress,
+					isChoiceRunnable: (candidate) => isChoiceRunnable(ctx, candidate),
+				}),
 		);
 
 		if (rendered.kind === "failed") {
@@ -149,39 +141,6 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 		}
 
 		return rendered.value;
-	}
-
-	/** Builds Gate B's view from a run outcome that reached a review state. */
-	function buildGateBView(view: DraftReady, choice: ModelChoice, outcome: RunOutcome): GateBView | undefined {
-		const base = { slug: view.draft.slug, choice, promptPath: view.promptPath };
-
-		if (outcome.kind === "completed") {
-			return {
-				...base,
-				iteration: outcome.state.iteration,
-				report: outcome.state.report,
-				diffstat: outcome.state.diffstat,
-				diffstatFailure:
-					outcome.diffstatFailure === undefined ? undefined : describeGitFailure(outcome.diffstatFailure),
-				usage: outcome.state.usage,
-				interruptionNote: undefined,
-			};
-		}
-
-		if (outcome.kind === "interrupted") {
-			return {
-				...base,
-				iteration: outcome.state.iteration,
-				report: null,
-				diffstat: outcome.diffstat,
-				diffstatFailure:
-					outcome.diffstatFailure === undefined ? undefined : describeGitFailure(outcome.diffstatFailure),
-				usage: null,
-				interruptionNote: outcome.state.interruptionNote,
-			};
-		}
-
-		return undefined;
 	}
 
 	/** Reports a run outcome that never reached a review state. */
@@ -209,85 +168,6 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 		}
 	}
 
-	/** Discards the worker's changes, always reporting which paths were left alone. */
-	async function discardChanges(ctx: ExtensionContext, runService: RunService): Promise<boolean> {
-		const confirmed = await selectOption(
-			(title, options) => ctx.ui.select(title, options),
-			"Discard the worker's changes?",
-			confirmDiscardMenu(),
-		);
-		if (confirmed !== "discard") return false;
-
-		const discarded = await runService.discard(ctx.cwd);
-		if (!discarded.ok) {
-			const message =
-				discarded.error.kind === "conflict"
-					? discarded.error.message
-					: `Nothing was discarded. ${describeGitFailure(discarded.error)}`;
-			ctx.ui.notify(message, "error");
-			return false;
-		}
-
-		// Always acknowledged, never a transient notify: skipped paths are the one thing
-		// here a user cannot afford to scroll past.
-		await openAcknowledgement(ctx, formatDiscardHeadline(discarded.value), formatDiscardSummary(discarded.value), {
-			warning: discarded.value.skippedPaths.length > 0,
-		});
-		return true;
-	}
-
-	/** Records the accepted report and returns to idle, committing nothing. */
-	function acceptRun(ctx: ExtensionContext, gateB: GateBView): void {
-		if (gateB.report !== null) {
-			reportRecorder.record({
-				slug: gateB.slug,
-				model: formatModelChoice(gateB.choice),
-				iteration: gateB.iteration,
-				report: gateB.report,
-				diffstat: gateB.diffstat,
-				acceptedAt: clock.nowIso(),
-			});
-		}
-
-		machine.reset();
-		ctx.ui.notify("Handoff accepted. The working tree is unchanged and nothing was committed.", "info");
-	}
-
-	/** Keeps Gate B open until the user accepts, discards, or leaves it pending. */
-	async function reviewRun(ctx: ExtensionContext, runService: RunService, gateB: GateBView): Promise<void> {
-		for (;;) {
-			const selected = await openGateB(ctx, gateB);
-
-			if (selected === undefined || selected === "dismiss") {
-				// Reopening a dismissed gate belongs to a later task, so this does not promise it.
-				ctx.ui.notify(
-					"Review left pending. The worker's changes are still in the working tree, and a new handoff is refused until this one is accepted or discarded.",
-					"info",
-				);
-				return;
-			}
-
-			if (selected === "accept") {
-				acceptRun(ctx, gateB);
-				return;
-			}
-
-			if (selected === "discard") {
-				const discarded = await discardChanges(ctx, runService);
-				if (discarded) return;
-				continue;
-			}
-
-			// Review here and Send feedback to worker are shown blocked; a later task owns them.
-			ctx.ui.notify(
-				selected === "review"
-					? "Review here is not implemented yet. Accept or discard for now."
-					: "Sending feedback to the worker is not implemented yet. Accept or discard for now.",
-				"warning",
-			);
-		}
-	}
-
 	return async function handleHandoffCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		const command = parseHandoffCommand(args);
 
@@ -305,6 +185,17 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify("/handoff requires interactive mode; use /handoff status elsewhere", "error");
 			return;
+		}
+
+		// A pending review is reopened rather than drafted over. Drafting would be refused
+		// by the machine anyway, and Gate B already carries Discard and Accept, so there is
+		// nothing to ask the user first.
+		if (machine.reviewing() !== undefined) {
+			const pending = await gateBFlow.viewFromPendingReview(ctx);
+			if (pending !== undefined) {
+				await gateBFlow.run(ctx, pending);
+				return;
+			}
 		}
 
 		const service = createService(ctx);
@@ -356,7 +247,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 
 		// Gate A stays open across Edit prompt and Change model.
 		for (;;) {
-			const runnable = service.isChoiceRunnable(view.choice);
+			const runnable = isChoiceRunnable(ctx, view.choice);
 			const selected = await openGateA(ctx, { ...view, runnable });
 
 			if (selected === undefined || selected === "cancel") {
@@ -373,11 +264,13 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 					continue;
 				}
 
-				const runService = createRunService(ctx, service);
-				const outcome = await runWorker(ctx, runService, view, choice);
+				const outcome = await runWorker(ctx, view, choice);
 				if (outcome === undefined) return;
 
-				const gateB = buildGateBView(view, choice, outcome);
+				const gateB = gateBFlow.viewFromOutcome(
+					{ slug: view.draft.slug, choice, promptPath: view.promptPath },
+					outcome,
+				);
 				if (gateB === undefined) {
 					// The run never started; Gate A stays open so the user can fix the cause.
 					reportRunRefusal(ctx, outcome);
@@ -385,7 +278,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 					continue;
 				}
 
-				await reviewRun(ctx, runService, gateB);
+				await gateBFlow.run(ctx, gateB);
 				return;
 			}
 

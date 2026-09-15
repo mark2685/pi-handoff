@@ -1,11 +1,12 @@
 /**
- * Behavioral tests for the worker run, Discard, and their refusals.
+ * Behavioral tests for the worker run, restart, Discard, and their refusals.
  *
- * Every dependency is a fake, so these assert the decisions T8 owns rather than
- * the behavior of Git or a child process. The safety-shaped ones matter most: a
- * vanished model and a failed checkpoint must refuse *before* a worker spawns,
- * an aborted run must never invent a report, and Discard must report the paths
- * it deliberately left alone.
+ * Every dependency is a fake, so these assert the decisions the run service owns
+ * rather than the behavior of Git or a child process. The safety-shaped ones
+ * matter most: a vanished model and a failed checkpoint must refuse *before* a
+ * worker spawns, an aborted run must never invent a report, a restart must reuse
+ * the original checkpoint so Discard still covers every iteration, and Discard
+ * must report the paths it deliberately left alone.
  *
  * The ordering assertions use a shared event log rather than call counts,
  * because "the checkpoint was taken before the spawn" is the property that makes
@@ -74,6 +75,8 @@ interface Harness {
 	requests: WorkerRunRequest[];
 	events: string[];
 	progress: RunProgress[];
+	/** The live-registry check, now supplied per call rather than at construction. */
+	runnable: () => boolean;
 }
 
 interface HarnessOptions {
@@ -146,10 +149,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		git,
 		clock,
 		recorder,
-		isChoiceRunnable: () => options.runnable ?? true,
 	});
 
-	return { service, machine, recorded, requests, events, progress };
+	return { service, machine, recorded, requests, events, progress, runnable: () => options.runnable ?? true };
 }
 
 /** Starts a run with the standard options, collecting progress for assertions. */
@@ -157,6 +159,19 @@ async function start(harness: Harness): Promise<RunOutcome> {
 	return harness.service.start({
 		promptPath: PROMPT_PATH,
 		cwd: CWD,
+		isChoiceRunnable: harness.runnable,
+		onProgress: (update) => harness.progress.push(update),
+	});
+}
+
+/** Restarts a run for a feedback iteration, with the revised prompt on disk already. */
+async function restart(harness: Harness, overrides: { iteration?: number; draft?: Draft } = {}): Promise<RunOutcome> {
+	return harness.service.restart({
+		promptPath: PROMPT_PATH,
+		cwd: CWD,
+		iteration: overrides.iteration ?? 2,
+		draft: overrides.draft ?? { ...DRAFT, prompt: `${DRAFT.prompt}\n\n## Review feedback (iteration 2)\n\nFix it.` },
+		isChoiceRunnable: harness.runnable,
 		onProgress: (update) => harness.progress.push(update),
 	});
 }
@@ -499,6 +514,192 @@ describe("RunService.abortActiveRun", () => {
 		await running;
 
 		assert.equal(duringRun, true);
+	});
+});
+
+describe("RunService.restart", () => {
+	it("runs another iteration from a pending review", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const outcome = await restart(harness);
+
+		assert.equal(outcome.kind, "completed");
+	});
+
+	/**
+	 * The whole point of reusing the checkpoint: Discard after iteration 3 must still
+	 * revert iteration 1's edits. A fresh checkpoint per iteration would strand them.
+	 */
+	it("reuses the checkpoint taken before the first iteration", async () => {
+		const harness = createHarness();
+		await start(harness);
+		await restart(harness);
+
+		assert.equal(harness.events.filter((event) => event === "checkpoint").length, 1);
+	});
+
+	it("carries the original checkpoint onto the restarted run state", async () => {
+		const harness = createHarness();
+		await start(harness);
+		let observed: Checkpoint | undefined;
+		const service = harness.service;
+		const restarted = service.restart({
+			promptPath: PROMPT_PATH,
+			cwd: CWD,
+			iteration: 2,
+			draft: DRAFT,
+			isChoiceRunnable: () => {
+				observed = harness.machine.reviewing()?.checkpoint;
+				return true;
+			},
+		});
+		await restarted;
+
+		assert.deepEqual(observed, CHECKPOINT);
+	});
+
+	it("records the given iteration on the restarted run", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const outcome = await restart(harness, { iteration: 3 });
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.iteration, 3);
+	});
+
+	it("runs the worker against the revised prompt's draft", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const revised: Draft = { ...DRAFT, prompt: "Revised with feedback." };
+		await restart(harness, { draft: revised });
+
+		assert.equal(harness.machine.reviewing()?.draft.prompt, "Revised with feedback.");
+	});
+
+	it("records the running state before the restarted worker finishes", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const before = harness.recorded.length;
+		await restart(harness);
+
+		assert.equal(harness.recorded[before]?.kind, "running");
+	});
+
+	it("refuses to restart when no review is pending", async () => {
+		const harness = createHarness({ startIdle: true });
+		const outcome = await restart(harness);
+
+		assert.ok(outcome.kind === "refused");
+		assert.equal(outcome.conflict.current, "idle");
+	});
+
+	it("refuses to restart from a proposal that never ran", async () => {
+		const harness = createHarness();
+		const outcome = await restart(harness);
+
+		assert.ok(outcome.kind === "refused");
+		assert.equal(outcome.conflict.current, "proposed");
+	});
+
+	it("does not spawn a worker when the restart is refused", async () => {
+		const harness = createHarness({ startIdle: true });
+		await restart(harness);
+
+		assert.deepEqual(harness.requests, []);
+	});
+
+	it("refuses a restart whose model vanished from the registry", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const outcome = await harness.service.restart({
+			promptPath: PROMPT_PATH,
+			cwd: CWD,
+			iteration: 2,
+			draft: DRAFT,
+			isChoiceRunnable: () => false,
+		});
+
+		assert.equal(outcome.kind, "model_unavailable");
+	});
+
+	it("leaves the review pending when a restart is refused for an unavailable model", async () => {
+		const harness = createHarness();
+		await start(harness);
+		await harness.service.restart({
+			promptPath: PROMPT_PATH,
+			cwd: CWD,
+			iteration: 2,
+			draft: DRAFT,
+			isChoiceRunnable: () => false,
+		});
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("interrupts a restarted run that produced no report", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", exitCode: 1 }) });
+		await start(harness);
+		const outcome = await restart(harness);
+
+		assert.equal(outcome.kind, "interrupted");
+	});
+
+	it("restarts from an interrupted review, so a crashed run can be retried", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", exitCode: 1 }) });
+		await start(harness);
+		assert.equal(harness.machine.reviewing()?.completion, "interrupted");
+
+		const outcome = await restart(harness);
+		assert.notEqual(outcome.kind, "refused");
+	});
+});
+
+describe("RunService.whenSettled", () => {
+	/**
+	 * `session_shutdown` awaits this. Aborting only requests the kill, so a hook that
+	 * returned at the abort would let Pi exit while the child still held the tree.
+	 */
+	it("resolves only after an aborted run has finished settling", async () => {
+		let resolveWorker: (() => void) | undefined;
+		const harness = createHarness({
+			run: async (request) =>
+				new Promise<WorkerRunOutcome>((resolve) => {
+					request.signal?.addEventListener("abort", () => {
+						// Stands in for the adapter's SIGTERM-then-SIGKILL delay.
+						resolveWorker = () => resolve(workerOutcome({ report: "", aborted: true, exitCode: undefined }));
+					});
+				}),
+		});
+
+		const running = start(harness);
+		await Promise.resolve();
+		harness.service.abortActiveRun();
+
+		let settled = false;
+		const waiting = harness.service.whenSettled().then(() => {
+			settled = true;
+		});
+
+		await Promise.resolve();
+		assert.equal(settled, false, "whenSettled must not resolve while the child is still dying");
+
+		resolveWorker?.();
+		await running;
+		await waiting;
+		assert.equal(settled, true);
+	});
+
+	it("resolves immediately when no worker is running", async () => {
+		const harness = createHarness();
+		await harness.service.whenSettled();
+	});
+
+	it("resolves after a run that completed normally", async () => {
+		const harness = createHarness();
+		await start(harness);
+		await harness.service.whenSettled();
+
+		assert.equal(harness.service.isRunning(), false);
 	});
 });
 

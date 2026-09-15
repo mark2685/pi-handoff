@@ -194,12 +194,44 @@ describe("gateBMenu", () => {
 		assert.ok(ids.includes("discard"));
 	});
 
-	it("shows the later task's options as explicitly unimplemented rather than hiding them", () => {
+	it("labels the live options plainly once they are implemented", () => {
 		const options = gateBMenu({ interrupted: false });
 		const review = options.find((option) => option.id === "review");
 		const feedback = options.find((option) => option.id === "feedback");
-		assert.equal(review?.label, "Review here (not implemented yet)");
-		assert.equal(feedback?.label, "Send feedback to worker (not implemented yet)");
+		assert.equal(review?.label, "Review here");
+		assert.equal(feedback?.label, "Send feedback to worker");
+	});
+
+	/** Same convention as Gate A's blocked Run: a missing option reads as a broken gate. */
+	it("shows feedback as blocked once the iteration bound is reached", () => {
+		const options = gateBMenu({
+			interrupted: false,
+			feedback: { allowed: false, iteration: 3, maxIterations: 3 },
+		});
+		const feedback = options.find((option) => option.id === "feedback");
+		assert.equal(feedback?.label, "Send feedback to worker (blocked: iteration 3 of 3 is the last)");
+	});
+
+	it("keeps the blocked feedback option present so the rule is visible", () => {
+		const ids = gateBMenu({
+			interrupted: false,
+			feedback: { allowed: false, iteration: 3, maxIterations: 3 },
+		}).map((option) => option.id);
+		assert.ok(ids.includes("feedback"));
+	});
+
+	it("labels feedback plainly while iterations remain", () => {
+		const options = gateBMenu({
+			interrupted: false,
+			feedback: { allowed: true, iteration: 1, maxIterations: 3 },
+		});
+		assert.equal(options.find((option) => option.id === "feedback")?.label, "Send feedback to worker");
+	});
+
+	/** Re-running after a crash is exactly what a user wants from an interrupted review. */
+	it("still offers feedback after an interrupted run", () => {
+		const ids = gateBMenu({ interrupted: true }).map((option) => option.id);
+		assert.ok(ids.includes("feedback"));
 	});
 
 	it("omits Review here when there is no report to review", () => {

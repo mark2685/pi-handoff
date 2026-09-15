@@ -1,0 +1,408 @@
+/**
+ * Behavioral tests for the Gate B loop and the `agent_end` reopen.
+ *
+ * These exist mainly for one ordering property that no other test can express:
+ * `agent_end` must clear the review arm *before* it opens Gate B. Pi's
+ * `_runAgentPrompt` loops on auto-retry, so more than one `agent_end` per prompt is
+ * normal, and a flag cleared only after the gate closed would let the second event
+ * stack a second gate behind the first. The double-fire test below is what pins
+ * that; removing the clear makes it fail.
+ *
+ * Gate B is faked at `ctx.ui.custom`, which resolves queued option ids without
+ * constructing the overlay. That keeps these tests about the flow's decisions
+ * rather than about rendering, matching how the gate formatters are tested
+ * separately as pure functions.
+ *
+ * The feedback branch is deliberately not driven here: it runs behind
+ * `runWithWidget`, which only performs its operation when a real TUI invokes the
+ * component factory. Its decisions — the bound, the write ordering, the refusals —
+ * are covered against `ReviewService` directly instead.
+ */
+
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createHandoffMachine, type HandoffMachine } from "../../src/app/handoff-machine.ts";
+import { createReviewService } from "../../src/app/review-service.ts";
+import { createRunService, type RunService } from "../../src/app/run-service.ts";
+import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
+import { createGateBFlow, type GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import { ok } from "../../src/domain/result.ts";
+import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
+import type { Clock } from "../../src/ports/clock.ts";
+import type { Git } from "../../src/ports/git.ts";
+import type { PromptFileWriter } from "../../src/ports/prompt-file-writer.ts";
+import type { WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
+
+const DRAFT: Draft = {
+	slug: "add-retry-logic",
+	prompt: "# Add retry logic\n\nImplement retries in src/client.ts.",
+	tier: "standard",
+	rationale: "Fully specified.",
+};
+
+const CHOICE: ModelChoice = { provider: "bifrost-openai", model: "gpt-5.6-terra", thinking: "high" };
+const CHECKPOINT: Checkpoint = { repositoryRoot: "/repo", head: "abc1234", statuses: [] };
+
+const USAGE: WorkerUsage = {
+	inputTokens: 10,
+	outputTokens: 5,
+	cacheReadTokens: 0,
+	cacheWriteTokens: 0,
+	cost: 0,
+	contextTokens: 100,
+	turns: 1,
+};
+
+const REPORT = "## Summary\nAdded retries.";
+const DIFFSTAT = " src/client.ts | 4 ++--";
+const PROMPT_PATH = "/tmp/pi-handoff-add-retry-logic.md";
+const CWD = "/repo";
+
+interface Harness {
+	flow: GateBFlow;
+	machine: HandoffMachine;
+	runService: RunService;
+	ctx: ExtensionContext;
+	/** One entry per `ctx.ui.custom` call, so a stacked second gate is visible. */
+	overlays: number[];
+	notifications: { message: string; level?: string }[];
+	messages: string[];
+}
+
+interface HarnessOptions {
+	/** Option ids resolved by successive Gate B renders, in order. */
+	selections?: (string | undefined)[];
+	interrupted?: boolean;
+	maxIterations?: number;
+}
+
+function createHarness(options: HarnessOptions = {}): Harness {
+	const machine = createHandoffMachine();
+	const overlays: number[] = [];
+	const notifications: { message: string; level?: string }[] = [];
+	const messages: string[] = [];
+	const selections = [...(options.selections ?? [])];
+
+	const recorder: HandoffStateRecorder = { record: () => {} };
+	const reportRecorder: HandoffReportRecorder = { record: () => {} };
+	const promptWriter: PromptFileWriter = { write: async () => ok(undefined) };
+
+	const runner: WorkerRunner = {
+		run: async () => ({
+			exitCode: options.interrupted === true ? 1 : 0,
+			report: options.interrupted === true ? "" : REPORT,
+			usage: USAGE,
+			toolResults: [],
+			stopReason: "endTurn",
+			errorMessage: undefined,
+			stderr: "",
+			aborted: false,
+		}),
+	};
+
+	const git: Git = {
+		repositoryRoot: async () => ok("/repo"),
+		checkpoint: async () => ok(CHECKPOINT),
+		diffstat: async () => ok(DIFFSTAT),
+		discardSinceCheckpoint: async () => ok({ restoredPaths: [], removedPaths: [], skippedPaths: [] }),
+	};
+
+	const clock: Clock = { nowIso: () => "2026-03-09T09:00:00.000Z", nowMs: () => 0 };
+
+	const runService = createRunService({ machine, runner, git, clock, recorder });
+	const reviewService = createReviewService({
+		machine,
+		runService,
+		promptWriter,
+		reportRecorder,
+		recorder,
+		clock,
+		maxIterations: options.maxIterations ?? 3,
+	});
+
+	const ctx = {
+		mode: "tui",
+		hasUI: true,
+		cwd: CWD,
+		ui: {
+			notify: (message: string, level?: string) => {
+				notifications.push({ message, ...(level === undefined ? {} : { level }) });
+			},
+			// The factory is never invoked: these tests assert which option the flow acted
+			// on, not how the overlay draws. Counting calls is what exposes a second gate.
+			custom: async () => {
+				overlays.push(overlays.length);
+				return selections.shift();
+			},
+			select: async () => undefined,
+			editor: async () => undefined,
+		},
+	} as unknown as ExtensionContext;
+
+	const flow = createGateBFlow({
+		machine,
+		runService,
+		reviewService,
+		clock,
+		isChoiceRunnable: () => true,
+		sendUserMessage: (content) => {
+			messages.push(content);
+		},
+	});
+
+	return { flow, machine, runService, ctx, overlays, notifications, messages };
+}
+
+/** Drives the machine to a pending review, which is Gate B's precondition. */
+async function reachReview(harness: Harness): Promise<void> {
+	harness.machine.beginDraft("add retries");
+	harness.machine.propose(DRAFT, CHOICE);
+	await harness.runService.start({ promptPath: PROMPT_PATH, cwd: CWD, isChoiceRunnable: () => true });
+}
+
+describe("GateBFlow.viewFromPendingReview", () => {
+	it("builds a view from the review the machine holds", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+
+		assert.ok(view);
+		assert.equal(view.slug, "add-retry-logic");
+		assert.equal(view.report, REPORT);
+	});
+
+	it("carries the feedback allowance so the menu can label the bound", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+
+		assert.deepEqual(view?.feedback, { allowed: true, iteration: 1, maxIterations: 3 });
+	});
+
+	/** An interrupted state stores no diffstat, so it has to be read live. */
+	it("reads a live diffstat for an interrupted review", async () => {
+		const harness = createHarness({ interrupted: true });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+
+		assert.equal(view?.report, null);
+		assert.equal(view?.diffstat, DIFFSTAT);
+	});
+
+	it("builds nothing when no review is pending", async () => {
+		const harness = createHarness();
+
+		assert.equal(await harness.flow.viewFromPendingReview(harness.ctx), undefined);
+	});
+});
+
+describe("GateBFlow.run", () => {
+	it("accepts the review and returns to idle", async () => {
+		const harness = createHarness({ selections: ["accept"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.current().kind, "idle");
+	});
+
+	it("leaves the review pending when the gate is dismissed", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("promises that /handoff reopens a dismissed review", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.notifications[0]?.message ?? "", /`\/handoff` reopens this review/);
+	});
+
+	it("treats an escaped gate as leaving the review pending", async () => {
+		const harness = createHarness({ selections: [undefined] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("injects the review message when Review here is chosen", async () => {
+		const harness = createHarness({ selections: ["review"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.messages.length, 1);
+		assert.ok(harness.messages[0]?.includes(REPORT));
+	});
+
+	it("arms the review turn before returning", async () => {
+		const harness = createHarness({ selections: ["review"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
+	});
+
+	/**
+	 * The handler must return so the injected turn can run. If it looped back to the
+	 * gate instead, a second overlay would sit in front of the review it just asked for.
+	 */
+	it("closes the gate after Review here rather than reopening it", async () => {
+		const harness = createHarness({ selections: ["review"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.overlays.length, 1);
+	});
+
+	it("refuses Review here for an interrupted run and keeps the gate open", async () => {
+		const harness = createHarness({ interrupted: true, selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.messages, []);
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	it("refuses feedback at the bound without opening an editor", async () => {
+		const harness = createHarness({ maxIterations: 1, selections: ["feedback", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.notifications[0]?.message ?? "", /is the last of 1/);
+	});
+
+	it("keeps the review pending when feedback is refused at the bound", async () => {
+		const harness = createHarness({ maxIterations: 1, selections: ["feedback", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+});
+
+describe("GateBFlow.handleAgentEnd", () => {
+	it("does nothing when no handoff is active", async () => {
+		const harness = createHarness();
+		await harness.flow.handleAgentEnd(harness.ctx);
+
+		assert.deepEqual(harness.overlays, []);
+		assert.deepEqual(harness.notifications, []);
+	});
+
+	it("does nothing while a review is pending but unarmed", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		await harness.flow.handleAgentEnd(harness.ctx);
+
+		assert.deepEqual(harness.overlays, []);
+	});
+
+	it("reopens Gate B after the review turn it armed", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+		await harness.flow.handleAgentEnd(harness.ctx);
+
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	it("clears the arm when it reopens the gate", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+		await harness.flow.handleAgentEnd(harness.ctx);
+
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+	});
+
+	/**
+	 * The ordering guard. `agent_end` can fire more than once per prompt, so the arm
+	 * has to be down before the gate opens; clearing it afterwards would let the
+	 * second event open a second gate behind the first.
+	 */
+	it("opens exactly one gate when agent_end fires twice for one prompt", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		await harness.flow.handleAgentEnd(harness.ctx);
+		await harness.flow.handleAgentEnd(harness.ctx);
+
+		// One for Review here, one for the reopen. A third would be the stacked gate.
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	/**
+	 * A concurrent second event must not slip past the flag either: the clear happens
+	 * before the first `await`, so the second call sees it down without interleaving.
+	 */
+	it("opens one gate when two agent_end events race", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		await Promise.all([harness.flow.handleAgentEnd(harness.ctx), harness.flow.handleAgentEnd(harness.ctx)]);
+
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	it("does not reopen the gate on turns after a dismissed reopen", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+		await harness.flow.handleAgentEnd(harness.ctx);
+		harness.overlays.length = 0;
+
+		await harness.flow.handleAgentEnd(harness.ctx);
+		assert.deepEqual(harness.overlays, []);
+	});
+
+	it("opens no gate outside a TUI, but still clears the arm", async () => {
+		const harness = createHarness({ selections: ["review"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		const headless = { ...harness.ctx, mode: "print" } as unknown as ExtensionContext;
+		await harness.flow.handleAgentEnd(headless);
+
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+		assert.equal(harness.overlays.length, 1);
+	});
+});

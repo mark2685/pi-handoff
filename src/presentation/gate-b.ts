@@ -40,6 +40,13 @@ export interface GateBView {
 	usage: UsageTotals | null;
 	/** Present only for an interrupted run, explaining what ended it. */
 	interruptionNote: string | undefined;
+	/**
+	 * Whether another worker iteration is allowed, used only for the menu label.
+	 *
+	 * Undefined leaves the option unlabelled-as-blocked. The service refuses a
+	 * bound-exceeding iteration regardless of what this says.
+	 */
+	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
 }
 
 /** Truncates a block to a bounded preview, noting how much was hidden. */
@@ -106,7 +113,10 @@ export function formatGateBTitle(view: GateBView): string {
  * leaving the review pending rather than as an implicit accept or discard.
  */
 export async function openGateB(ctx: ExtensionContext, view: GateBView): Promise<GateBOptionId | undefined> {
-	const options = gateBMenu({ interrupted: view.report === null });
+	const options = gateBMenu({
+		interrupted: view.report === null,
+		...(view.feedback === undefined ? {} : { feedback: view.feedback }),
+	});
 	const items: SelectItem[] = options.map((option) => ({
 		value: option.id,
 		label: option.label,

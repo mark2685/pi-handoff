@@ -13,9 +13,16 @@
  * directly), so nothing external can stop the worker. This service therefore
  * creates the `AbortController` for each run and exposes `abortActiveRun`, which
  * is the single mechanism that stops a worker: the running widget calls it on
- * Escape, and `session_shutdown` must call it in a later task. The design's claim
- * that Ctrl+C is "routed through the command's abort signal" describes an API
- * that does not exist.
+ * Escape, and `session_shutdown` calls it so a child can never outlive the
+ * reviewing session. Because a kill is SIGTERM then SIGKILL after a grace period,
+ * `abortActiveRun` only requests the death; `whenSettled` is the seam a shutdown
+ * hook awaits to know the child is actually gone.
+ *
+ * The live-registry check is a per-call option rather than a constructor
+ * dependency. This service is built once per session so `session_shutdown` and a
+ * reopened Gate B can reach it, while the registry must still be read at the
+ * moment of a click; passing the check in keeps the session-scoped object from
+ * capturing a stale view of which models exist.
  *
  * A run that produces no report never fabricates one. An abort, a spawn failure,
  * and a worker that exits non-zero with nothing to show all reach `reviewing`
@@ -26,10 +33,15 @@
  * text. A killed worker's partial output is not a result, and treating it as one
  * would put an abandoned half-report in front of the reviewer as though the run
  * had finished.
+ *
+ * A restart reuses the checkpoint taken before iteration 1 rather than taking a
+ * new one. That is what keeps Discard able to undo every iteration at once and
+ * keeps Gate B's diffstat cumulative; a fresh checkpoint per iteration would
+ * silently strand earlier iterations' edits outside Discard's reach.
  */
 
 import { err, ok, type Result } from "../domain/result.ts";
-import type { Checkpoint, ModelChoice } from "../domain/types.ts";
+import type { Checkpoint, Draft, ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Git, GitFailure } from "../ports/git.ts";
 import type { WorkerRunProgress, WorkerRunner } from "../ports/worker-runner.ts";
@@ -95,8 +107,22 @@ export interface StartRunOptions {
 	promptPath: string;
 	/** Working directory for both the checkpoint and the worker. */
 	cwd: string;
+	/**
+	 * Re-checked immediately before spawning, not when the gate opened.
+	 *
+	 * Supplied per call because this service outlives any one invocation, and a
+	 * captured registry view could approve a provider that has since disappeared.
+	 */
+	isChoiceRunnable: (choice: ModelChoice | undefined) => boolean;
 	/** Receives incremental worker progress for the running widget. */
 	onProgress?: (progress: RunProgress) => void;
+}
+
+export interface RestartRunOptions extends StartRunOptions {
+	/** Which iteration this run is. The caller enforces the rubric's bound. */
+	iteration: number;
+	/** The draft whose prompt already carries the appended feedback on disk. */
+	draft: Draft;
 }
 
 /** Outcome of discarding a worker's changes back to the checkpoint. */
@@ -118,23 +144,35 @@ export interface RunServiceDeps {
 	git: Git;
 	clock: Clock;
 	recorder: HandoffStateRecorder;
-	/** Re-checked immediately before spawning, not when Gate A opened. */
-	isChoiceRunnable: (choice: ModelChoice | undefined) => boolean;
 }
 
 export interface RunService {
 	/** Re-checks the model, checkpoints, spawns the worker, and prepares Gate B. */
 	start(options: StartRunOptions): Promise<RunOutcome>;
 	/**
+	 * Runs another iteration against the review's existing checkpoint.
+	 *
+	 * No new checkpoint is taken, so Discard still reverts every iteration and the
+	 * diffstat stays cumulative across the feedback loop.
+	 */
+	restart(options: RestartRunOptions): Promise<RunOutcome>;
+	/**
 	 * Stops the active worker, if any, and reports whether one was stopped.
 	 *
-	 * This is the kill seam. It is the only way a worker is stopped, and it is
-	 * exported for a later task to call from `session_shutdown` so a child can
-	 * never outlive the reviewing session.
+	 * This is the kill seam. It is the only way a worker is stopped, and it only
+	 * *requests* the death: the adapter sends SIGTERM and then SIGKILL after a grace
+	 * period, so a caller that needs the child to be gone must await `whenSettled`.
 	 */
 	abortActiveRun(): boolean;
 	/** True while a child is running, so a shutdown hook can decide to wait. */
 	isRunning(): boolean;
+	/**
+	 * Resolves once no worker is in flight, rejecting never.
+	 *
+	 * `session_shutdown` awaits this after `abortActiveRun` so Pi does not tear the
+	 * session down while a child is still writing to the working tree.
+	 */
+	whenSettled(): Promise<void>;
 	/** Reverts only paths that were clean when the run's checkpoint was taken. */
 	discard(cwd: string): Promise<Result<DiscardResult, GitFailure | HandoffConflict>>;
 	/** Reads the diffstat for the active review against its checkpoint. */
@@ -171,10 +209,19 @@ function interruptionNote(reason: {
 
 /** Wires a worker run to the machine, Git, and the clock behind their ports. */
 export function createRunService(deps: RunServiceDeps): RunService {
-	const { machine, runner, git, clock, recorder, isChoiceRunnable } = deps;
+	const { machine, runner, git, clock, recorder } = deps;
 
 	/** The controller for the run in flight, and the reason a caller can stop it. */
 	let activeController: AbortController | undefined;
+
+	/**
+	 * The run in flight, so a shutdown hook can await the child's actual death.
+	 *
+	 * Held separately from the controller because aborting only requests the kill:
+	 * the adapter still has to escalate SIGTERM to SIGKILL, and the promise is the
+	 * only thing that knows when that finished.
+	 */
+	let activeRun: Promise<RunOutcome> | undefined;
 
 	/** Persists the machine's current state so a resumed session can recover it. */
 	function record(): void {
@@ -195,6 +242,97 @@ export function createRunService(deps: RunServiceDeps): RunService {
 		return result.ok ? { diffstat: result.value, failure: undefined } : { diffstat: "", failure: result.error };
 	}
 
+	/**
+	 * Spawns the worker for an already-running machine state and resolves Gate B's outcome.
+	 *
+	 * Shared by `start` and `restart` so an iteration reached through feedback gets
+	 * exactly the same completion, abort, and failure handling as the first run. It
+	 * assumes the machine has already transitioned and been recorded, because the
+	 * transition is the part the two entry points legitimately differ on.
+	 */
+	async function spawnAndSettle(input: {
+		choice: ModelChoice;
+		promptPath: string;
+		cwd: string;
+		checkpoint: Checkpoint;
+		onProgress: ((progress: RunProgress) => void) | undefined;
+	}): Promise<RunOutcome> {
+		const startedAtMs = clock.nowMs();
+		const controller = new AbortController();
+		activeController = controller;
+
+		try {
+			const outcome = await runner.run({
+				choice: input.choice,
+				promptPath: input.promptPath,
+				cwd: input.cwd,
+				signal: controller.signal,
+				onProgress:
+					input.onProgress === undefined
+						? undefined
+						: (progress) => {
+								input.onProgress?.({ ...progress, elapsedMs: clock.nowMs() - startedAtMs });
+							},
+			});
+
+			const report = outcome.report.trim();
+
+			// An aborted run is interrupted even if the worker emitted text first: partial
+			// output is not a result, and presenting it as one would let a killed worker
+			// reach Gate B as a finished report. An empty report is likewise never dressed
+			// up as a completed review.
+			if (outcome.aborted || report === "") {
+				const note = interruptionNote({
+					aborted: outcome.aborted,
+					hadPartialReport: report !== "",
+					exitCode: outcome.exitCode,
+					errorMessage: outcome.errorMessage,
+					stopReason: outcome.stopReason,
+				});
+				const interrupted = machine.interruptRun(note);
+				if (!interrupted.ok) return { kind: "refused", conflict: interrupted.error };
+				record();
+				const { diffstat, failure } = await readDiffstat(input.cwd, input.checkpoint);
+				return {
+					kind: "interrupted",
+					state: interrupted.value,
+					diffstat,
+					diffstatFailure: failure,
+					exitCode: outcome.exitCode,
+					aborted: outcome.aborted,
+					stderr: outcome.stderr,
+				};
+			}
+
+			const { diffstat, failure } = await readDiffstat(input.cwd, input.checkpoint);
+			const completed = machine.completeRun({
+				report: outcome.report,
+				diffstat,
+				usage: outcome.usage,
+			});
+			if (!completed.ok) return { kind: "refused", conflict: completed.error };
+			record();
+			return {
+				kind: "completed",
+				state: completed.value,
+				exitCode: outcome.exitCode,
+				diffstatFailure: failure,
+			};
+		} finally {
+			activeController = undefined;
+		}
+	}
+
+	/** Tracks a run so `whenSettled` can await the child's death, then clears it. */
+	async function track(run: Promise<RunOutcome>): Promise<RunOutcome> {
+		activeRun = run;
+		try {
+			return await run;
+		} finally {
+			activeRun = undefined;
+		}
+	}
+
 	return {
 		async start(options: StartRunOptions): Promise<RunOutcome> {
 			const proposed = machine.current();
@@ -212,13 +350,12 @@ export function createRunService(deps: RunServiceDeps): RunService {
 
 			// Re-checked here, not at Gate A: a provider can disappear while the gate sits open.
 			const choice = proposed.choice;
-			if (!isChoiceRunnable(choice)) return { kind: "model_unavailable", choice };
+			if (!options.isChoiceRunnable(choice)) return { kind: "model_unavailable", choice };
 
 			// The checkpoint precedes the spawn so Discard always has a boundary to revert to.
 			const checkpoint = await git.checkpoint(options.cwd);
 			if (!checkpoint.ok) return { kind: "checkpoint_failed", failure: checkpoint.error };
 
-			const startedAtMs = clock.nowMs();
 			const started = machine.startRun({
 				iteration: 1,
 				startedAt: clock.nowIso(),
@@ -227,69 +364,56 @@ export function createRunService(deps: RunServiceDeps): RunService {
 			if (!started.ok) return { kind: "refused", conflict: started.error };
 			record();
 
-			const controller = new AbortController();
-			activeController = controller;
-
-			try {
-				const outcome = await runner.run({
+			return track(
+				spawnAndSettle({
 					choice,
 					promptPath: options.promptPath,
 					cwd: options.cwd,
-					signal: controller.signal,
-					onProgress:
-						options.onProgress === undefined
-							? undefined
-							: (progress) => {
-									options.onProgress?.({ ...progress, elapsedMs: clock.nowMs() - startedAtMs });
-								},
-				});
+					checkpoint: checkpoint.value,
+					onProgress: options.onProgress,
+				}),
+			);
+		},
 
-				const report = outcome.report.trim();
-
-				// An aborted run is interrupted even if the worker emitted text first: partial
-				// output is not a result, and presenting it as one would let a killed worker
-				// reach Gate B as a finished report. An empty report is likewise never dressed
-				// up as a completed review.
-				if (outcome.aborted || report === "") {
-					const note = interruptionNote({
-						aborted: outcome.aborted,
-						hadPartialReport: report !== "",
-						exitCode: outcome.exitCode,
-						errorMessage: outcome.errorMessage,
-						stopReason: outcome.stopReason,
-					});
-					const interrupted = machine.interruptRun(note);
-					if (!interrupted.ok) return { kind: "refused", conflict: interrupted.error };
-					record();
-					const { diffstat, failure } = await readDiffstat(options.cwd, checkpoint.value);
-					return {
-						kind: "interrupted",
-						state: interrupted.value,
-						diffstat,
-						diffstatFailure: failure,
-						exitCode: outcome.exitCode,
-						aborted: outcome.aborted,
-						stderr: outcome.stderr,
-					};
-				}
-
-				const { diffstat, failure } = await readDiffstat(options.cwd, checkpoint.value);
-				const completed = machine.completeRun({
-					report: outcome.report,
-					diffstat,
-					usage: outcome.usage,
-				});
-				if (!completed.ok) return { kind: "refused", conflict: completed.error };
-				record();
+		async restart(options: RestartRunOptions): Promise<RunOutcome> {
+			const reviewing = machine.reviewing();
+			if (reviewing === undefined) {
 				return {
-					kind: "completed",
-					state: completed.value,
-					exitCode: outcome.exitCode,
-					diffstatFailure: failure,
+					kind: "refused",
+					conflict: {
+						kind: "conflict",
+						current: machine.current().kind,
+						attempted: "restart",
+						message: "Worker feedback can be sent only while a review is pending",
+					},
 				};
-			} finally {
-				activeController = undefined;
 			}
+
+			// Re-checked for the same reason as the first run: the gate may have sat open.
+			const choice = reviewing.choice;
+			if (!options.isChoiceRunnable(choice)) return { kind: "model_unavailable", choice };
+
+			// Deliberately the review's existing checkpoint: see the module header.
+			const checkpoint = reviewing.checkpoint;
+			const restarted = machine.restartRun({
+				draft: options.draft,
+				choice,
+				iteration: options.iteration,
+				startedAt: clock.nowIso(),
+				checkpoint,
+			});
+			if (!restarted.ok) return { kind: "refused", conflict: restarted.error };
+			record();
+
+			return track(
+				spawnAndSettle({
+					choice,
+					promptPath: options.promptPath,
+					cwd: options.cwd,
+					checkpoint,
+					onProgress: options.onProgress,
+				}),
+			);
 		},
 
 		abortActiveRun(): boolean {
@@ -300,6 +424,12 @@ export function createRunService(deps: RunServiceDeps): RunService {
 
 		isRunning(): boolean {
 			return activeController !== undefined;
+		},
+
+		async whenSettled(): Promise<void> {
+			// A rejection is the caller's problem to observe on its own call, not a reason
+			// to fail a shutdown hook that only needs to know the child is gone.
+			await activeRun?.catch(() => undefined);
 		},
 
 		async discard(cwd: string): Promise<Result<DiscardResult, GitFailure | HandoffConflict>> {

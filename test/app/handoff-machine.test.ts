@@ -180,6 +180,18 @@ describe("handoff machine", () => {
 		});
 	});
 
+	/**
+	 * An interrupted review has no report, so Review here is refused there. Feedback is
+	 * not: re-running after a crash is exactly what a user wants from that state, and
+	 * the checkpoint it carries is what makes the retry safe.
+	 */
+	it("starts a feedback iteration from an interrupted review", () => {
+		machine.restore(rehydrateHandoffState({ kind: "running", draft, choice, ...startInput() }));
+		const result = machine.restartRun({ ...startInput(2), draft, choice });
+		assert.equal(result.ok, true);
+		assert.equal(machine.running()?.iteration, 2);
+	});
+
 	it("resets from every active state", () => {
 		const enterStates = [
 			() => machine.beginDraft("scope"),

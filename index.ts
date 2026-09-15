@@ -3,7 +3,7 @@
  * session implements an approved handoff.
  *
  * This file is the composition root. It constructs adapters and services, then
- * registers the command. All behavior lives in `src/`:
+ * registers the command and the lifecycle hooks. All behavior lives in `src/`:
  *
  *   src/domain/       pure handoff rules, no IO or Pi imports
  *   src/ports/        interfaces for everything outside the process
@@ -14,11 +14,17 @@
  *   src/prompts/      drafting and review prompt text
  *   src/commands/     /handoff argument parsing and dispatch
  *
- * The machine and the state recorder are built once per session, because they
- * represent the one handoff a session may own. The drafting service is built per
- * invocation instead: it depends on `ctx.model` and the live registry, which can
- * both change between commands, and a stale model must never be used for a
- * side-call the user did not intend.
+ * Almost everything is built once per session, because a session owns at most one
+ * handoff and three separate entry points have to reach the same one: the command,
+ * the `agent_end` reopen, and the `session_shutdown` kill. In particular the run
+ * service is session-scoped so the shutdown hook can stop a worker it never
+ * started, and the live-registry check it needs is passed per call instead of
+ * captured, so a session-lived object cannot approve a model that has since
+ * disappeared.
+ *
+ * The drafting service is the exception: it depends on `ctx.model` and the live
+ * registry, which can both change between commands, and a stale model must never
+ * be used for a side-call the user did not intend.
  *
  * The rubric is `DEFAULT_RUBRIC` for now. A `ConfigStore` reading
  * `~/.pi/agent/handoff.json`, and the `/handoff config` editor that maintains it,
@@ -37,10 +43,14 @@ import {
 } from "./src/adapters/session-state-recorder.ts";
 import { createSystemClock } from "./src/adapters/system-clock.ts";
 import { createDraftService, type DraftService } from "./src/app/draft-service.ts";
-import { createHandoffMachine } from "./src/app/handoff-machine.ts";
-import { createRunService, type RunService } from "./src/app/run-service.ts";
+import { createHandoffMachine, rehydrateLatestHandoffState } from "./src/app/handoff-machine.ts";
+import { createReviewService } from "./src/app/review-service.ts";
+import { createRunService } from "./src/app/run-service.ts";
+import { createGateBFlow } from "./src/commands/gate-b-flow.ts";
 import { createHandoffCommandHandler } from "./src/commands/handoff-command.ts";
 import { DEFAULT_RUBRIC } from "./src/domain/rubric/defaults.ts";
+import { isModelAvailable } from "./src/domain/rubric/resolve.ts";
+import type { ModelChoice } from "./src/domain/types.ts";
 
 export default function handoff(pi: ExtensionAPI) {
 	const machine = createHandoffMachine();
@@ -53,6 +63,47 @@ export default function handoff(pi: ExtensionAPI) {
 	// `pi.exec` already buffers an argument-vector command into the shape T5's Exec
 	// port expects, so the Git adapter needs no separate process adapter of its own.
 	const git = createExecGit((command, args, options) => pi.exec(command, args, { cwd: options.cwd }));
+
+	const runService = createRunService({ machine, runner: workerRunner, git, clock, recorder });
+
+	const reviewService = createReviewService({
+		machine,
+		runService,
+		promptWriter,
+		reportRecorder,
+		recorder,
+		clock,
+		maxIterations: DEFAULT_RUBRIC.maxIterations,
+	});
+
+	/**
+	 * Re-checks a model against the live registry at the moment of a click.
+	 *
+	 * Read through the context rather than captured, because a provider can appear
+	 * or disappear while a gate sits open, and every spawn is gated on this.
+	 */
+	function isChoiceRunnable(ctx: ExtensionContext, choice: ModelChoice | undefined): boolean {
+		if (choice === undefined) return false;
+		const available = ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id }));
+		return isModelAvailable(`${choice.provider}/${choice.model}`, available);
+	}
+
+	const gateBFlow = createGateBFlow({
+		machine,
+		runService,
+		reviewService,
+		clock,
+		isChoiceRunnable,
+		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
+		// handler, so this is fire-and-forget by construction: the injected message
+		// starts an agent turn that the calling handler must return from, and that turn's
+		// `agent_end` is what reopens the gate. `deliverAs: "followUp"` is required because
+		// Gate B can reopen from `agent_end`, while the agent is still streaming and an
+		// un-queued message is refused; when the agent is idle, the option is ignored.
+		sendUserMessage: (content) => {
+			pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs: "followUp" });
+		},
+	});
 
 	/** Builds the drafting service for one invocation, or nothing if no model is selected. */
 	function createService(ctx: ExtensionContext): DraftService | undefined {
@@ -71,33 +122,57 @@ export default function handoff(pi: ExtensionAPI) {
 		});
 	}
 
-	/**
-	 * Builds the run service for one invocation.
-	 *
-	 * It borrows the drafting service's `isChoiceRunnable`, which reads the live
-	 * registry, so the spawn-time model check sees the registry as it is at the
-	 * moment of the click rather than as it was when Gate A opened.
-	 */
-	function createRun(_ctx: ExtensionContext, service: DraftService): RunService {
-		return createRunService({
-			machine,
-			runner: workerRunner,
-			git,
-			clock,
-			recorder,
-			isChoiceRunnable: (choice) => service.isChoiceRunnable(choice),
-		});
-	}
-
 	pi.registerCommand("handoff", {
 		description: "Draft and run a review-preserving implementation handoff.",
 		handler: createHandoffCommandHandler({
 			machine,
 			createService,
-			createRunService: createRun,
+			runService,
+			gateBFlow,
+			isChoiceRunnable,
 			clipboard,
-			reportRecorder,
 			clock,
 		}),
+	});
+
+	/**
+	 * Restores a handoff that outlived its session, or resets to idle.
+	 *
+	 * No UI opens here. The reason is deliberately ignored: a `"new"` session has no
+	 * entries on its branch, so the same code path resets it, and branching on the
+	 * reason would add a way for the two to disagree. Rehydration downgrades a
+	 * `running` entry to an interrupted review, which is what makes the child's death
+	 * visible instead of silently losing the checkpoint Discard needs.
+	 */
+	pi.on("session_start", (_event, ctx) => {
+		const restored = rehydrateLatestHandoffState(ctx.sessionManager.getBranch());
+		if (restored === undefined) machine.reset();
+		else machine.restore(restored);
+	});
+
+	/**
+	 * Kills any worker before Pi tears the session down.
+	 *
+	 * Awaited on purpose: aborting only requests the death, and the adapter escalates
+	 * SIGTERM to SIGKILL after a grace period, so returning early would let Pi exit
+	 * while a child was still writing to the working tree — the orphaned-worker case
+	 * §7 forbids. State is deliberately untouched: the already-recorded `running`
+	 * entry is what lets the next `session_start` downgrade it to an interrupted
+	 * review, so overwriting it here would erase the evidence.
+	 */
+	pi.on("session_shutdown", async () => {
+		if (!runService.abortActiveRun()) return;
+		await runService.whenSettled();
+	});
+
+	/**
+	 * Reopens Gate B after the review turn that Review here injected.
+	 *
+	 * Inert in every other case. The flow reads the arm flag, clears it before
+	 * opening anything, and returns early otherwise, so an ordinary turn in a session
+	 * with no handoff never sees handoff UI.
+	 */
+	pi.on("agent_end", async (_event, ctx) => {
+		await gateBFlow.handleAgentEnd(ctx);
 	});
 }

@@ -37,7 +37,7 @@ The extension registers:
 
 - `/handoff [scope]` as the user-facing command. Runs the full drafting, gate, run, and review flow.
 - `/handoff status` to show the current handoff state and the last worker report.
-- `/handoff abort` to kill a running worker and return to idle.
+- `/handoff abort` to kill a running worker and return to idle. Superseded by Escape in the running overlay: the run blocks the session behind that overlay, so this command cannot be typed while a worker is alive and is left unimplemented.
 - `/handoff config` to edit the tier rubric's model mapping.
 
 The extension uses these lifecycle hooks:
@@ -60,7 +60,7 @@ The extension uses these lifecycle hooks:
   │
   ├─ 2. RUN     git checkpoint (stash-free: record HEAD + `git status --porcelain`)
   │              spawn: pi --mode json -p --no-session --model P/M --thinking L @prompt
-  │              stream events into a widget; Ctrl+C / abort kills the child
+  │              stream events into a widget; Escape kills the child
   │
   ├─ GATE B     worker's final report + `git diff --stat` + usage/cost
   │              [Review here] [Send feedback to worker] [Discard changes] [Accept]
@@ -87,7 +87,7 @@ reviewing  { draft, choice, iteration, checkpoint, report, diffstat, usage, awai
 
 `awaitingReviewTurn` is true only between **Review here** and the end of the turn it triggered. It is the sole condition under which `agent_end` acts.
 
-Only one handoff can exist per session. Starting `/handoff` while `running` is refused; starting it while `reviewing` asks whether to discard the pending review.
+Only one handoff can exist per session. Starting `/handoff` while `running` is refused; starting it while `reviewing` reopens Gate B rather than drafting, since Gate B already offers Discard and Accept.
 
 ## 5. Detailed Design
 
@@ -158,7 +158,7 @@ pi --mode json -p --no-session --model <provider>/<model> --thinking <level> @/t
 
 in `ctx.cwd`, with the same event handling as `examples/extensions/subagent/index.ts`: `message_end` accumulates assistant messages and usage; `tool_result_end` accumulates tool results; `stopReason` and `errorMessage` are captured; SIGTERM then SIGKILL on abort. The extension does not pass `--tools`; the worker gets the normal default tool set. It also does not pass `--append-system-prompt`; all instructions live in the prompt file so what the user approved at Gate A is exactly what the worker receives.
 
-While running, a widget shows elapsed time, turns, tokens, cost, and the last few tool calls. The reviewing session's agent is not invoked during this phase; the command handler awaits the child process directly, so the user sees the widget and can press Ctrl+C (routed through the command's abort signal) to stop the worker.
+While running, a widget shows elapsed time, turns, tokens, cost, and the last few tool calls. The reviewing session's agent is not invoked during this phase; the command handler awaits the child process directly, so the user sees the widget and can press Escape in it to stop the worker. The overlay owns the `AbortController` for the run because there is no external signal to borrow: `ExtensionCommandContext` has no abort member, and `ExtensionContext.signal` is undefined when the agent is not streaming, which is exactly the case while a command handler awaits a child process.
 
 The worker's final assistant text is the report. Its expected shape is the "final report" section the drafting prompt requires: summary, files changed, validation performed, blockers. The extension does not parse this structurally in v1; it is passed through verbatim.
 
@@ -166,14 +166,14 @@ The worker's final assistant text is the report. Its expected shape is the "fina
 
 Rendered with `ctx.ui.custom`, showing the report, `git diff --stat` against the checkpoint, usage, and iteration count. Options:
 
-- **Review here** — sets `awaitingReviewTurn`, then `pi.sendUserMessage` with: the original handoff prompt (collapsed reference), the worker's report, the diffstat, and instructions to review the actual diff with the read/bash tools against the handoff's acceptance criteria and end the turn with a one-line verdict of accept, fix, or discard. When that turn ends, `agent_end` clears the flag and reopens Gate B, so the user acts on the review without typing another command. The reviewer's verdict is in the transcript directly above the reopened gate. If the user dismisses the gate (Escape) to ask the reviewer a follow-up question, the machine stays in `reviewing` with the flag cleared; subsequent turns do not reopen the gate, and `/handoff` reopens it on demand.
-- **Send feedback to worker** — `ctx.ui.editor` for feedback; the extension appends a `## Review feedback (iteration N)` section to the prompt file and returns to 5.4. Refused when `iteration >= maxIterations`.
-- **Discard changes** — `git checkout -- <files changed since checkpoint>` and `git clean` limited to files that were untracked-and-absent at checkpoint. Then `idle`.
+- **Review here** — sets `awaitingReviewTurn`, then `pi.sendUserMessage` with: the original handoff prompt (collapsed reference), the worker's report, the diffstat, and instructions to review the actual diff with the read/bash tools against the handoff's acceptance criteria and end the turn with a one-line verdict of accept, fix, or discard. The injected message triggers a full agent turn, so the handler must fire it without awaiting completion and return immediately; a handler that waited would hold the command open for the entire review turn and deadlock the gate it is trying to reopen. The message is delivered as a follow-up (`deliverAs: "followUp"`) because Gate B may itself be open inside `agent_end`, where the agent is still streaming and an un-queued user message is refused; when the agent is idle the option has no effect. When that turn ends, `agent_end` clears the flag and reopens Gate B, so the user acts on the review without typing another command. The reviewer's verdict is in the transcript directly above the reopened gate. If the user dismisses the gate (Escape) to ask the reviewer a follow-up question, the machine stays in `reviewing` with the flag cleared; subsequent turns do not reopen the gate, and `/handoff` reopens it on demand.
+- **Send feedback to worker** — `ctx.ui.editor` for feedback; the extension appends a `## Review feedback (iteration N)` section to the prompt file and returns to 5.4. Refused when `iteration >= maxIterations`. The restart reuses the checkpoint taken before iteration 1 rather than taking a new one, so Discard still undoes every iteration and the diffstat stays cumulative across the loop.
+- **Discard changes** — `git checkout -- <files changed since checkpoint>` and `git clean` limited to files that were untracked-and-absent at checkpoint. Then `idle`. Paths that were already dirty when the checkpoint was taken are skipped, so a worker's edits to those paths survive Discard; this is why Gate B leads its discard summary with the skipped paths rather than reporting only what was reverted.
 - **Accept** — marks the handoff complete, leaves the working tree as is, records the report in the session as a custom entry, and returns to `idle`. Nothing is committed.
 
 ### 5.6 Session entries and recovery
 
-Each transition appends a `handoff-state` custom entry (`sm.appendCustomEntry`) containing the serialized machine state minus the child process handle. On `session_start`, the latest entry is decoded; `running` is downgraded to `reviewing` with a note that the worker was interrupted (the child cannot survive a Pi restart), and `/handoff` reopens the appropriate gate. `drafting` and `proposed` are downgraded to `idle` because the `/tmp` prompt file may be stale.
+Each transition appends a `handoff-state` custom entry (`pi.appendEntry(customType, data?)`, which returns `void`) containing the serialized machine state minus the child process handle. Writing entries is an `ExtensionAPI` capability rather than a session-manager call, because `ctx.sessionManager` is a read-only `ReadonlySessionManager` with no append method. On `session_start`, the latest entry is decoded; `running` is downgraded to `reviewing` with a note that the worker was interrupted (the child cannot survive a Pi restart), and `/handoff` reopens the appropriate gate. `drafting` and `proposed` are downgraded to `idle` because the `/tmp` prompt file may be stale.
 
 ### 5.7 Package layout
 
@@ -184,7 +184,7 @@ src/domain/             pure, no IO, no Pi imports
   result.ts             Result type (copied from phase-runner)
   rubric/               tier resolution, defaults, validation
   draft/                draft JSON parsing, slug normalization, feedback append
-  report/               diffstat parsing, usage formatting
+  report/               usage formatting, discard summaries (the report itself is passed through verbatim, never parsed)
 src/ports/              WorkerRunner, Git, Clipboard, ConfigStore, Clock
 src/adapters/           child-process runner, exec-based git, pbcopy, json file
 src/persistence/        schemas for handoff.json, session entries, draft JSON
@@ -252,7 +252,7 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 - Rubric resolution picks the first available candidate and falls through correctly when a model is missing or excluded.
 - Draft JSON parsing rejects malformed output and surfaces the raw text.
 - In a scratch repository with a pre-existing dirty file: run a handoff, Discard, and confirm the pre-existing change is untouched while worker changes are gone.
-- Ctrl+C during Run kills the child process (`ps` shows no orphan `pi`).
+- Escape during Run kills the child process (`ps` shows no orphan `pi`).
 - Killing the reviewing Pi during Run kills the child.
 - Resume the reviewing session mid-review and confirm `/handoff` reopens Gate B.
 - After Review here, confirm Gate B reopens exactly once when the review turn ends, and does not reopen after a follow-up question to the reviewer.
@@ -278,7 +278,7 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 - [ ] T6: Implement `HandoffMachine` and session-entry persistence with schemas.
 - [ ] T7: Implement DraftService, the drafting prompt, and Gate A including Run externally.
 - [ ] T8: Implement RunService, the running widget, and Gate B with Accept and Discard.
-- [ ] T9: Implement Review here injection, the `agent_end` reopen of Gate B, and the bounded feedback loop.
-- [ ] T10: Implement `session_start` rehydration and `session_shutdown` cleanup.
+- [x] T9: Implement Review here injection, the `agent_end` reopen of Gate B, and the bounded feedback loop.
+- [x] T10: Implement `session_start` rehydration and `session_shutdown` cleanup.
 - [ ] T11: Write README and extension load test; run `npm run check`.
 - [ ] T12: End-to-end test in a scratch repository, including the Discard safety check.
