@@ -10,7 +10,18 @@
 import { type Static, type TSchema, Type } from "typebox";
 import { Check, Errors } from "typebox/value";
 import { err, ok, type Result } from "../domain/result.ts";
-import type { ModelCandidate, Rubric, ThinkingLevel } from "../domain/types.ts";
+import type {
+	Checkpoint,
+	CheckpointPathStatus,
+	Draft,
+	ModelCandidate,
+	ModelChoice,
+	Rubric,
+	ThinkingLevel,
+	Tier,
+} from "../domain/types.ts";
+import type { HandoffState } from "../app/handoff-machine.ts";
+import type { WorkerUsage } from "../ports/worker-runner.ts";
 
 const ThinkingLevelSchema = Type.Union([
 	Type.Literal("off"),
@@ -35,6 +46,13 @@ const ModelCandidateSchema = Type.Object(
 
 const TierCandidatesSchema = Type.Array(ModelCandidateSchema, { minItems: 1 });
 
+const TierSchema = Type.Union([
+	Type.Literal("routine"),
+	Type.Literal("standard"),
+	Type.Literal("hard"),
+	Type.Literal("frontier"),
+]);
+
 const TiersSchema = Type.Object(
 	{
 		routine: TierCandidatesSchema,
@@ -56,6 +74,134 @@ export const RubricSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+
+/** Strict envelope returned by the drafting model before it becomes a domain draft. */
+export const DraftSchema = Type.Object(
+	{
+		slug: Type.String({ minLength: 1 }),
+		prompt: Type.String({ minLength: 1 }),
+		tier: TierSchema,
+		rationale: Type.String({ minLength: 1 }),
+	},
+	{ additionalProperties: false },
+);
+
+/** One checkpoint path's status, retaining the pre-worker staging boundary. */
+export const CheckpointPathStatusSchema = Type.Object(
+	{
+		indexStatus: Type.String(),
+		worktreeStatus: Type.String(),
+		path: Type.String(),
+		originalPath: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
+
+/** Serializable Git checkpoint used to constrain a later discard operation. */
+export const CheckpointSchema = Type.Object(
+	{
+		repositoryRoot: Type.String(),
+		head: Type.String(),
+		statuses: Type.Array(CheckpointPathStatusSchema),
+	},
+	{ additionalProperties: false },
+);
+
+const ModelChoiceSchema = Type.Object(
+	{
+		provider: Type.String(),
+		model: Type.String(),
+		thinking: ThinkingLevelSchema,
+	},
+	{ additionalProperties: false },
+);
+
+const WorkerUsageSchema = Type.Object(
+	{
+		inputTokens: Type.Number(),
+		outputTokens: Type.Number(),
+		cacheReadTokens: Type.Number(),
+		cacheWriteTokens: Type.Number(),
+		cost: Type.Number(),
+		contextTokens: Type.Number(),
+		turns: Type.Number(),
+	},
+	{ additionalProperties: false },
+);
+
+const IdleHandoffStateSchema = Type.Object({ kind: Type.Literal("idle") }, { additionalProperties: false });
+
+const DraftingHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("drafting"),
+		scope: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+
+const ProposedHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("proposed"),
+		draft: DraftSchema,
+		choice: ModelChoiceSchema,
+	},
+	{ additionalProperties: false },
+);
+
+const RunningHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("running"),
+		draft: DraftSchema,
+		choice: ModelChoiceSchema,
+		iteration: Type.Number(),
+		startedAt: Type.String(),
+		checkpoint: CheckpointSchema,
+	},
+	{ additionalProperties: false },
+);
+
+const CompletedReviewingHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("reviewing"),
+		completion: Type.Literal("completed"),
+		draft: DraftSchema,
+		choice: ModelChoiceSchema,
+		iteration: Type.Number(),
+		checkpoint: CheckpointSchema,
+		report: Type.String(),
+		diffstat: Type.String(),
+		usage: WorkerUsageSchema,
+		awaitingReviewTurn: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+
+const InterruptedReviewingHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("reviewing"),
+		completion: Type.Literal("interrupted"),
+		draft: DraftSchema,
+		choice: ModelChoiceSchema,
+		iteration: Type.Number(),
+		checkpoint: CheckpointSchema,
+		report: Type.Null(),
+		diffstat: Type.Null(),
+		usage: Type.Null(),
+		interruptionNote: Type.String({ minLength: 1 }),
+		awaitingReviewTurn: Type.Boolean(),
+	},
+	{ additionalProperties: false },
+);
+
+/** Strict persisted discriminated union for state appended to Pi session entries. */
+export const HandoffStateSchema = Type.Union([
+	IdleHandoffStateSchema,
+	DraftingHandoffStateSchema,
+	ProposedHandoffStateSchema,
+	RunningHandoffStateSchema,
+	CompletedReviewingHandoffStateSchema,
+	InterruptedReviewingHandoffStateSchema,
+]);
 
 /** Describes why a persisted configuration value was rejected. */
 export interface DecodeError {
@@ -82,6 +228,16 @@ export function validateRubric(value: unknown): Result<Rubric, DecodeError> {
 	return decode(RubricSchema, value);
 }
 
+/** Validates a drafting-model JSON envelope before it enters the domain. */
+export function validateDraft(value: unknown): Result<Draft, DecodeError> {
+	return decode(DraftSchema, value);
+}
+
+/** Validates a custom session entry before the app layer attempts recovery. */
+export function validateHandoffState(value: unknown): Result<HandoffState, DecodeError> {
+	return decode(HandoffStateSchema, value);
+}
+
 /**
  * Compile-time assertion that a schema's inferred type and the hand-written
  * domain interface describe the same shape, in both directions.
@@ -95,5 +251,12 @@ type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 function assertSchemaMatches<A, B>(_matches: Exact<A, B>): void {}
 
 assertSchemaMatches<Static<typeof ThinkingLevelSchema>, ThinkingLevel>(true);
+assertSchemaMatches<Static<typeof TierSchema>, Tier>(true);
 assertSchemaMatches<Static<typeof ModelCandidateSchema>, ModelCandidate>(true);
 assertSchemaMatches<Static<typeof RubricSchema>, Rubric>(true);
+assertSchemaMatches<Static<typeof DraftSchema>, Draft>(true);
+assertSchemaMatches<Static<typeof CheckpointPathStatusSchema>, CheckpointPathStatus>(true);
+assertSchemaMatches<Static<typeof CheckpointSchema>, Checkpoint>(true);
+assertSchemaMatches<Static<typeof ModelChoiceSchema>, ModelChoice>(true);
+assertSchemaMatches<Static<typeof WorkerUsageSchema>, WorkerUsage>(true);
+assertSchemaMatches<Static<typeof HandoffStateSchema>, HandoffState>(true);

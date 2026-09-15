@@ -1,0 +1,1 @@
+This directory contains pure app-layer tests for the handoff state machine and session recovery rules. They may use domain and port protocol types, but must not require Pi, filesystem, Git, or concrete adapters.
