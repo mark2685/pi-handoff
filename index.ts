@@ -48,6 +48,8 @@ import { createReviewService } from "./src/app/review-service.ts";
 import { createRunService } from "./src/app/run-service.ts";
 import { createGateBFlow } from "./src/commands/gate-b-flow.ts";
 import { createHandoffCommandHandler } from "./src/commands/handoff-command.ts";
+import { finalAssistantText } from "./src/commands/review-turn.ts";
+import { HANDOFF_COMMAND_NAME } from "./src/commands/parse.ts";
 import { DEFAULT_RUBRIC } from "./src/domain/rubric/defaults.ts";
 import { isModelAvailable } from "./src/domain/rubric/resolve.ts";
 import type { ModelChoice } from "./src/domain/types.ts";
@@ -122,7 +124,7 @@ export default function handoff(pi: ExtensionAPI) {
 		});
 	}
 
-	pi.registerCommand("handoff", {
+	pi.registerCommand(HANDOFF_COMMAND_NAME, {
 		description: "Draft and run a review-preserving implementation handoff.",
 		handler: createHandoffCommandHandler({
 			machine,
@@ -172,7 +174,7 @@ export default function handoff(pi: ExtensionAPI) {
 	 * opening anything, and returns early otherwise, so an ordinary turn in a session
 	 * with no handoff never sees handoff UI.
 	 */
-	pi.on("agent_end", async (_event, ctx) => {
-		await gateBFlow.handleAgentEnd(ctx);
+	pi.on("agent_end", async (event, ctx) => {
+		await gateBFlow.handleAgentEnd(ctx, finalAssistantText(event.messages));
 	});
 }

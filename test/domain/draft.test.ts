@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { appendReviewFeedback } from "../../src/domain/draft/feedback.ts";
-import { hasNeedsInputMarker, parseDraft } from "../../src/domain/draft/parse.ts";
+import { appendReviewFeedback, normalizeReviewFeedback } from "../../src/domain/draft/feedback.ts";
+import { extractNeedsInput, hasNeedsInputMarker, parseDraft } from "../../src/domain/draft/parse.ts";
+import { appendNeedsInputAnswers } from "../../src/domain/draft/scope.ts";
 import {
 	FALLBACK_SLUG,
 	HANDOFF_PROMPT_EXTENSION,
@@ -120,24 +121,100 @@ describe("slugify", () => {
 	});
 });
 
-describe("appendReviewFeedback", () => {
-	it("appends the first review-feedback section", () => {
+describe("normalizeReviewFeedback", () => {
+	it("strips every tolerated trailing Verdict form", () => {
+		for (const verdictLine of [
+			"Verdict: fix",
+			"Verdict: fix.",
+			"**Verdict:** fix",
+			"**Verdict: fix**",
+			"_Verdict:_ FIX",
+			"`Verdict: fix`",
+			"Verdict: **fix**",
+		]) {
+			assert.equal(
+				normalizeReviewFeedback(`Fix the timeout handling.\n\n${verdictLine}  \n\t`),
+				"Fix the timeout handling.",
+				verdictLine,
+			);
+		}
+	});
+
+	it("preserves a Verdict line that is not trailing", () => {
 		assert.equal(
-			appendReviewFeedback("# Worker prompt", "Handle the retry edge case.", 1),
-			"# Worker prompt\n\n## Review feedback (iteration 1)\n\nHandle the retry edge case.\n",
+			normalizeReviewFeedback("Verdict: fix\nThe final recommendation follows elsewhere."),
+			"Verdict: fix\nThe final recommendation follows elsewhere.",
+		);
+	});
+
+	it("preserves malformed or non-trailing Verdict lines", () => {
+		for (const feedback of [
+			"Verdict: fix\nThe final recommendation follows elsewhere.",
+			"Fix it.\nVerdict: fix, but see notes",
+			"Fix it.\nVerdict: fix..",
+		]) {
+			assert.equal(normalizeReviewFeedback(feedback), feedback, feedback);
+		}
+	});
+
+	it("does not remove other feedback formatting", () => {
+		assert.equal(normalizeReviewFeedback("\n- Add a test\n  - cover timeout\n"), "- Add a test\n  - cover timeout");
+	});
+});
+
+describe("appendReviewFeedback", () => {
+	const CHECKPOINT_HEAD = "abc1234def5678";
+	const PREAMBLE =
+		"This is iteration 1. The working tree already contains the previous iteration's changes against checkpoint `abc1234`; do not start over and do not revert them unless the feedback below says to. A reviewer inspected that tree and reported the findings below. Address only these; do not expand scope.";
+
+	it("appends the first review-feedback section with worker context", () => {
+		assert.equal(
+			appendReviewFeedback("# Worker prompt", "Handle the retry edge case.", 1, CHECKPOINT_HEAD),
+			`# Worker prompt\n\n## Review feedback (iteration 1)\n\n${PREAMBLE}\n\nHandle the retry edge case.\n`,
 		);
 	});
 
 	it("preserves an earlier feedback section when appending the next iteration", () => {
-		const first = appendReviewFeedback("# Worker prompt", "Handle the retry edge case.", 1);
-		assert.equal(
-			appendReviewFeedback(first, "Add a regression test.", 2),
-			"# Worker prompt\n\n## Review feedback (iteration 1)\n\nHandle the retry edge case.\n\n## Review feedback (iteration 2)\n\nAdd a regression test.\n",
+		const first = appendReviewFeedback("# Worker prompt", "Handle the retry edge case.", 1, CHECKPOINT_HEAD);
+		assert.match(
+			appendReviewFeedback(first, "Add a regression test.", 2, CHECKPOINT_HEAD),
+			/## Review feedback \(iteration 1\)[\s\S]*## Review feedback \(iteration 2\)/,
 		);
 	});
 
-	it("leaves the prompt unchanged for empty feedback", () => {
-		assert.equal(appendReviewFeedback("# Worker prompt\n", " \n\t", 1), "# Worker prompt\n");
+	it("leaves the prompt unchanged for empty or verdict-only feedback", () => {
+		assert.equal(appendReviewFeedback("# Worker prompt\n", " \n\t", 1, CHECKPOINT_HEAD), "# Worker prompt\n");
+		assert.equal(
+			appendReviewFeedback("# Worker prompt\n", "**Verdict:** fix", 1, CHECKPOINT_HEAD),
+			"# Worker prompt\n",
+		);
+	});
+});
+
+describe("appendNeedsInputAnswers", () => {
+	const HEADING = "Answers to the previous draft's NEEDS INPUT questions";
+	const ANSWERED_TEXT =
+		"1. Which retry policy?\n\nExponential backoff.\n\n2. Configurable timeout?\n\nYes, default 30s.";
+
+	it("appends a heading-labelled section under existing scope", () => {
+		assert.equal(
+			appendNeedsInputAnswers("Also update the docs.", HEADING, ANSWERED_TEXT),
+			`Also update the docs.\n\n## ${HEADING}\n\n${ANSWERED_TEXT}\n`,
+		);
+	});
+
+	it("builds the section alone when there was no prior scope", () => {
+		assert.equal(appendNeedsInputAnswers("", HEADING, ANSWERED_TEXT), `## ${HEADING}\n\n${ANSWERED_TEXT}\n`);
+	});
+
+	it("includes both the restated questions and the answers", () => {
+		const result = appendNeedsInputAnswers("", HEADING, ANSWERED_TEXT);
+		assert.match(result, /Which retry policy\?/);
+		assert.match(result, /Exponential backoff\./);
+	});
+
+	it("leaves the scope unchanged when the answered text is blank", () => {
+		assert.equal(appendNeedsInputAnswers("Also update the docs.", HEADING, "   \n\t"), "Also update the docs.");
 	});
 });
 
@@ -148,5 +225,65 @@ describe("hasNeedsInputMarker", () => {
 
 	it("does not match ordinary lowercase prose", () => {
 		assert.equal(hasNeedsInputMarker("The implementation needs input validation before writing code."), false);
+	});
+});
+
+describe("extractNeedsInput", () => {
+	it("returns a heading section's body, stopping before the next heading", () => {
+		const prompt = [
+			"# Handoff: add retries",
+			"",
+			"## NEEDS INPUT",
+			"",
+			"1. Which retry policy applies to streaming calls?",
+			"2. Should the timeout be configurable?",
+			"",
+			"## Background",
+			"",
+			"Verified context goes here.",
+		].join("\n");
+		assert.equal(
+			extractNeedsInput(prompt),
+			"1. Which retry policy applies to streaming calls?\n2. Should the timeout be configurable?",
+		);
+	});
+
+	it("returns the marker's paragraph up to the next blank line when there is no heading", () => {
+		const prompt = [
+			"# Handoff: add retries",
+			"",
+			"Note: NEEDS INPUT — which retry policy applies to streaming calls?",
+			"Also confirm the timeout default.",
+			"",
+			"## Next section",
+			"",
+			"More text.",
+		].join("\n");
+		assert.equal(
+			extractNeedsInput(prompt),
+			"NEEDS INPUT — which retry policy applies to streaming calls?\nAlso confirm the timeout default.",
+		);
+	});
+
+	it("falls back to the bare marker line when neither a heading nor a blank line applies", () => {
+		const prompt = "NEEDS INPUT: which retry policy applies to streaming calls?";
+		assert.equal(extractNeedsInput(prompt), prompt);
+	});
+
+	it("returns the first heading section when the marker appears twice", () => {
+		const prompt = [
+			"## NEEDS INPUT",
+			"",
+			"Question A?",
+			"",
+			"## Background",
+			"",
+			"Some verified context.",
+			"",
+			"## NEEDS INPUT",
+			"",
+			"Question B?",
+		].join("\n");
+		assert.equal(extractNeedsInput(prompt), "Question A?");
 	});
 });

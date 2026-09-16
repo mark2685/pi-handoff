@@ -120,3 +120,87 @@ export function parseDraft<T, E>(response: string, validate: DraftValidator<T, E
 export function hasNeedsInputMarker(prompt: string): boolean {
 	return /\bNEEDS INPUT\b/.test(prompt);
 }
+
+/** Matches a Markdown heading line and captures its `#` run, so its depth can be compared. */
+const HEADING_LINE = /^(#{1,6})\s+/;
+
+/** Finds the 0-based index of the first line containing the marker. */
+function findMarkerLineIndex(lines: readonly string[]): number {
+	return lines.findIndex((line) => hasNeedsInputMarker(line));
+}
+
+/**
+ * Returns a heading section's body, bounded by the next heading at the same or
+ * a shallower depth (fewer `#` characters), or the end of the prompt.
+ *
+ * The heading line itself is excluded: it is usually just "## NEEDS INPUT" and
+ * carries no question text, so the gate would otherwise show a redundant title.
+ */
+function extractHeadingSection(lines: readonly string[], headingIndex: number, level: number): string {
+	let end = lines.length;
+	for (let index = headingIndex + 1; index < lines.length; index += 1) {
+		const match = lines[index]?.match(HEADING_LINE);
+		if (match !== null && match !== undefined && match[1] !== undefined && match[1].length <= level) {
+			end = index;
+			break;
+		}
+	}
+	return lines
+		.slice(headingIndex + 1, end)
+		.join("\n")
+		.trim();
+}
+
+/**
+ * Returns the paragraph containing the marker, from the marker's own text
+ * onward, up to the next blank line.
+ *
+ * Falls back to the bare marker line when no blank line follows: extracting to
+ * the end of an un-paragraphed document would otherwise drag in unrelated
+ * trailing content that was never delimited as part of this question.
+ */
+function extractParagraph(lines: readonly string[], markerLineIndex: number): string {
+	const markerLine = lines[markerLineIndex] ?? "";
+	const markerIndex = markerLine.search(/\bNEEDS INPUT\b/);
+
+	let blankIndex = -1;
+	for (let index = markerLineIndex; index < lines.length; index += 1) {
+		if ((lines[index] ?? "").trim() === "") {
+			blankIndex = index;
+			break;
+		}
+	}
+
+	if (blankIndex === -1) return markerLine.trim();
+
+	const firstLine = markerLine.slice(Math.max(markerIndex, 0));
+	const restLines = lines.slice(markerLineIndex + 1, blankIndex);
+	return [firstLine, ...restLines].join("\n").trim();
+}
+
+/**
+ * Extracts only the NEEDS INPUT questions from a drafted prompt, for the gate
+ * that shows them instead of the whole prompt.
+ *
+ * Three shapes, tried in order: a Markdown heading whose text contains the
+ * marker yields that heading's body; otherwise the marker's own paragraph, from
+ * the marker onward, up to the next blank line; otherwise the bare line
+ * containing the marker. Only the first occurrence of the marker is used, so a
+ * prompt with two NEEDS INPUT sections surfaces the first one.
+ *
+ * Callers should only call this when `hasNeedsInputMarker(prompt)` is true; if
+ * the marker is absent, the whole prompt is returned unchanged.
+ */
+export function extractNeedsInput(prompt: string): string {
+	const lines = prompt.split("\n");
+	const markerLineIndex = findMarkerLineIndex(lines);
+	if (markerLineIndex === -1) return prompt;
+
+	const markerLine = lines[markerLineIndex] ?? "";
+	const heading = markerLine.match(HEADING_LINE);
+	if (heading !== null && heading[1] !== undefined) {
+		return extractHeadingSection(lines, markerLineIndex, heading[1].length);
+	}
+
+	return extractParagraph(lines, markerLineIndex);
+}

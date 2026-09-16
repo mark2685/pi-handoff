@@ -16,6 +16,7 @@ import { Container, SelectList, Spacer, Text, type SelectItem } from "@earendil-
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatUsageLines, type UsageTotals } from "../domain/report/format.ts";
+import type { CapturedReview } from "../domain/review.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import { gateBMenu, type GateBOptionId } from "./menus.ts";
 
@@ -24,6 +25,9 @@ const REPORT_PREVIEW_LINES = 24;
 
 /** Lines of diffstat shown before it is truncated. */
 const DIFFSTAT_PREVIEW_LINES = 12;
+
+/** Lines of captured reviewer findings shown before they are truncated. */
+const REVIEW_PREVIEW_LINES = 24;
 
 export interface GateBView {
 	slug: string;
@@ -40,6 +44,8 @@ export interface GateBView {
 	usage: UsageTotals | null;
 	/** Present only for an interrupted run, explaining what ended it. */
 	interruptionNote: string | undefined;
+	/** Captured Review here response, only when it applies to this iteration. */
+	review?: CapturedReview;
 	/**
 	 * Whether another worker iteration is allowed, used only for the menu label.
 	 *
@@ -77,6 +83,17 @@ function reportLines(view: GateBView): string[] {
 	return ["Worker report:", ...preview(view.report.trimEnd(), REPORT_PREVIEW_LINES)];
 }
 
+/** Renders the reviewer response that would otherwise be obscured behind this overlay. */
+function reviewLines(view: GateBView): string[] {
+	if (view.review === undefined) return [];
+	return [
+		"",
+		`Reviewer verdict: ${view.review.verdict ?? "none (no Verdict: line found)"}`,
+		"Reviewer findings:",
+		...preview(view.review.text.trimEnd(), REVIEW_PREVIEW_LINES),
+	];
+}
+
 /**
  * Builds Gate B's summary lines.
  *
@@ -98,6 +115,7 @@ export function formatGateBSummary(view: GateBView): string[] {
 		...diffstatLines(view),
 		"",
 		...reportLines(view),
+		...reviewLines(view),
 	];
 }
 
@@ -115,6 +133,7 @@ export function formatGateBTitle(view: GateBView): string {
 export async function openGateB(ctx: ExtensionContext, view: GateBView): Promise<GateBOptionId | undefined> {
 	const options = gateBMenu({
 		interrupted: view.report === null,
+		...(view.review === undefined ? {} : { review: view.review }),
 		...(view.feedback === undefined ? {} : { feedback: view.feedback }),
 	});
 	const items: SelectItem[] = options.map((option) => ({

@@ -8,16 +8,19 @@
  * decisions that matter stay testable without a TUI.
  *
  * Three behaviors here are correctness requirements rather than conveniences.
- * The prompt file is written before any outcome that can open Gate A, so the
+ * The prompt file is written before any outcome that can open a gate, so the
  * external fallback survives a later failure. A draft carrying the explicit
- * `NEEDS INPUT` marker never reaches Gate A. And a tier that resolves to no
- * available model yields a ready outcome with an undefined choice rather than a
- * fabricated one, which is what lets Gate A open with Run blocked.
+ * `NEEDS INPUT` marker never reaches Gate A — it is retained so the NEEDS INPUT
+ * gate's Answer and Edit options can finish it later, rather than abandoned. And
+ * a tier that resolves to no available model yields a ready outcome with an
+ * undefined choice rather than a fabricated one, which is what lets Gate A open
+ * with Run blocked.
  *
  * The machine stays in `drafting` until a real `ModelChoice` exists, because
  * `propose` requires one. That is deliberate: there is no representable
- * `proposed` state with a missing model, so an unresolved tier cannot be
- * mistaken for an approved proposal.
+ * `proposed` state with a missing model or an open question, so neither an
+ * unresolved tier nor a NEEDS INPUT draft can be mistaken for an approved
+ * proposal.
  */
 
 import { buildPromptPath } from "../domain/draft/slug.ts";
@@ -94,6 +97,14 @@ export interface DraftService {
 	chooseModel(choice: ModelChoice): Result<DraftReady, HandoffConflict>;
 	/** Rewrites the prompt file and the retained draft after Edit prompt. */
 	revisePrompt(prompt: string): Promise<Result<DraftReady, HandoffConflict | PromptWriteFailure>>;
+	/**
+	 * Finishes a retained draft with replacement prompt text, from the NEEDS INPUT
+	 * gate's Answer (re-drafted prompt) or Edit (hand-edited prompt) options.
+	 * Refuses with a conflict when no draft is retained; returns `needs_input`
+	 * again, rather than a conflict, when the replacement prompt still carries the
+	 * marker.
+	 */
+	continueWithPrompt(prompt: string): Promise<Result<DraftOutcome, HandoffConflict>>;
 	/** Re-checks a choice against the live registry immediately before Run. */
 	isChoiceRunnable(choice: ModelChoice | undefined): boolean;
 	/** Returns to idle after Cancel, Run externally, or a terminal failure. */
@@ -105,13 +116,18 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	const { machine, draftingModel, transcript, promptWriter, recorder, rubric, availableModels } = deps;
 
 	/**
-	 * The draft produced while no model was available.
+	 * The draft retained while the machine cannot expose one: an unresolved tier
+	 * awaiting a model, or a NEEDS INPUT draft awaiting an answer or an edit.
 	 *
-	 * Held only for the window between an unresolved tier and the user's model
-	 * pick. Cleared on every terminal outcome so a later handoff can never inherit
-	 * a stale draft.
+	 * `machine.draft()` is undefined in the `drafting` state, which is exactly the
+	 * state both of those outcomes leave behind, so Change model and the NEEDS
+	 * INPUT gate need the draft that the pending outcome carried. It is retained
+	 * here rather than pushed into the machine so no state can hold a draft
+	 * without a model or with an unanswered question. Cleared on every terminal
+	 * outcome so a later handoff can never inherit a stale draft, and replaced
+	 * rather than leaked across a re-draft.
 	 */
-	let unresolvedDraft: Draft | undefined;
+	let retainedDraft: Draft | undefined;
 
 	/** Persists the machine's current state so a resumed session can recover it. */
 	function record(): void {
@@ -120,7 +136,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 
 	/** Returns to idle and records the reset, used by every terminal drafting outcome. */
 	function abandon(): void {
-		unresolvedDraft = undefined;
+		retainedDraft = undefined;
 		machine.reset();
 		record();
 	}
@@ -147,15 +163,45 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	}
 
 	/**
-	 * The draft awaiting a model, which the machine cannot expose while drafting.
-	 *
-	 * `machine.draft()` is undefined in the `drafting` state, which is exactly the
-	 * state an unresolved tier leaves behind, so Change model needs the draft that
-	 * the pending outcome carried. It is retained here rather than pushed into the
-	 * machine so no state can hold a draft without a model.
+	 * The draft awaiting a model or an answer, which the machine cannot expose
+	 * while drafting.
 	 */
 	function pendingDraft(): Draft | undefined {
-		return machine.draft() ?? unresolvedDraft;
+		return machine.draft() ?? retainedDraft;
+	}
+
+	/**
+	 * Finishes a parsed draft envelope: write the prompt, divert to NEEDS INPUT if
+	 * the marker survives, otherwise resolve the tier and propose.
+	 *
+	 * Shared by `draft()` and `continueWithPrompt()`, the two paths that produce a
+	 * draft envelope ready to finalize, so the write-before-gate and
+	 * marker-before-resolution rules live in exactly one place instead of two.
+	 */
+	async function finishDraft(draft: Draft): Promise<Result<DraftOutcome, HandoffConflict>> {
+		const written = await writePrompt(draft);
+		if (!written.ok) {
+			abandon();
+			return ok({ kind: "write_failed", failure: written.error });
+		}
+
+		// A draft that still asks for context is retained for the NEEDS INPUT gate, never Gate A.
+		if (hasNeedsInputMarker(draft.prompt)) {
+			retainedDraft = draft;
+			return ok({ kind: "needs_input", draft, promptPath: written.value });
+		}
+
+		const resolution = resolveTier(rubric, draft.tier, availableModels());
+		if (resolution.kind === "none_available") {
+			// No representable proposal exists without a model, so the machine stays drafting.
+			retainedDraft = draft;
+			return ok({ kind: "ready", draft, choice: undefined, promptPath: written.value });
+		}
+
+		const applied = applyChoice(draft, resolution.choice);
+		if (!applied.ok) return err(applied.error);
+		retainedDraft = undefined;
+		return ok({ kind: "ready", draft, choice: resolution.choice, promptPath: written.value });
 	}
 
 	return {
@@ -189,30 +235,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				return ok({ kind: "unparseable", rawResponse: response.value, error: parsed.error });
 			}
 
-			const draft = parsed.value;
-			const written = await writePrompt(draft);
-			if (!written.ok) {
-				abandon();
-				return ok({ kind: "write_failed", failure: written.error });
-			}
-
-			// A draft that asks for context must reach the user, never Gate A.
-			if (hasNeedsInputMarker(draft.prompt)) {
-				abandon();
-				return ok({ kind: "needs_input", draft, promptPath: written.value });
-			}
-
-			const resolution = resolveTier(rubric, draft.tier, availableModels());
-			if (resolution.kind === "none_available") {
-				// No representable proposal exists without a model, so the machine stays drafting.
-				unresolvedDraft = draft;
-				return ok({ kind: "ready", draft, choice: undefined, promptPath: written.value });
-			}
-
-			const applied = applyChoice(draft, resolution.choice);
-			if (!applied.ok) return err(applied.error);
-			unresolvedDraft = undefined;
-			return ok({ kind: "ready", draft, choice: resolution.choice, promptPath: written.value });
+			return finishDraft(parsed.value);
 		},
 
 		chooseModel(choice: ModelChoice): Result<DraftReady, HandoffConflict> {
@@ -225,10 +248,18 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					message: "No drafted handoff is available to assign a model to",
 				});
 			}
+			if (hasNeedsInputMarker(pending.prompt)) {
+				return err({
+					kind: "conflict",
+					current: machine.current().kind,
+					attempted: "chooseModel",
+					message: "Answer the NEEDS INPUT questions, or remove the marker, before choosing a model",
+				});
+			}
 
 			const applied = applyChoice(pending, choice);
 			if (!applied.ok) return err(applied.error);
-			unresolvedDraft = undefined;
+			retainedDraft = undefined;
 			return ok({ kind: "ready", draft: pending, choice, promptPath: buildPromptPath(pending.slug) });
 		},
 
@@ -242,6 +273,14 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					message: "No drafted handoff is available to edit",
 				});
 			}
+			if (hasNeedsInputMarker(existing.prompt)) {
+				return err({
+					kind: "conflict",
+					current: machine.current().kind,
+					attempted: "revisePrompt",
+					message: "Answer the NEEDS INPUT questions, or remove the marker, before editing the prompt",
+				});
+			}
 
 			const revised: Draft = { ...existing, prompt };
 			const written = await writePrompt(revised);
@@ -252,10 +291,25 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				const applied = applyChoice(revised, choice);
 				if (!applied.ok) return err(applied.error);
 			} else {
-				unresolvedDraft = revised;
+				retainedDraft = revised;
 			}
 
 			return ok({ kind: "ready", draft: revised, choice, promptPath: written.value });
+		},
+
+		async continueWithPrompt(prompt: string): Promise<Result<DraftOutcome, HandoffConflict>> {
+			const existing = pendingDraft();
+			if (existing === undefined) {
+				return err({
+					kind: "conflict",
+					current: machine.current().kind,
+					attempted: "continueWithPrompt",
+					message: "No drafted handoff is available to continue",
+				});
+			}
+
+			const revised: Draft = { ...existing, prompt };
+			return finishDraft(revised);
 		},
 
 		isChoiceRunnable(choice: ModelChoice | undefined): boolean {

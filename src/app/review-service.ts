@@ -23,7 +23,8 @@
  * `running` with a prompt the worker never received.
  */
 
-import { appendReviewFeedback } from "../domain/draft/feedback.ts";
+import { appendReviewFeedback, normalizeReviewFeedback } from "../domain/draft/feedback.ts";
+import { parseReviewVerdict } from "../domain/review.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import { err, ok, type Result } from "../domain/result.ts";
@@ -86,8 +87,8 @@ export interface ReviewService {
 	accept(): Result<AcceptOutcome, HandoffConflict>;
 	/** Arms the one `agent_end` that Review here is allowed to act on. */
 	beginReview(): Result<HandoffReviewingState, HandoffConflict>;
-	/** Disarms the review turn, which `agent_end` must do before opening a gate. */
-	clearReview(): Result<HandoffReviewingState, HandoffConflict>;
+	/** Disarms the review turn and persists its final assistant response before reopening Gate B. */
+	clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict>;
 	/** Builds the text Review here injects into the reviewing session. */
 	buildReviewMessage(state: HandoffReviewingState): string;
 	/** Reports whether another iteration is allowed, for the menu's label. */
@@ -148,8 +149,19 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 			return ok(armed.value);
 		},
 
-		clearReview(): Result<HandoffReviewingState, HandoffConflict> {
-			const cleared = machine.clearReviewTurn();
+		clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict> {
+			const reviewing = machine.reviewing();
+			if (reviewing === undefined) return err(noReview("clearReview"));
+			const verdict = reviewText === undefined ? undefined : parseReviewVerdict(reviewText);
+			const review =
+				reviewText === undefined
+					? undefined
+					: {
+							iteration: reviewing.iteration,
+							text: reviewText,
+							...(verdict === undefined ? {} : { verdict }),
+						};
+			const cleared = machine.clearReviewTurn(review);
 			if (!cleared.ok) return err(cleared.error);
 			record();
 			return ok(cleared.value);
@@ -187,11 +199,11 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 				return err({ kind: "bound_reached", iteration: reviewing.iteration, maxIterations });
 			}
 
-			const feedback = options.feedback.trim();
+			const feedback = normalizeReviewFeedback(options.feedback);
 			if (feedback === "") return err({ kind: "empty_feedback" });
 
 			const iteration = reviewing.iteration + 1;
-			const prompt = appendReviewFeedback(reviewing.draft.prompt, feedback, iteration);
+			const prompt = appendReviewFeedback(reviewing.draft.prompt, feedback, iteration, reviewing.checkpoint.head);
 			const promptPath = buildPromptPath(reviewing.draft.slug);
 
 			// The worker reads the file, so the file is the source of truth: it is rewritten

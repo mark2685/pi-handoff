@@ -68,6 +68,7 @@ interface Harness {
 	overlays: number[];
 	notifications: { message: string; level?: string }[];
 	messages: string[];
+	editorPrefills: string[];
 }
 
 interface HarnessOptions {
@@ -75,6 +76,7 @@ interface HarnessOptions {
 	selections?: (string | undefined)[];
 	interrupted?: boolean;
 	maxIterations?: number;
+	editorResult?: string | undefined;
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -82,6 +84,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const overlays: number[] = [];
 	const notifications: { message: string; level?: string }[] = [];
 	const messages: string[] = [];
+	const editorPrefills: string[] = [];
 	const selections = [...(options.selections ?? [])];
 
 	const recorder: HandoffStateRecorder = { record: () => {} };
@@ -136,7 +139,10 @@ function createHarness(options: HarnessOptions = {}): Harness {
 				return selections.shift();
 			},
 			select: async () => undefined,
-			editor: async () => undefined,
+			editor: async (_title: string, prefill?: string) => {
+				editorPrefills.push(prefill ?? "");
+				return options.editorResult;
+			},
 		},
 	} as unknown as ExtensionContext;
 
@@ -151,7 +157,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 	});
 
-	return { flow, machine, runService, ctx, overlays, notifications, messages };
+	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills };
 }
 
 /** Drives the machine to a pending review, which is Gate B's precondition. */
@@ -225,7 +231,7 @@ describe("GateBFlow.run", () => {
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		assert.match(harness.notifications[0]?.message ?? "", /`\/handoff` reopens this review/);
+		assert.match(harness.notifications[0]?.message ?? "", /`\/handoff-v2` reopens this review/);
 	});
 
 	it("treats an escaped gate as leaving the review pending", async () => {
@@ -284,6 +290,43 @@ describe("GateBFlow.run", () => {
 		assert.equal(harness.overlays.length, 2);
 	});
 
+	it("prefills feedback with captured review text minus its verdict", async () => {
+		const harness = createHarness({ selections: ["feedback"], editorResult: undefined });
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({
+			iteration: 1,
+			verdict: "fix",
+			text: "Fix the timeout edge case.\nVerdict: fix\n",
+		});
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.editorPrefills, ["Fix the timeout edge case."]);
+	});
+
+	it("opens a blank feedback editor when no review was captured", async () => {
+		const harness = createHarness({ selections: ["feedback"], editorResult: undefined });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.editorPrefills, [""]);
+	});
+
+	it("returns to the gate without sending verdict-only feedback", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "Verdict: fix" });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.overlays.length, 2);
+		assert.equal(harness.machine.reviewing()?.iteration, 1);
+		assert.match(harness.notifications[0]?.message ?? "", /No feedback to send/);
+	});
+
 	it("refuses feedback at the bound without opening an editor", async () => {
 		const harness = createHarness({ maxIterations: 1, selections: ["feedback", "dismiss"] });
 		await reachReview(harness);
@@ -333,14 +376,19 @@ describe("GateBFlow.handleAgentEnd", () => {
 		assert.equal(harness.overlays.length, 2);
 	});
 
-	it("clears the arm when it reopens the gate", async () => {
+	it("captures the final reviewer text and verdict before reopening Gate B", async () => {
 		const harness = createHarness({ selections: ["review", "dismiss"] });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await harness.flow.handleAgentEnd(harness.ctx, "The timeout path needs a test.\nVerdict: FIX\n");
 
+		assert.deepEqual(harness.machine.reviewing()?.review, {
+			iteration: 1,
+			verdict: "fix",
+			text: "The timeout path needs a test.\nVerdict: FIX\n",
+		});
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
 	});
 

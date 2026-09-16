@@ -175,6 +175,42 @@ describe("formatGateBSummary", () => {
 		const lines = formatGateBSummary({ ...COMPLETED_VIEW, report });
 		assert.ok(lines.includes("… 16 more lines"));
 	});
+
+	it("is unchanged when no review was captured", () => {
+		const withoutReview = formatGateBSummary(COMPLETED_VIEW);
+		const copiedWithoutReview = formatGateBSummary({ ...COMPLETED_VIEW });
+		assert.deepEqual(copiedWithoutReview, withoutReview);
+		assert.equal(
+			withoutReview.some((line) => line.startsWith("Reviewer verdict:")),
+			false,
+		);
+	});
+
+	it("shows every parsed reviewer verdict and its findings", () => {
+		for (const verdict of ["accept", "fix", "discard"] as const) {
+			const lines = formatGateBSummary({
+				...COMPLETED_VIEW,
+				review: { iteration: 1, verdict, text: `Finding for ${verdict}.\nVerdict: ${verdict}` },
+			});
+			assert.ok(lines.includes(`Reviewer verdict: ${verdict}`));
+			assert.ok(lines.includes(`Finding for ${verdict}.`));
+		}
+	});
+
+	it("shows captured findings when the verdict could not be parsed", () => {
+		const lines = formatGateBSummary({
+			...COMPLETED_VIEW,
+			review: { iteration: 1, text: "The review ended without the required recommendation." },
+		});
+		assert.ok(lines.includes("Reviewer verdict: none (no Verdict: line found)"));
+		assert.ok(lines.includes("The review ended without the required recommendation."));
+	});
+
+	it("truncates a long review preview", () => {
+		const text = Array.from({ length: 30 }, (_, index) => `finding ${index}`).join("\n");
+		const lines = formatGateBSummary({ ...COMPLETED_VIEW, review: { iteration: 1, verdict: "fix", text } });
+		assert.ok(lines.includes("… 6 more lines"));
+	});
 });
 
 describe("formatGateBTitle", () => {
@@ -188,10 +224,14 @@ describe("formatGateBTitle", () => {
 });
 
 describe("gateBMenu", () => {
-	it("offers Accept and Discard for a completed run", () => {
-		const ids = gateBMenu({ interrupted: false }).map((option) => option.id);
-		assert.ok(ids.includes("accept"));
-		assert.ok(ids.includes("discard"));
+	it("keeps the original order and labels when no review was captured", () => {
+		const options = gateBMenu({ interrupted: false });
+		assert.deepEqual(
+			options.map((option) => option.id),
+			["review", "feedback", "discard", "accept", "dismiss"],
+		);
+		assert.equal(options[0]?.label, "Review here");
+		assert.equal(options[1]?.label, "Send feedback to worker");
 	});
 
 	it("labels the live options plainly once they are implemented", () => {
@@ -226,6 +266,30 @@ describe("gateBMenu", () => {
 			feedback: { allowed: true, iteration: 1, maxIterations: 3 },
 		});
 		assert.equal(options.find((option) => option.id === "feedback")?.label, "Send feedback to worker");
+	});
+
+	it("relabels review actions after a review without a verdict", () => {
+		const options = gateBMenu({ interrupted: false, review: {} });
+		assert.equal(options.find((option) => option.id === "review")?.label, "Review again");
+		assert.equal(options.find((option) => option.id === "feedback")?.label, "Send review to worker");
+		assert.deepEqual(
+			options.map((option) => option.id),
+			["review", "feedback", "discard", "accept", "dismiss"],
+		);
+	});
+
+	it("puts only fix and accept actions first", () => {
+		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "fix" } })[0]?.id, "feedback");
+		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "accept" } })[0]?.id, "accept");
+		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "discard" } })[0]?.id, "review");
+	});
+
+	it("explains a discard recommendation without moving the destructive action", () => {
+		const options = gateBMenu({ interrupted: false, review: { verdict: "discard" } });
+		assert.equal(
+			options.find((option) => option.id === "discard")?.label,
+			"Discard changes (reviewer recommends discard)",
+		);
 	});
 
 	/** Re-running after a crash is exactly what a user wants from an interrupted review. */

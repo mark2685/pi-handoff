@@ -10,6 +10,7 @@
 import { type Static, type TSchema, Type } from "typebox";
 import { Check, Errors } from "typebox/value";
 import { err, ok, type Result } from "../domain/result.ts";
+import type { CapturedReview, ReviewVerdict } from "../domain/review.ts";
 import type {
 	Checkpoint,
 	CheckpointPathStatus,
@@ -129,6 +130,18 @@ const WorkerUsageSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+const ReviewVerdictSchema = Type.Union([Type.Literal("accept"), Type.Literal("fix"), Type.Literal("discard")]);
+
+/** Optional so session entries written before review capture remain readable. */
+const CapturedReviewSchema = Type.Object(
+	{
+		iteration: Type.Number(),
+		verdict: Type.Optional(ReviewVerdictSchema),
+		text: Type.String(),
+	},
+	{ additionalProperties: false },
+);
+
 const IdleHandoffStateSchema = Type.Object({ kind: Type.Literal("idle") }, { additionalProperties: false });
 
 const DraftingHandoffStateSchema = Type.Object(
@@ -171,6 +184,7 @@ const CompletedReviewingHandoffStateSchema = Type.Object(
 		report: Type.String(),
 		diffstat: Type.String(),
 		usage: WorkerUsageSchema,
+		review: Type.Optional(CapturedReviewSchema),
 		awaitingReviewTurn: Type.Boolean(),
 	},
 	{ additionalProperties: false },
@@ -188,6 +202,7 @@ const InterruptedReviewingHandoffStateSchema = Type.Object(
 		diffstat: Type.Null(),
 		usage: Type.Null(),
 		interruptionNote: Type.String({ minLength: 1 }),
+		review: Type.Optional(CapturedReviewSchema),
 		awaitingReviewTurn: Type.Boolean(),
 	},
 	{ additionalProperties: false },
@@ -259,4 +274,6 @@ assertSchemaMatches<Static<typeof CheckpointPathStatusSchema>, CheckpointPathSta
 assertSchemaMatches<Static<typeof CheckpointSchema>, Checkpoint>(true);
 assertSchemaMatches<Static<typeof ModelChoiceSchema>, ModelChoice>(true);
 assertSchemaMatches<Static<typeof WorkerUsageSchema>, WorkerUsage>(true);
+assertSchemaMatches<Static<typeof ReviewVerdictSchema>, ReviewVerdict>(true);
+assertSchemaMatches<Static<typeof CapturedReviewSchema>, CapturedReview>(true);
 assertSchemaMatches<Static<typeof HandoffStateSchema>, HandoffState>(true);

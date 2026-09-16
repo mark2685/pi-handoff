@@ -14,6 +14,7 @@
 
 import { err, ok, type Result } from "../domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../domain/types.ts";
+import type { CapturedReview } from "../domain/review.ts";
 import { validateHandoffState } from "../persistence/schemas.ts";
 import type { WorkerUsage } from "../ports/worker-runner.ts";
 
@@ -55,6 +56,8 @@ export interface HandoffCompletedReviewingState {
 	readonly report: string;
 	readonly diffstat: string;
 	readonly usage: WorkerUsage;
+	/** The final response captured from Review here, when this iteration was reviewed. */
+	readonly review?: CapturedReview;
 	readonly awaitingReviewTurn: boolean;
 }
 
@@ -73,6 +76,8 @@ export interface HandoffInterruptedReviewingState {
 	readonly diffstat: null;
 	readonly usage: null;
 	readonly interruptionNote: string;
+	/** Present only if a reviewer response was captured before the interrupted review was reopened. */
+	readonly review?: CapturedReview;
 	readonly awaitingReviewTurn: boolean;
 }
 
@@ -153,8 +158,8 @@ export interface HandoffMachine {
 	interruptRun(note: string): Result<HandoffInterruptedReviewingState, HandoffConflict>;
 	/** Arms the one `agent_end` event caused by Review here. */
 	beginReviewTurn(): Result<HandoffCompletedReviewingState, HandoffConflict>;
-	/** Clears the Review here arm before Gate B is reopened. */
-	clearReviewTurn(): Result<HandoffReviewingState, HandoffConflict>;
+	/** Clears the Review here arm and records the response that caused Gate B to reopen. */
+	clearReviewTurn(review?: CapturedReview): Result<HandoffReviewingState, HandoffConflict>;
 	/** Replaces in-memory state with decoded, rehydrated persisted state. */
 	restore(state: HandoffState): void;
 	/** Returns to idle after Cancel, Accept, Discard, or a terminal failure. */
@@ -313,11 +318,15 @@ export function createHandoffMachine(): HandoffMachine {
 			return ok(reviewing);
 		},
 
-		clearReviewTurn(): Result<HandoffReviewingState, HandoffConflict> {
+		clearReviewTurn(review?: CapturedReview): Result<HandoffReviewingState, HandoffConflict> {
 			if (state.kind !== "reviewing") {
 				return conflict(state, "clearReviewTurn", "No review turn is awaiting completion");
 			}
-			const reviewing: HandoffReviewingState = { ...state, awaitingReviewTurn: false };
+			const reviewing: HandoffReviewingState = {
+				...state,
+				...(review === undefined ? {} : { review }),
+				awaitingReviewTurn: false,
+			};
 			state = reviewing;
 			return ok(reviewing);
 		},

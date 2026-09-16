@@ -11,8 +11,8 @@
  *
  * The instructions push the reviewer at the diff rather than the report. A report
  * is a claim; the diff is the evidence. The closing verdict line is required so
- * `agent_end` reopens Gate B with the recommendation sitting directly above it,
- * which is what lets the user act on the review without re-reading the transcript.
+ * `agent_end` can capture the recommendation and show it inside the reopened Gate
+ * B overlay, which otherwise obscures the transcript.
  *
  * The reviewer is told not to edit files. Fixes belong to the worker through the
  * feedback loop, where they land inside the checkpoint that Discard can undo; a

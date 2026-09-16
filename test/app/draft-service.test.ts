@@ -45,6 +45,8 @@ interface Harness {
 
 interface HarnessOptions {
 	response?: Result<string, { kind: "completion_failed"; detail: string }>;
+	/** Consumed in order across calls; the last entry repeats once exhausted. Overrides `response`. */
+	responses?: Result<string, { kind: "completion_failed"; detail: string }>[];
 	transcript?: SessionTranscriptSource;
 	models?: AvailableModel[];
 	rubric?: Rubric;
@@ -57,10 +59,16 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const recorded: HandoffState[] = [];
 	const events: string[] = [];
 
+	let callIndex = 0;
 	const draftingModel: DraftingModel = {
 		complete: async (request) => {
 			requests.push(request);
 			events.push("complete");
+			if (options.responses !== undefined) {
+				const response = options.responses[Math.min(callIndex, options.responses.length - 1)];
+				callIndex += 1;
+				return response ?? ok(JSON.stringify(DRAFT));
+			}
 			return options.response ?? ok(JSON.stringify(DRAFT));
 		},
 	};
@@ -202,10 +210,96 @@ describe("DraftService.draft when the draft asks for context", () => {
 		assert.deepEqual(harness.writes, [{ path: PROMPT_PATH, contents: needsInput.prompt }]);
 	});
 
-	it("returns the machine to idle so no gate can act on it", async () => {
+	it("keeps the machine drafting rather than abandoning the retained draft", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "drafting", scope: "add retries" });
+	});
+
+	it("refuses chooseModel while the marker is still present", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		const chosen = harness.service.chooseModel(EXPECTED_CHOICE);
+		assert.equal(chosen.ok, false);
+	});
+
+	it("refuses revisePrompt while the marker is still present", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		const revised = await harness.service.revisePrompt("Still NEEDS INPUT: same question.");
+		assert.equal(revised.ok, false);
+	});
+
+	it("replaces the retained draft when a second draft() call is made", async () => {
+		const secondDraft: Draft = { ...DRAFT, slug: "add-timeout-config", prompt: "Add a configurable timeout." };
+		const harness = createHarness({
+			responses: [ok(JSON.stringify(needsInput)), ok(JSON.stringify(secondDraft))],
+		});
+
+		await draftOutcome(harness);
+		const secondOutcome = await draftOutcome(harness, "add a configurable timeout instead");
+
+		// The retained draft is now the second draft's, resolved against the live models,
+		// so choosing a model must apply to it and not the first draft's marker-carrying prompt.
+		assert.deepEqual(secondOutcome, {
+			kind: "ready",
+			draft: secondDraft,
+			choice: EXPECTED_CHOICE,
+			promptPath: "/tmp/pi-handoff-add-timeout-config.md",
+		});
+		const chosen = harness.service.chooseModel(EXPECTED_CHOICE);
+		assert.ok(chosen.ok);
+		assert.deepEqual(chosen.value.draft, secondDraft);
+	});
+});
+
+describe("DraftService.continueWithPrompt", () => {
+	const needsInput: Draft = { ...DRAFT, prompt: "NEEDS INPUT: which retry policy applies to streaming calls?" };
+
+	it("reports a conflict when no draft is retained", async () => {
+		const harness = createHarness();
+		const outcome = await harness.service.continueWithPrompt("Use exponential backoff.");
+		assert.equal(outcome.ok, false);
+		assert.equal(outcome.ok === false ? outcome.error.attempted : undefined, "continueWithPrompt");
+	});
+
+	it("resolves to ready with a resolved choice once the marker is removed", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		const outcome = await harness.service.continueWithPrompt("Use exponential backoff on all retries.");
+		assert.ok(outcome.ok);
+		assert.deepEqual(outcome.value, {
+			kind: "ready",
+			draft: { ...needsInput, prompt: "Use exponential backoff on all retries." },
+			choice: EXPECTED_CHOICE,
+			promptPath: PROMPT_PATH,
+		});
+	});
+
+	it("moves the machine to proposed once the marker is removed", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		await harness.service.continueWithPrompt("Use exponential backoff on all retries.");
+		assert.equal(harness.machine.current().kind, "proposed");
+	});
+
+	it("returns needs_input again when the marker is still present", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		const outcome = await harness.service.continueWithPrompt("Still NEEDS INPUT: same question, reworded.");
+		assert.ok(outcome.ok);
+		assert.equal(outcome.value.kind, "needs_input");
+		assert.equal(harness.machine.current().kind, "drafting");
+	});
+
+	it("writes the replacement prompt to the same slug-derived path", async () => {
+		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
+		await draftOutcome(harness);
+		await harness.service.continueWithPrompt("Use exponential backoff on all retries.");
+		assert.deepEqual(harness.writes.at(-1), {
+			path: PROMPT_PATH,
+			contents: "Use exponential backoff on all retries.",
+		});
 	});
 });
 

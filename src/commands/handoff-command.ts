@@ -6,6 +6,14 @@
  * than fall through to a decision. Every branch that ends the handoff routes
  * through the service so the machine and its session entries stay consistent.
  *
+ * A `needs_input` outcome opens its own gate, nested inside the drafting loop,
+ * instead of dumping the whole drafted prompt into the editor: Answer folds the
+ * user's response into the accumulated scope and re-enters drafting, so a
+ * re-draft that again needs input loops rather than dead-ends; Edit finishes the
+ * retained draft in place once the marker is gone. `continueWithPrompt` on the
+ * service is the only path from that draft to Gate A, so this gate can never be
+ * bypassed by construction.
+ *
  * Gate B's own loop lives in `gate-b-flow.ts`, because the `agent_end` reopen and
  * `/handoff` while a review is pending both need it and neither goes through
  * drafting.
@@ -20,10 +28,12 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { DraftOutcome, DraftReady, DraftService } from "../app/draft-service.ts";
+import type { DraftNeedsInput, DraftOutcome, DraftReady, DraftService } from "../app/draft-service.ts";
 import type { HandoffMachine } from "../app/handoff-machine.ts";
 import type { RunOutcome, RunService } from "../app/run-service.ts";
 import { buildLaunchCommand, formatModelChoice } from "../domain/draft/launch.ts";
+import { extractNeedsInput } from "../domain/draft/parse.ts";
+import { appendNeedsInputAnswers } from "../domain/draft/scope.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Clipboard } from "../ports/clipboard.ts";
@@ -32,9 +42,11 @@ import { openGateA } from "../presentation/gate-a.ts";
 import { describeGitFailure } from "../presentation/git-failure.ts";
 import { selectOption, unparseableMenu } from "../presentation/menus.ts";
 import { pickModel } from "../presentation/model-picker.ts";
+import { openNeedsInputGate } from "../presentation/needs-input-gate.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
+import { NEEDS_INPUT_ANSWERS_HEADING } from "../prompts/drafting-prompt.ts";
 import type { GateBFlow } from "./gate-b-flow.ts";
-import { parseHandoffCommand } from "./parse.ts";
+import { HANDOFF_COMMAND, parseHandoffCommand } from "./parse.ts";
 import { formatHandoffStatus } from "./status.ts";
 
 export interface HandoffCommandDeps {
@@ -77,13 +89,91 @@ function reportTerminalOutcome(ctx: ExtensionContext, outcome: DraftOutcome): vo
 			);
 			return;
 		case "needs_input":
-			// The draft asked for context; show it rather than running it.
-			ctx.ui.notify(`The draft needs more context before it can run. Prompt saved to ${outcome.promptPath}`, "warning");
-			ctx.ui.setEditorText(outcome.draft.prompt);
-			return;
 		case "ready":
 		case "unparseable":
 			return;
+	}
+}
+
+/** Outcome of the NEEDS INPUT gate loop, resolved once the loop cannot act on the gate itself. */
+type NeedsInputFlowResult =
+	/** Cancel, or a terminal outcome that already reported itself; the command should return. */
+	| { kind: "cancelled" }
+	/** Answer produced a new scope; the outer drafting loop should re-draft with it. */
+	| { kind: "rescoped"; scope: string }
+	/** Edit produced a prompt with no marker left; Gate A can open. */
+	| { kind: "ready"; view: DraftReady };
+
+/** Prefills the Answer editor with each question followed by a blank line for the response. */
+function buildAnswerPrefill(questions: string): string {
+	return questions
+		.split("\n")
+		.map((line) => `${line}\n`)
+		.join("\n");
+}
+
+/**
+ * Drives the NEEDS INPUT gate until the user answers, edits past the marker, or
+ * cancels.
+ *
+ * This loop is nested inside the outer drafting loop rather than merged into
+ * it: Answer and a blank/marker-carrying Edit both re-show this same gate
+ * without re-entering drafting, while only a successful Answer or Edit hands
+ * control back to the caller.
+ */
+async function runNeedsInputFlow(
+	ctx: ExtensionContext,
+	service: DraftService,
+	initial: DraftNeedsInput,
+	scope: string,
+): Promise<NeedsInputFlowResult> {
+	let current = initial;
+
+	for (;;) {
+		const questions = extractNeedsInput(current.draft.prompt);
+		const selected = await openNeedsInputGate(ctx, {
+			slug: current.draft.slug,
+			promptPath: current.promptPath,
+			questions,
+		});
+
+		if (selected === undefined || selected === "cancel") {
+			service.abandon();
+			ctx.ui.notify(`Handoff cancelled. Prompt left at ${current.promptPath}`, "info");
+			return { kind: "cancelled" };
+		}
+
+		if (selected === "answer") {
+			const answered = await ctx.ui.editor("Answer the NEEDS INPUT questions", buildAnswerPrefill(questions));
+			if (answered === undefined || answered.trim() === "") continue;
+			const nextScope = appendNeedsInputAnswers(scope, NEEDS_INPUT_ANSWERS_HEADING, answered);
+			return { kind: "rescoped", scope: nextScope };
+		}
+
+		// selected === "edit"
+		const edited = await ctx.ui.editor("Edit handoff prompt", current.draft.prompt);
+		if (edited === undefined) continue;
+
+		const continued = await service.continueWithPrompt(edited);
+		if (!continued.ok) {
+			ctx.ui.notify(continued.error.message, "warning");
+			continue;
+		}
+
+		if (continued.value.kind === "needs_input") {
+			ctx.ui.notify("The prompt still contains NEEDS INPUT; answer or remove it before continuing", "warning");
+			current = continued.value;
+			continue;
+		}
+
+		if (continued.value.kind === "ready") {
+			return { kind: "ready", view: continued.value };
+		}
+
+		// write_failed and every drafting-stage outcome are unreachable from continueWithPrompt in
+		// practice, since it only ever finishes an already-parsed draft; reported defensively.
+		reportTerminalOutcome(ctx, continued.value);
+		return { kind: "cancelled" };
 	}
 }
 
@@ -177,13 +267,13 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 		}
 
 		if (command.kind === "unimplemented") {
-			ctx.ui.notify(`/handoff ${command.name} is not implemented yet`, "info");
+			ctx.ui.notify(`${HANDOFF_COMMAND} ${command.name} is not implemented yet`, "info");
 			return;
 		}
 
 		// Drafting needs a gate, an editor, and a model; none of that exists headlessly.
 		if (ctx.mode !== "tui") {
-			ctx.ui.notify("/handoff requires interactive mode; use /handoff status elsewhere", "error");
+			ctx.ui.notify(`${HANDOFF_COMMAND} requires interactive mode; use ${HANDOFF_COMMAND} status elsewhere`, "error");
 			return;
 		}
 
@@ -205,10 +295,11 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 		}
 
 		let view: DraftReady | undefined;
+		let scope = command.scope;
 
 		// Drafting retries in place, so this loop re-enters until a draft is ready or the flow ends.
 		while (view === undefined) {
-			const drafted = await withLoader(ctx, "Drafting handoff…", (signal) => service.draft(command.scope, signal));
+			const drafted = await withLoader(ctx, "Drafting handoff…", (signal) => service.draft(scope, signal));
 			if (drafted.kind === "aborted") {
 				service.abandon();
 				ctx.ui.notify("Handoff drafting cancelled", "info");
@@ -234,6 +325,17 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps) {
 					ctx.ui.notify("Handoff cancelled", "info");
 					return;
 				}
+				continue;
+			}
+
+			if (outcome.value.kind === "needs_input") {
+				const flowResult = await runNeedsInputFlow(ctx, service, outcome.value, scope);
+				if (flowResult.kind === "cancelled") return;
+				if (flowResult.kind === "rescoped") {
+					scope = flowResult.scope;
+					continue;
+				}
+				view = flowResult.view;
 				continue;
 			}
 

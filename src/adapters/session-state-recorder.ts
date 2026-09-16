@@ -25,7 +25,12 @@ export interface SessionHandoffStateRecorderOptions {
 	onError?: (detail: string) => void;
 }
 
-/** Creates a recorder that appends serialized handoff state as a custom session entry. */
+/**
+ * Creates a recorder that appends serialized handoff state as a custom session entry.
+ *
+ * `serializeHandoffState` retains optional review captures, while the persistence
+ * schema remains backward-compatible with entries from before capture existed.
+ */
 export function createSessionHandoffStateRecorder(
 	pi: ExtensionAPI,
 	options: SessionHandoffStateRecorderOptions = {},

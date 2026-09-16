@@ -8,6 +8,20 @@
  * subcommand.
  */
 
+/**
+ * The slash-command name the extension registers.
+ *
+ * Temporarily `handoff-v2` rather than `handoff`, so the `~/.pi/agent/prompts/handoff.md`
+ * template stays reachable as `/handoff` while the extension is tested side by side.
+ * Extension commands shadow prompt templates of the same name, so the two cannot
+ * coexist under one name. Every user-facing mention of the command goes through
+ * `HANDOFF_COMMAND` so flipping this back is a one-line change.
+ */
+export const HANDOFF_COMMAND_NAME = "handoff-v2";
+
+/** The command as typed, with its leading slash, for messages shown to the user. */
+export const HANDOFF_COMMAND = `/${HANDOFF_COMMAND_NAME}`;
+
 /** A recognized `/handoff` invocation. */
 export type HandoffCommand =
 	/** Draft a handoff, optionally narrowed by user-supplied scope. */

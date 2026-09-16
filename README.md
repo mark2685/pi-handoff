@@ -14,6 +14,8 @@ pi install /absolute/path/to/pi-handoff
 /handoff [scope]
 ```
 
+> **Temporary:** while the extension is being tested side by side with the `~/.pi/agent/prompts/handoff.md` template, it is registered as **`/handoff-v2`** (see `HANDOFF_COMMAND_NAME` in `src/commands/parse.ts`). Extension commands shadow prompt templates of the same name, so `/handoff` still runs the template until the name is flipped back. Everything below reads `/handoff` for the intended final name.
+
 - `/handoff` or `/handoff <scope>` — draft a handoff from the current session, optionally narrowed by free-text scope (anything that is not a recognized subcommand is treated as scope, not an error).
 - `/handoff status` — print the current handoff state. Works outside the TUI.
 - `/handoff abort` — recognized but replies "is not implemented yet"; superseded by Escape in the running overlay, since the run blocks the session behind that overlay and the command cannot be typed while a worker is alive.
@@ -23,7 +25,7 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
 
 ## Flow
 
-1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale }`. If the response cannot be parsed, the raw text is placed in the editor and a retry/cancel menu is shown. If the draft contains a `NEEDS INPUT` marker, it is shown to the user rather than run. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
+1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale }`. If the response cannot be parsed, the raw text is placed in the editor and a retry/cancel menu is shown. If the draft contains a `NEEDS INPUT` marker, the gate offers **Answer the questions and re-draft**, **Edit the prompt and continue to Gate A**, or **Cancel**; answers feed a re-draft. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
 2. **Gate A** — shows the prompt, the recommended `provider/model:thinking`, and the rationale. Options:
    - **Run** (shown as "Run (blocked: choose an available model first)" until an available model is chosen)
    - **Edit prompt** — opens an editor prefilled with the prompt and rewrites the `/tmp` file.
@@ -31,17 +33,17 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
    - **Run externally (copy command)** — copies `pi --model "provider/model:thinking" @/tmp/pi-handoff-<slug>.md` to the clipboard via `pbcopy`, falling back to a notification if the clipboard is unavailable.
    - **Cancel** — returns to idle; the `/tmp` file is left in place.
 3. **Run** — a git checkpoint (`git rev-parse HEAD` plus `git status --porcelain`) is taken before spawning, and the chosen model is re-checked against the live registry at the moment of the click. The worker is spawned as `pi --mode json -p --no-session --model <provider>/<model> --thinking <level> @/tmp/pi-handoff-<slug>.md` in the working directory, with no `--tools` and no `--append-system-prompt`. A live overlay shows elapsed time, turns, tokens, context, and cost, plus recent tool calls. Pressing Escape stops the worker (SIGTERM, then SIGKILL after a grace period). An aborted run or one that produced no report still reaches Gate B, marked _interrupted_, with the checkpoint retained.
-4. **Gate B** — shows the worker's report, `git diff --stat` against the checkpoint, and usage. Options (Review here is omitted for interrupted runs):
-   - **Review here** — injects the report, diffstat, and review instructions into the reviewing session as a follow-up message; see Review and feedback below.
-   - **Send feedback to worker** — shown as blocked once the iteration bound is reached.
+4. **Gate B** — shows the worker's report, `git diff --stat` against the checkpoint, usage, and, after **Review here**, the captured reviewer verdict and a bounded findings preview. Options (Review here is omitted for interrupted runs):
+   - **Review here** — injects the report, diffstat, and review instructions into the reviewing session as a follow-up message; see Review and feedback below. After a review it becomes **Review again**.
+   - **Send feedback to worker** — shown as blocked once the iteration bound is reached. After a review it becomes **Send review to worker**; a `fix` verdict puts it first, an `accept` verdict puts Accept first, and a `discard` verdict leaves Discard in place but relabels it to explain the recommendation.
    - **Discard changes** — asks for confirmation first (Keep is the default option), then reverts.
    - **Accept** (shown as "Accept (keep the tree as it is)" for an interrupted run)
    - **Leave this for later** — dismisses the gate without discarding or accepting; `/handoff` reopens it.
 
 ### Review and feedback
 
-- **Review here** arms a one-shot flag and sends the report, the diffstat, and review instructions into the reviewing session as a follow-up user message. The reviewer is told to inspect the actual diff with the read and bash tools rather than trust the report, not to edit or commit anything, and to end the turn with a line beginning `Verdict:` followed by `accept`, `fix`, or `discard`. When that turn ends, the `agent_end` hook reopens Gate B exactly once. Dismissing the gate leaves the review pending without rearming it; `/handoff` reopens it on demand.
-- **Send feedback to worker** opens an editor, appends a `## Review feedback (iteration N)` section to the prompt file on disk, and re-runs the worker against the **original checkpoint** from iteration 1, so Discard still undoes every iteration and the diffstat stays cumulative. Refused once `iteration >= maxIterations`.
+- **Review here** arms a one-shot flag and sends the report, the diffstat, and review instructions into the reviewing session as a follow-up user message. The reviewer is told to inspect the actual diff with the read and bash tools rather than trust the report, not to edit or commit anything, and to end the turn with a line beginning `Verdict:` followed by `accept`, `fix`, or `discard`. When that turn ends, the `agent_end` hook captures the final assistant text and its final non-empty verdict line, persists them on the pending review, and reopens Gate B exactly once. The reopened overlay displays the verdict and findings preview so they are not hidden behind the gate. Dismissing the gate leaves the review pending without rearming it; `/handoff` reopens it on demand.
+- **Send feedback to worker** opens an editor prefilled with the captured reviewer response (minus its trailing `Verdict:` line) when one exists; verdict lines tolerate case differences, simple `*`, `_`, or backtick emphasis around the label or value, and an optional final period. The user can edit or replace it. Normalization happens before the emptiness check, so submitting only a verdict line is refused without starting a worker iteration. It appends a `## Review feedback (iteration N)` section with a preamble that names the iteration and original checkpoint, tells the fresh worker that the working tree already contains prior changes, and limits it to the review findings. It then re-runs against the **original checkpoint** from iteration 1, so Discard still undoes every iteration and the diffstat stays cumulative. Refused once `iteration >= maxIterations`.
 
 ## Safety properties
 

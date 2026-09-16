@@ -58,6 +58,23 @@ export function unparseableMenu(): MenuOption<UnparseableOptionId>[] {
 	];
 }
 
+export type NeedsInputOptionId = "answer" | "edit" | "cancel";
+
+/**
+ * Builds the menu shown when a draft contains the NEEDS INPUT marker.
+ *
+ * Answer comes first because it is the path back into an automated re-draft;
+ * Edit is the manual escape hatch for a user who would rather resolve the
+ * marker by hand than restate answers as scope.
+ */
+export function needsInputMenu(): MenuOption<NeedsInputOptionId>[] {
+	return [
+		{ id: "answer", label: "Answer the questions and re-draft" },
+		{ id: "edit", label: "Edit the prompt and continue to Gate A" },
+		{ id: "cancel", label: "Cancel" },
+	];
+}
+
 export type GateBOptionId = "accept" | "discard" | "review" | "feedback" | "dismiss";
 
 /**
@@ -72,29 +89,48 @@ export type GateBOptionId = "accept" | "discard" | "review" | "feedback" | "dism
  * rather than omitted, following the same convention as Gate A's blocked Run: a
  * silently missing option reads as a broken gate, while a blocked one states the
  * rule. The caller refuses it either way, because a label is a hint and the
- * service is the guarantee.
+ * service is the guarantee. A fix verdict moves feedback first and an accept
+ * verdict moves Accept first; discard is the exception so the destructive action
+ * stays in its normal position, with its label explaining the recommendation.
  */
 export function gateBMenu(options: {
 	interrupted: boolean;
+	/** Present only when Review here captured a response for the current iteration. */
+	review?: { verdict?: "accept" | "fix" | "discard" };
 	/** Present when a review is pending, describing whether another iteration is allowed. */
 	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
 }): MenuOption<GateBOptionId>[] {
+	const reviewed = options.review !== undefined;
 	const reviewOptions: MenuOption<GateBOptionId>[] = options.interrupted
 		? []
-		: [{ id: "review", label: "Review here" }];
+		: [{ id: "review", label: reviewed ? "Review again" : "Review here" }];
 
 	const feedbackLabel =
 		options.feedback !== undefined && !options.feedback.allowed
-			? `Send feedback to worker (blocked: iteration ${options.feedback.iteration} of ${options.feedback.maxIterations} is the last)`
-			: "Send feedback to worker";
+			? `${reviewed ? "Send review to worker" : "Send feedback to worker"} (blocked: iteration ${options.feedback.iteration} of ${options.feedback.maxIterations} is the last)`
+			: reviewed
+				? "Send review to worker"
+				: "Send feedback to worker";
 
-	return [
+	const menu: MenuOption<GateBOptionId>[] = [
 		...reviewOptions,
 		{ id: "feedback", label: feedbackLabel },
-		{ id: "discard", label: "Discard changes" },
+		{
+			id: "discard",
+			label:
+				options.review?.verdict === "discard" ? "Discard changes (reviewer recommends discard)" : "Discard changes",
+		},
 		{ id: "accept", label: options.interrupted ? "Accept (keep the tree as it is)" : "Accept" },
 		{ id: "dismiss", label: "Leave this for later" },
 	];
+	const preferred =
+		options.review?.verdict === "fix" ? "feedback" : options.review?.verdict === "accept" ? "accept" : undefined;
+	if (preferred === undefined) return menu;
+
+	const preferredOption = menu.find((option) => option.id === preferred);
+	return preferredOption === undefined
+		? menu
+		: [preferredOption, ...menu.filter((option) => option !== preferredOption)];
 }
 
 export type ConfirmDiscardOptionId = "discard" | "keep";

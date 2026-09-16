@@ -18,6 +18,9 @@
 /** The marker a draft must contain when the session lacks information for a safe handoff. */
 export const NEEDS_INPUT_MARKER = "NEEDS INPUT";
 
+/** Heading a re-drafted scope uses to feed the user's answers back to the drafting model. */
+export const NEEDS_INPUT_ANSWERS_HEADING = "Answers to the previous draft's NEEDS INPUT questions";
+
 /**
  * System prompt for the drafting call.
  *
@@ -46,7 +49,7 @@ Tell the new agent to inspect the repository and its instructions before editing
 
 ## When context is missing
 
-Never fabricate context. If the conversation lacks information required for a safe handoff — an unstated file, an undecided design question, an unverified command — do not guess and do not paper over it with vague wording. Instead include the literal marker ${NEEDS_INPUT_MARKER} in the prompt, immediately followed by the specific questions the user must answer. A draft containing that marker is shown to the user for answers instead of being run.
+Never fabricate context. If the conversation lacks information required for a safe handoff — an unstated file, an undecided design question, an unverified command — do not guess and do not paper over it with vague wording. Instead include the literal marker ${NEEDS_INPUT_MARKER} in the prompt, immediately followed by the specific questions the user must answer. The user is shown only those questions and may answer them to trigger a re-draft. When the scope below contains a "${NEEDS_INPUT_ANSWERS_HEADING}" section, treat every answer there as already decided and do not re-ask it.
 
 ## Choosing a tier
 

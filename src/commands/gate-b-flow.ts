@@ -22,6 +22,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HandoffMachine } from "../app/handoff-machine.ts";
 import type { ReviewService } from "../app/review-service.ts";
 import type { RunOutcome, RunService } from "../app/run-service.ts";
+import { normalizeReviewFeedback } from "../domain/draft/feedback.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
@@ -31,6 +32,7 @@ import { openAcknowledgement, openGateB, type GateBView } from "../presentation/
 import { describeGitFailure, describeGitOrConflict } from "../presentation/git-failure.ts";
 import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
+import { HANDOFF_COMMAND } from "./parse.ts";
 
 export interface GateBFlowDeps {
 	machine: HandoffMachine;
@@ -58,8 +60,8 @@ export interface GateBFlow {
 	viewFromPendingReview(ctx: ExtensionContext): Promise<GateBView | undefined>;
 	/** Keeps Gate B open until the user accepts, discards, reviews, or defers. */
 	run(ctx: ExtensionContext, view: GateBView): Promise<void>;
-	/** The `agent_end` body: reopens Gate B exactly once after a Review here turn. */
-	handleAgentEnd(ctx: ExtensionContext): Promise<void>;
+	/** The `agent_end` body: captures the review and reopens Gate B exactly once. */
+	handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void>;
 }
 
 /** Wires Gate B's surfaces to the machine and the two session-scoped services. */
@@ -138,11 +140,13 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			if (reviewing === undefined) return undefined;
 
 			const allowance = reviewService.feedbackAllowance();
+			const review = reviewing.review?.iteration === reviewing.iteration ? reviewing.review : undefined;
 			const base = {
 				slug: reviewing.draft.slug,
 				choice: reviewing.choice,
 				promptPath: buildPromptPath(reviewing.draft.slug),
 				iteration: reviewing.iteration,
+				...(review === undefined ? {} : { review }),
 				...(allowance === undefined ? {} : { feedback: allowance }),
 			};
 
@@ -177,7 +181,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 				if (selected === undefined || selected === "dismiss") {
 					ctx.ui.notify(
-						"Review left pending. The worker's changes are still in the working tree, and `/handoff` reopens this review.",
+						`Review left pending. The worker's changes are still in the working tree, and \`${HANDOFF_COMMAND}\` reopens this review.`,
 						"info",
 					);
 					return;
@@ -222,8 +226,16 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					continue;
 				}
 
-				const feedback = await ctx.ui.editor("Review feedback", "");
-				if (feedback === undefined || feedback.trim() === "") continue;
+				const feedback = await ctx.ui.editor(
+					"Review feedback",
+					current.review === undefined ? "" : normalizeReviewFeedback(current.review.text),
+				);
+				if (feedback === undefined) continue;
+				const normalizedFeedback = normalizeReviewFeedback(feedback);
+				if (normalizedFeedback === "") {
+					ctx.ui.notify("No feedback to send: the editor contained only a verdict line.", "warning");
+					continue;
+				}
 
 				const rendered = await runWithWidget(
 					ctx,
@@ -231,7 +243,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					{ nowMs: () => clock.nowMs(), onAbort: () => runService.abortActiveRun() },
 					(onProgress) =>
 						reviewService.sendFeedback({
-							feedback,
+							feedback: normalizedFeedback,
 							cwd: ctx.cwd,
 							onProgress,
 							isChoiceRunnable: (choice) => isChoiceRunnable(ctx, choice),
@@ -290,13 +302,13 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			}
 		},
 
-		async handleAgentEnd(ctx: ExtensionContext): Promise<void> {
+		async handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void> {
 			// The arm flag is the sole condition under which this hook does anything.
 			if (machine.reviewing()?.awaitingReviewTurn !== true) return;
 
 			// Cleared before the gate opens, so a second agent_end for the same prompt
 			// finds the flag already down and does nothing.
-			const cleared = reviewService.clearReview();
+			const cleared = reviewService.clearReview(reviewText);
 			if (!cleared.ok) return;
 
 			// A gate is a TUI overlay; there is nothing to open elsewhere.

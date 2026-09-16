@@ -293,6 +293,30 @@ describe("ReviewService review turn", () => {
 		assert.equal(cleared.value.awaitingReviewTurn, false);
 	});
 
+	it("captures reviewer text and its parsed verdict while clearing the arm", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.service.beginReview();
+		const cleared = harness.service.clearReview("The timeout path needs coverage.\nVerdict: fix\n");
+
+		assert.ok(cleared.ok);
+		assert.deepEqual(cleared.value.review, {
+			iteration: 1,
+			verdict: "fix",
+			text: "The timeout path needs coverage.\nVerdict: fix\n",
+		});
+	});
+
+	it("keeps captured text with an unparseable verdict", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.service.beginReview();
+		const cleared = harness.service.clearReview("I cannot make a recommendation.");
+
+		assert.ok(cleared.ok);
+		assert.deepEqual(cleared.value.review, { iteration: 1, text: "I cannot make a recommendation." });
+	});
+
 	it("keeps the review pending after the arm is cleared", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
@@ -450,6 +474,11 @@ describe("ReviewService.sendFeedback", () => {
 
 		assert.equal(harness.writes[0]?.path, PROMPT_PATH);
 		assert.ok(harness.writes[0]?.contents.includes("## Review feedback (iteration 2)"));
+		assert.ok(
+			harness.writes[0]?.contents.includes(
+				"This is iteration 2. The working tree already contains the previous iteration's changes against checkpoint `abc1234`; do not start over and do not revert them unless the feedback below says to.",
+			),
+		);
 		assert.ok(harness.writes[0]?.contents.includes("Handle the timeout case too."));
 	});
 
@@ -575,6 +604,24 @@ describe("ReviewService.sendFeedback refusals", () => {
 		await harness.service.sendFeedback({ feedback: "   \n ", cwd: CWD, isChoiceRunnable: () => true });
 
 		assert.deepEqual(harness.writes, []);
+	});
+
+	it("treats a verdict-only submission as empty after normalization", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.writes.length = 0;
+		harness.events.length = 0;
+		const sent = await harness.service.sendFeedback({
+			feedback: "**Verdict:** fix",
+			cwd: CWD,
+			isChoiceRunnable: () => true,
+		});
+
+		assert.ok(!sent.ok);
+		assert.equal(sent.error.kind, "empty_feedback");
+		assert.deepEqual(harness.writes, []);
+		assert.ok(!harness.events.includes("spawn"));
+		assert.equal(harness.machine.reviewing()?.iteration, 1);
 	});
 
 	/** The worker reads the file, so a machine that moved anyway would run a stale prompt. */

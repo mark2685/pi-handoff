@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import handoff from "../../index.ts";
+import { HANDOFF_COMMAND, HANDOFF_COMMAND_NAME } from "../../src/commands/parse.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const testAgentDir = mkdtempSync(join(tmpdir(), "pi-handoff-registration-"));
@@ -147,12 +148,12 @@ describe("extension registration", () => {
 	});
 
 	it("registers exactly one command named handoff", () => {
-		assert.deepEqual([...recorder.commands.keys()], ["handoff"]);
+		assert.deepEqual([...recorder.commands.keys()], [HANDOFF_COMMAND_NAME]);
 	});
 
 	it("describes the command for the slash-command list", () => {
 		assert.equal(
-			recorder.commands.get("handoff")?.description,
+			recorder.commands.get(HANDOFF_COMMAND_NAME)?.description,
 			"Draft and run a review-preserving implementation handoff.",
 		);
 	});
@@ -176,7 +177,7 @@ describe("extension registration", () => {
 	});
 
 	it("reports idle for /handoff status", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext();
 		await command.handler("status", ctx);
@@ -184,7 +185,7 @@ describe("extension registration", () => {
 	});
 
 	it("reports status without appending an entry", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx } = createCommandContext();
 		await command.handler("status", ctx);
@@ -192,17 +193,20 @@ describe("extension registration", () => {
 	});
 
 	it("refuses drafting outside interactive mode instead of opening a gate", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext({ hasModel: true });
 		await command.handler("add retries", ctx);
 		assert.deepEqual(notifications, [
-			{ message: "/handoff requires interactive mode; use /handoff status elsewhere", level: "error" },
+			{
+				message: `${HANDOFF_COMMAND} requires interactive mode; use ${HANDOFF_COMMAND} status elsewhere`,
+				level: "error",
+			},
 		]);
 	});
 
 	it("refuses drafting in a TUI session with no model selected", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext({ mode: "tui", hasModel: false });
 		await command.handler("add retries", ctx);
@@ -212,14 +216,14 @@ describe("extension registration", () => {
 	});
 
 	it("reports subcommands owned by later tasks as unimplemented", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext();
 		await command.handler("abort", ctx);
 		await command.handler("config", ctx);
 		assert.deepEqual(notifications, [
-			{ message: "/handoff abort is not implemented yet", level: "info" },
-			{ message: "/handoff config is not implemented yet", level: "info" },
+			{ message: `${HANDOFF_COMMAND} abort is not implemented yet`, level: "info" },
+			{ message: `${HANDOFF_COMMAND} config is not implemented yet`, level: "info" },
 		]);
 	});
 });
@@ -233,7 +237,7 @@ describe("session_start rehydration", () => {
 	});
 
 	it("leaves a session with no handoff entries idle", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext();
 		await fireHook(recorder, "session_start", { type: "session_start", reason: "startup" }, ctx);
@@ -252,7 +256,7 @@ describe("session_start rehydration", () => {
 
 	/** A worker cannot survive a restart, so a persisted `running` entry must come back as a review. */
 	it("downgrades an interrupted worker run to a pending review", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const branch = [
 			{
@@ -276,7 +280,7 @@ describe("session_start rehydration", () => {
 	});
 
 	it("resets a new session even when the previous one held a handoff", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx: resumed } = createCommandContext({
 			branch: [
@@ -305,7 +309,7 @@ describe("session_start rehydration", () => {
 	});
 
 	it("delivers Review here as a follow-up and arms the next review turn", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const branch = [
 			{
@@ -387,7 +391,7 @@ describe("agent_end reopen", () => {
 	});
 
 	it("changes no state when the machine is idle", async () => {
-		const command = recorder.commands.get("handoff");
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext({ mode: "tui" });
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
