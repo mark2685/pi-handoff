@@ -25,7 +25,7 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
 
 ## Flow
 
-1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale }`. If the response cannot be parsed, the raw text is placed in the editor and a retry/cancel menu is shown. If the draft contains a `NEEDS INPUT` marker, the gate offers **Answer the questions and re-draft**, **Edit the prompt and continue to Gate A**, or **Cancel**; answers feed a re-draft. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
+1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale, questions? }`. `questions` is bounded to three structured items (`question`, optional one-line `context`, optional `choices`, optional 0-based `recommended` choice); a bad recommendation index is ignored rather than rejecting the envelope. A non-empty `questions` array opens NEEDS INPUT as the primary signal. A standalone prose `NEEDS INPUT` line — normally `## NEEDS INPUT` — remains a fallback for a non-compliant model, but prose mentions and titles do not count. The gate shows numbered questions, context, choices, and recommendations, and offers **Answer**, **Edit**, **View full draft**, and **Cancel**. It asks one question at a time using a select plus Other or a text input, then feeds deterministic `Q:`/`A:` pairs into the re-draft scope; dismissing a question submits no partial answers. View full draft is read-only and discards edits. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
 2. **Gate A** — shows the prompt, the recommended `provider/model:thinking`, and the rationale. Options:
    - **Run** (shown as "Run (blocked: choose an available model first)" until an available model is chosen)
    - **Edit prompt** — opens an editor prefilled with the prompt and rewrites the `/tmp` file.
@@ -58,7 +58,7 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
 
 Every transition appends a `handoff-state` custom session entry. On `session_start`, the latest valid entry is rehydrated:
 
-- `drafting` or `proposed` → `idle` (the `/tmp` prompt file may be stale).
+- a bare legacy `drafting` state or `proposed` → `idle` (the `/tmp` prompt file may be stale); a `drafting` state with its persisted pending NEEDS INPUT draft reopens that gate on `/handoff`. Answered NEEDS INPUT scope replaces the drafting state's scope before each re-draft, so a later round and restart retain prior answers. If `/handoff <scope>` is used while resuming a pending round, the supplied scope is ignored with a warning; Cancel and re-run to start fresh with it.
 - `running` → an _interrupted_ review, with the note "The worker was interrupted because this Pi session restarted.", keeping the checkpoint so Discard is still available.
 - `reviewing` → `reviewing`, with the review-turn flag cleared so a restart cannot resurrect an armed `agent_end`.
 

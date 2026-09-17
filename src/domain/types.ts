@@ -33,6 +33,18 @@ export interface Checkpoint {
 	statuses: CheckpointPathStatus[];
 }
 
+/** One unresolved decision returned alongside a drafting envelope. */
+export interface DraftQuestion {
+	/** The single decision the user must make. */
+	question: string;
+	/** Short orientation for terms the gate cannot otherwise show. */
+	context?: string;
+	/** Finite options; absent or empty means the answer is free text. */
+	choices?: string[];
+	/** Zero-based recommended choice, present only when it selects a real choice. */
+	recommended?: number;
+}
+
 /** A validated drafting-model envelope ready for rubric resolution and Gate A. */
 export interface Draft {
 	/** Model-provided filename hint; callers normalize it before using a path. */
@@ -43,6 +55,8 @@ export interface Draft {
 	tier: Tier;
 	/** Human-readable explanation displayed alongside the recommended model. */
 	rationale: string;
+	/** Open decisions kept out of prompt prose; absent for a ready draft. */
+	questions?: DraftQuestion[];
 }
 
 /** A concrete model candidate assigned to one rubric tier, in priority order. */

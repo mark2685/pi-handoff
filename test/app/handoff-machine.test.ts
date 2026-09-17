@@ -86,6 +86,26 @@ describe("handoff machine", () => {
 		assert.deepEqual(machine.current(), { kind: "drafting", scope: "persist session state" });
 	});
 
+	it("replaces the scope while drafting without changing the phase", () => {
+		machine.beginDraft("original scope");
+		const result = machine.replaceDraftScope("answered scope\n\n## Answers\n\nQ: Which?\nA: This");
+
+		assert.deepEqual(result, {
+			ok: true,
+			value: { kind: "drafting", scope: "answered scope\n\n## Answers\n\nQ: Which?\nA: This" },
+		});
+		assert.deepEqual(machine.current(), result.ok ? result.value : undefined);
+	});
+
+	it("refuses replacing the scope outside drafting", () => {
+		assertConflict(
+			machine.replaceDraftScope("scope"),
+			"idle",
+			"replaceDraftScope",
+			"A draft scope can be replaced only while drafting",
+		);
+	});
+
 	it("proposes a drafted handoff", () => {
 		machine.beginDraft("persist session state");
 		const result = machine.propose(draft, choice);
@@ -343,6 +363,15 @@ describe("handoff session persistence", () => {
 
 	it("downgrades drafting to idle on rehydration", () => {
 		assert.deepEqual(rehydrateHandoffState({ kind: "drafting", scope: "scope" }), { kind: "idle" });
+	});
+
+	it("keeps a drafting state with a persisted needs-input envelope on rehydration", () => {
+		const pending = {
+			kind: "drafting" as const,
+			scope: "scope",
+			pendingDraft: { draft, promptPath: "/tmp/pi-handoff-draft.md" },
+		};
+		assert.deepEqual(rehydrateHandoffState(pending), pending);
 	});
 
 	it("downgrades proposed to idle on rehydration", () => {

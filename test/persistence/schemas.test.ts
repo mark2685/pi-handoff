@@ -5,6 +5,7 @@ import { createHandoffMachine, serializeHandoffState } from "../../src/app/hando
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
 import type { WorkerUsage } from "../../src/ports/worker-runner.ts";
 import {
+	MAX_DRAFT_QUESTIONS,
 	MAX_RUBRIC_ITERATIONS,
 	validateDraft,
 	validateHandoffState,
@@ -120,6 +121,40 @@ describe("validateDraft", () => {
 		assert.deepEqual(validateDraft(validDraft), { ok: true, value: validDraft });
 	});
 
+	it("accepts structured questions and normalizes unusable recommendations away", () => {
+		const result = validateDraft({
+			...validDraft,
+			questions: [
+				{ question: "Choose a mode", choices: ["Fast", "Safe"], recommended: 1 },
+				{ question: "No choices", recommended: 0 },
+				{ question: "Bad index", choices: ["Only"], recommended: -1 },
+			],
+		});
+		assert.deepEqual(result, {
+			ok: true,
+			value: {
+				...validDraft,
+				questions: [
+					{ question: "Choose a mode", choices: ["Fast", "Safe"], recommended: 1 },
+					{ question: "No choices" },
+					{ question: "Bad index", choices: ["Only"] },
+				],
+			},
+		});
+	});
+
+	it("rejects more than the bounded number of questions", () => {
+		assert.equal(
+			validateDraft({
+				...validDraft,
+				questions: Array.from({ length: MAX_DRAFT_QUESTIONS + 1 }, (_value, index) => ({
+					question: `Question ${index}`,
+				})),
+			}).ok,
+			false,
+		);
+	});
+
 	it("accepts every supported tier", () => {
 		for (const tier of ["routine", "standard", "hard", "frontier"]) {
 			assert.deepEqual(validateDraft({ ...validDraft, tier }), { ok: true, value: { ...validDraft, tier } });
@@ -163,6 +198,13 @@ describe("validateHandoffState", () => {
 
 	it("rejects a malformed drafting variant", () => {
 		assert.equal(validateHandoffState({ kind: "drafting" }).ok, false);
+	});
+
+	it("accepts an older drafting entry with no pending draft", () => {
+		assert.deepEqual(validateHandoffState({ kind: "drafting", scope: "old session" }), {
+			ok: true,
+			value: { kind: "drafting", scope: "old session" },
+		});
 	});
 
 	it("rejects a malformed proposed variant", () => {

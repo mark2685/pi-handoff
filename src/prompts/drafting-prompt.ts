@@ -10,9 +10,9 @@
  * Two rules here are load-bearing rather than stylistic. The model returns a
  * complexity *tier* and never a concrete model id, because an id can be
  * hallucinated or unavailable while a tier resolves deterministically against
- * the live registry. And the model must emit an explicit `NEEDS INPUT` marker
- * rather than invent missing context, because a fabricated handoff is worse
- * than a refused one.
+ * the live registry. And the model must emit structured questions rather than
+ * invent missing context, because a fabricated handoff is worse than a refused
+ * one; the prose heading remains a compatibility fallback.
  */
 
 /** The marker a draft must contain when the session lacks information for a safe handoff. */
@@ -49,7 +49,7 @@ Tell the new agent to inspect the repository and its instructions before editing
 
 ## When context is missing
 
-Never fabricate context. If the conversation lacks information required for a safe handoff — an unstated file, an undecided design question, an unverified command — do not guess and do not paper over it with vague wording. Instead include the literal marker ${NEEDS_INPUT_MARKER} in the prompt, immediately followed by the specific questions the user must answer. The user is shown only those questions and may answer them to trigger a re-draft. When the scope below contains a "${NEEDS_INPUT_ANSWERS_HEADING}" section, treat every answer there as already decided and do not re-ask it.
+Never fabricate context. Ask only when the conversation gives no basis for a safe decision — if it contains a recommendation or stated preference, record that as decided rather than asking for confirmation. Put each remaining decision in the envelope's "questions" array, not in prompt prose. Make each question one decision, answerable in a sentence. Enumerate "choices" when options are finite and set "recommended" to the 0-based better option when one is clear. Include a one-line "context" when the question uses terms defined elsewhere in the prompt, because the gate does not show the full prompt. Aim for at most three questions. The prose "## ${NEEDS_INPUT_MARKER}" heading is a compatibility fallback only; do not emit it when structured questions are present. When the scope below contains a "${NEEDS_INPUT_ANSWERS_HEADING}" section, treat every "Q:"/"A:" pair there as already decided and do not re-ask it.
 
 ## Choosing a tier
 
@@ -77,10 +77,18 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   "slug": "short-kebab-case-name",
   "prompt": "the full self-contained implementation prompt",
   "tier": "routine" | "standard" | "hard" | "frontier",
-  "rationale": "one or two sentences explaining the tier choice"
+  "rationale": "one or two sentences explaining the tier choice",
+  "questions": [
+    {
+      "question": "one unresolved decision",
+      "context": "optional one-line orientation",
+      "choices": ["finite option one", "finite option two"],
+      "recommended": 0
+    }
+  ]
 }
 
-The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task.`;
+The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".`;
 
 /** Builds the drafting call's user message from the serialized session and the user's scope. */
 export function buildDraftingUserMessage(conversationText: string, scope: string): string {

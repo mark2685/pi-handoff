@@ -10,8 +10,8 @@
  * Three behaviors here are correctness requirements rather than conveniences.
  * The prompt file is written before any outcome that can open a gate, so the
  * external fallback survives a later failure. A draft carrying the explicit
- * `NEEDS INPUT` marker never reaches Gate A — it is retained so the NEEDS INPUT
- * gate's Answer and Edit options can finish it later, rather than abandoned. And
+ * structured questions or the fallback `NEEDS INPUT` marker never reach Gate A — they are retained so the NEEDS INPUT
+ * gate's Answer and Edit options can finish them later, rather than abandoned. And
  * a tier that resolves to no available model yields a ready outcome with an
  * undefined choice rather than a fabricated one, which is what lets Gate A open
  * with Run blocked.
@@ -34,6 +34,11 @@ import type { PromptFileWriter, PromptWriteFailure } from "../ports/prompt-file-
 import { buildDraftingUserMessage, DRAFTING_SYSTEM_PROMPT } from "../prompts/drafting-prompt.ts";
 import type { HandoffConflict, HandoffMachine } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
+
+/** Structured questions win over prose; the marker remains a safety net for older model behavior. */
+function needsInput(draft: Draft): boolean {
+	return (draft.questions?.length ?? 0) > 0 || hasNeedsInputMarker(draft.prompt);
+}
 
 /** A draft that is ready for Gate A, including an unresolved-model case. */
 export interface DraftReady {
@@ -164,10 +169,20 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 
 	/**
 	 * The draft awaiting a model or an answer, which the machine cannot expose
-	 * while drafting.
+	 * while drafting. A persisted pending draft takes precedence after recovery.
 	 */
 	function pendingDraft(): Draft | undefined {
-		return machine.draft() ?? retainedDraft;
+		const state = machine.current();
+		return machine.draft() ?? (state.kind === "drafting" ? state.pendingDraft?.draft : undefined) ?? retainedDraft;
+	}
+
+	/** Persists the open round without making a draft with unanswered questions look proposed. */
+	function retainNeedsInputDraft(draft: Draft, promptPath: string): Result<void, HandoffConflict> {
+		retainedDraft = draft;
+		const retained = machine.setPendingDraft({ draft, promptPath });
+		if (!retained.ok) return err(retained.error);
+		record();
+		return ok(undefined);
 	}
 
 	/**
@@ -185,9 +200,10 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			return ok({ kind: "write_failed", failure: written.error });
 		}
 
-		// A draft that still asks for context is retained for the NEEDS INPUT gate, never Gate A.
-		if (hasNeedsInputMarker(draft.prompt)) {
-			retainedDraft = draft;
+		// Structured questions are the primary signal; the prose marker survives as a non-compliant-model fallback.
+		if (needsInput(draft)) {
+			const retained = retainNeedsInputDraft(draft, written.value);
+			if (!retained.ok) return err(retained.error);
 			return ok({ kind: "needs_input", draft, promptPath: written.value });
 		}
 
@@ -206,10 +222,15 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 
 	return {
 		async draft(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>> {
-			// A retry re-enters while already drafting, so only a fresh handoff transitions.
+			// A retry re-enters while already drafting. Replace the scope so answered
+			// NEEDS INPUT decisions survive another round and session recovery.
 			if (machine.current().kind !== "drafting") {
 				const began = machine.beginDraft(scope);
 				if (!began.ok) return err(began.error);
+				record();
+			} else {
+				const replaced = machine.replaceDraftScope(scope);
+				if (!replaced.ok) return err(replaced.error);
 				record();
 			}
 
@@ -235,6 +256,13 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				return ok({ kind: "unparseable", rawResponse: response.value, error: parsed.error });
 			}
 
+			// A successful re-draft supersedes a persisted prior question round before it is finalized.
+			const drafting = machine.current();
+			if (drafting.kind === "drafting" && drafting.pendingDraft !== undefined) {
+				const cleared = machine.clearPendingDraft();
+				if (!cleared.ok) return err(cleared.error);
+				record();
+			}
 			return finishDraft(parsed.value);
 		},
 
@@ -248,7 +276,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					message: "No drafted handoff is available to assign a model to",
 				});
 			}
-			if (hasNeedsInputMarker(pending.prompt)) {
+			if (needsInput(pending)) {
 				return err({
 					kind: "conflict",
 					current: machine.current().kind,
@@ -273,7 +301,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					message: "No drafted handoff is available to edit",
 				});
 			}
-			if (hasNeedsInputMarker(existing.prompt)) {
+			if (needsInput(existing)) {
 				return err({
 					kind: "conflict",
 					current: machine.current().kind,
@@ -308,7 +336,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				});
 			}
 
-			const revised: Draft = { ...existing, prompt };
+			// Edit is the manual escape hatch: its explicit Gate A intent resolves the retained questions.
+			const revised: Draft = { slug: existing.slug, prompt, tier: existing.tier, rationale: existing.rationale };
 			return finishDraft(revised);
 		},
 

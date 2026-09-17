@@ -141,6 +141,7 @@ describe("DraftService.draft", () => {
 		const request = harness.requests[0];
 		assert.ok(request);
 		assert.match(request.systemPrompt, /handoff drafting assistant/);
+		assert.match(request.systemPrompt, /envelope's "questions" array/);
 		assert.match(request.userMessage, /user: add retries/);
 		assert.match(request.userMessage, /add retries/);
 	});
@@ -204,16 +205,77 @@ describe("DraftService.draft when the draft asks for context", () => {
 		assert.deepEqual(outcome, { kind: "needs_input", draft: needsInput, promptPath: PROMPT_PATH });
 	});
 
+	it("uses non-empty structured questions as the primary signal even without prose", async () => {
+		const structured: Draft = {
+			...DRAFT,
+			questions: [
+				{ question: "Which retry policy should streaming use?", choices: ["Fixed", "Exponential"], recommended: 1 },
+			],
+		};
+		const harness = createHarness({ response: ok(JSON.stringify(structured)) });
+		const outcome = await draftOutcome(harness);
+		assert.equal(outcome.kind, "needs_input");
+		assert.deepEqual(outcome.kind === "needs_input" ? outcome.draft.questions : undefined, structured.questions);
+	});
+
+	it("keeps structured questions when prose also contains the fallback marker", async () => {
+		const structured: Draft = {
+			...needsInput,
+			questions: [{ question: "Which retry policy should streaming use?" }],
+		};
+		const harness = createHarness({ response: ok(JSON.stringify(structured)) });
+		const outcome = await draftOutcome(harness);
+		assert.deepEqual(outcome.kind === "needs_input" ? outcome.draft.questions : undefined, structured.questions);
+	});
+
 	it("still writes the prompt file for inspection", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
 		assert.deepEqual(harness.writes, [{ path: PROMPT_PATH, contents: needsInput.prompt }]);
 	});
 
-	it("keeps the machine drafting rather than abandoning the retained draft", async () => {
+	it("keeps the machine drafting and records the retained round", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
-		assert.deepEqual(harness.machine.current(), { kind: "drafting", scope: "add retries" });
+		const expected = {
+			kind: "drafting" as const,
+			scope: "add retries",
+			pendingDraft: { draft: needsInput, promptPath: PROMPT_PATH },
+		};
+		assert.deepEqual(harness.machine.current(), expected);
+		assert.deepEqual(harness.recorded.at(-1), expected);
+	});
+
+	it("carries answered scope into a later pending round and its recorded state", async () => {
+		const first: Draft = {
+			...DRAFT,
+			questions: [{ question: "Which retry policy?" }],
+		};
+		const second: Draft = {
+			...DRAFT,
+			questions: [{ question: "Which timeout?" }],
+		};
+		const answeredScope =
+			"add retries\n\n## Answers to the previous draft's NEEDS INPUT questions\n\nQ: Which retry policy?\nA: Exponential";
+		const harness = createHarness({ responses: [ok(JSON.stringify(first)), ok(JSON.stringify(second))] });
+
+		const firstOutcome = await draftOutcome(harness);
+		assert.equal(firstOutcome.kind, "needs_input");
+		const secondOutcome = await harness.service.draft(answeredScope, undefined);
+
+		assert.equal(secondOutcome.ok, true);
+		assert.deepEqual(harness.machine.current(), {
+			kind: "drafting",
+			scope: answeredScope,
+			pendingDraft: { draft: second, promptPath: PROMPT_PATH },
+		});
+		assert.deepEqual(harness.recorded.at(-1), harness.machine.current());
+
+		const rehydrated = createHandoffMachine();
+		rehydrated.restore(harness.machine.current());
+		const restoredState = rehydrated.current();
+		assert.equal(restoredState.kind, "drafting");
+		assert.equal(restoredState.kind === "drafting" ? restoredState.scope : undefined, answeredScope);
 	});
 
 	it("refuses chooseModel while the marker is still present", async () => {
@@ -226,18 +288,46 @@ describe("DraftService.draft when the draft asks for context", () => {
 	it("refuses revisePrompt while the marker is still present", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
-		const revised = await harness.service.revisePrompt("Still NEEDS INPUT: same question.");
+		const revised = await harness.service.revisePrompt("NEEDS INPUT: same question.");
 		assert.equal(revised.ok, false);
 	});
 
-	it("replaces the retained draft when a second draft() call is made", async () => {
+	it("allows a prompt that discusses NEEDS INPUT without raising it to reach Gate A", async () => {
+		const completeDraft: Draft = {
+			...DRAFT,
+			prompt:
+				"# Task: Replace the NEEDS INPUT editor flow with structured questions and per-question answering in `pi-handoff`",
+		};
+		const harness = createHarness({ response: ok(JSON.stringify(completeDraft)) });
+
+		const outcome = await draftOutcome(harness);
+
+		assert.deepEqual(outcome, {
+			kind: "ready",
+			draft: completeDraft,
+			choice: EXPECTED_CHOICE,
+			promptPath: PROMPT_PATH,
+		});
+		assert.ok(harness.service.chooseModel(EXPECTED_CHOICE).ok);
+	});
+
+	it("replaces the drafting scope and records it when a second draft starts", async () => {
 		const secondDraft: Draft = { ...DRAFT, slug: "add-timeout-config", prompt: "Add a configurable timeout." };
 		const harness = createHarness({
 			responses: [ok(JSON.stringify(needsInput)), ok(JSON.stringify(secondDraft))],
 		});
 
 		await draftOutcome(harness);
-		const secondOutcome = await draftOutcome(harness, "add a configurable timeout instead");
+		const recordedBeforeSecond = harness.recorded.length;
+		const secondScope = "add a configurable timeout instead";
+		const secondOutcome = await draftOutcome(harness, secondScope);
+
+		const secondDraftingState = harness.recorded
+			.slice(recordedBeforeSecond)
+			.filter((state): state is Extract<HandoffState, { kind: "drafting" }> => state.kind === "drafting")
+			.at(-1);
+		assert.deepEqual(secondDraftingState, { kind: "drafting", scope: secondScope });
+		assert.deepEqual(harness.recorded.at(-1), harness.machine.current());
 
 		// The retained draft is now the second draft's, resolved against the live models,
 		// so choosing a model must apply to it and not the first draft's marker-carrying prompt.
@@ -276,6 +366,23 @@ describe("DraftService.continueWithPrompt", () => {
 		});
 	});
 
+	it("uses Edit as an escape hatch for structured questions", async () => {
+		const structuredNeedsInput: Draft = {
+			...DRAFT,
+			questions: [{ question: "Which retry policy should streaming use?" }],
+		};
+		// The prose deliberately has no marker, so only dropping questions can resolve the gate.
+		const harness = createHarness({ response: ok(JSON.stringify(structuredNeedsInput)) });
+		const initial = await draftOutcome(harness);
+		assert.equal(initial.kind, "needs_input");
+
+		const outcome = await harness.service.continueWithPrompt("Use exponential backoff on all retries.");
+
+		assert.ok(outcome.ok);
+		assert.equal(outcome.value.kind, "ready");
+		assert.equal(outcome.value.kind === "ready" ? "questions" in outcome.value.draft : false, false);
+	});
+
 	it("moves the machine to proposed once the marker is removed", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
@@ -286,7 +393,7 @@ describe("DraftService.continueWithPrompt", () => {
 	it("returns needs_input again when the marker is still present", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
-		const outcome = await harness.service.continueWithPrompt("Still NEEDS INPUT: same question, reworded.");
+		const outcome = await harness.service.continueWithPrompt("NEEDS INPUT: same question, reworded.");
 		assert.ok(outcome.ok);
 		assert.equal(outcome.value.kind, "needs_input");
 		assert.equal(harness.machine.current().kind, "drafting");

@@ -1,49 +1,53 @@
 /**
  * The NEEDS INPUT gate: shown instead of Gate A when a draft leaves decisions
- * open.
- *
- * Split the same way as Gate A and Gate B. `formatNeedsInputSummary` is pure and
- * returns the lines shown above the option list, so what the gate says is
- * unit-testable without a TUI. `openNeedsInputGate` only renders those lines with
- * a `ctx.ui.custom` component and resolves the chosen option id.
- *
- * The gate deliberately shows only the extracted questions, never the whole
- * drafted prompt: that is the fix this gate exists to make. The full prompt
- * remains available at `promptPath` and through Edit.
+ * open. Its formatter remains pure so structured questions are inspectable
+ * without a TUI; the overlay only renders it and resolves a stable menu id.
  */
 
 import { Container, SelectList, Spacer, Text, type SelectItem } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { DraftQuestion } from "../domain/types.ts";
 import { needsInputMenu, type NeedsInputOptionId } from "./menus.ts";
 
 export interface NeedsInputView {
 	slug: string;
 	promptPath: string;
-	/** The extracted NEEDS INPUT questions, as returned by `extractNeedsInput`. */
-	questions: string;
+	/** Structured questions, or one fallback question extracted from prose. */
+	questions: DraftQuestion[];
+}
+
+/** The maximum number of question lines a non-scrolling gate can display legibly. */
+const MAX_QUESTION_LINES = 40;
+
+/** Renders a question independently so the same text can be capped without losing menu chrome. */
+function formatQuestion(question: DraftQuestion, index: number): string[] {
+	const lines = [`${index + 1}. ${question.question}`];
+	if (question.context !== undefined) lines.push(`   ${question.context}`);
+	for (const [choiceIndex, choice] of (question.choices ?? []).entries()) {
+		const recommendation = question.recommended === choiceIndex ? " (recommended)" : "";
+		lines.push(`   ${String.fromCharCode(65 + choiceIndex)}. ${choice}${recommendation}`);
+	}
+	return lines;
 }
 
 /**
- * Builds the gate's summary lines.
- *
- * The opening line explains why Gate A did not open, because a user landing
- * here mid-flow has no other cue that the draft was rejected rather than lost.
+ * Builds the gate's summary lines. The cap protects the non-scrolling shell even
+ * for the prose fallback, whose model-authored extraction is necessarily looser.
  */
 export function formatNeedsInputSummary(view: NeedsInputView): string[] {
+	const questionLines = view.questions.flatMap(formatQuestion);
+	const truncated = questionLines.length > MAX_QUESTION_LINES;
+
 	return [
 		`The draft for "${view.slug}" left decisions open and cannot run until they are answered.`,
 		`Prompt:    ${view.promptPath}`,
 		"",
-		...view.questions.split("\n"),
+		...questionLines.slice(0, MAX_QUESTION_LINES),
+		...(truncated ? [`Questions truncated after ${MAX_QUESTION_LINES} lines; see ${view.promptPath}.`] : []),
 	];
 }
 
-/**
- * Renders the NEEDS INPUT gate and resolves the selected option.
- *
- * Resolves undefined when the user dismisses the gate, which callers treat the
- * same as Cancel.
- */
+/** Renders the NEEDS INPUT gate and resolves undefined when the user dismisses it. */
 export async function openNeedsInputGate(
 	ctx: ExtensionContext,
 	view: NeedsInputView,
@@ -82,7 +86,6 @@ export async function openNeedsInputGate(
 
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("dim", "↑↓ navigate   enter select   esc cancel"), 1, 0));
-
 		// SelectList owns key handling; forwarding keeps the container focusable.
 		const focusable = container as Container & { handleInput?: (data: string) => void };
 		focusable.handleInput = (data: string) => list.handleInput(data);

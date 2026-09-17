@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { appendReviewFeedback, normalizeReviewFeedback } from "../../src/domain/draft/feedback.ts";
 import { extractNeedsInput, hasNeedsInputMarker, parseDraft } from "../../src/domain/draft/parse.ts";
+import { formatNeedsInputAnswers } from "../../src/domain/draft/questions.ts";
 import { appendNeedsInputAnswers } from "../../src/domain/draft/scope.ts";
 import {
 	FALLBACK_SLUG,
@@ -191,6 +192,18 @@ describe("appendReviewFeedback", () => {
 	});
 });
 
+describe("formatNeedsInputAnswers", () => {
+	it("renders deterministic question and answer pairs", () => {
+		assert.equal(
+			formatNeedsInputAnswers([
+				{ question: { question: "Which mode?" }, answer: "Safe" },
+				{ question: { question: "Which timeout?" }, answer: "30 seconds" },
+			]),
+			"Q: Which mode?\nA: Safe\n\nQ: Which timeout?\nA: 30 seconds",
+		);
+	});
+});
+
 describe("appendNeedsInputAnswers", () => {
 	const HEADING = "Answers to the previous draft's NEEDS INPUT questions";
 	const ANSWERED_TEXT =
@@ -219,12 +232,39 @@ describe("appendNeedsInputAnswers", () => {
 });
 
 describe("hasNeedsInputMarker", () => {
-	it("detects the explicit uppercase marker", () => {
-		assert.equal(hasNeedsInputMarker("Clarify the API contract. NEEDS INPUT before implementation."), true);
+	it("detects an explicit uppercase marker at the start of a line", () => {
+		for (const prompt of [
+			"## NEEDS INPUT",
+			"NEEDS INPUT: which retry policy applies to streaming calls?",
+			"  NEEDS INPUT: which retry policy applies to streaming calls?",
+			"*NEEDS INPUT*: which retry policy applies to streaming calls?",
+			"_NEEDS INPUT: which retry policy applies to streaming calls.",
+			"`NEEDS INPUT`: which retry policy applies to streaming calls?",
+		]) {
+			assert.equal(hasNeedsInputMarker(prompt), true, prompt);
+		}
 	});
 
-	it("does not match ordinary lowercase prose", () => {
-		assert.equal(hasNeedsInputMarker("The implementation needs input validation before writing code."), false);
+	it("does not mistake task titles and mid-sentence references for a marker", () => {
+		for (const prompt of [
+			"# Task: Replace the NEEDS INPUT editor flow with structured questions and per-question answering in `pi-handoff`",
+			"# Task: Restructure the NEEDS INPUT flow in `pi-handoff` (structured questions, per-question answering, persistence)",
+			"Clarify the API contract. NEEDS INPUT before implementation.",
+		]) {
+			assert.equal(hasNeedsInputMarker(prompt), false, prompt);
+		}
+	});
+
+	it("preserves negative near-matches and lowercase prose", () => {
+		for (const prompt of [
+			"NEEDS INPUTS: clarify the retry policy.",
+			"NEEDS-INPUT: clarify the retry policy.",
+			"NEEDS_INPUT: clarify the retry policy.",
+			"NEEDS  INPUT: clarify the retry policy.",
+			"needs input: clarify the retry policy.",
+		]) {
+			assert.equal(hasNeedsInputMarker(prompt), false, prompt);
+		}
 	});
 });
 
@@ -252,7 +292,7 @@ describe("extractNeedsInput", () => {
 		const prompt = [
 			"# Handoff: add retries",
 			"",
-			"Note: NEEDS INPUT — which retry policy applies to streaming calls?",
+			"NEEDS INPUT — which retry policy applies to streaming calls?",
 			"Also confirm the timeout default.",
 			"",
 			"## Next section",
@@ -262,6 +302,27 @@ describe("extractNeedsInput", () => {
 		assert.equal(
 			extractNeedsInput(prompt),
 			"NEEDS INPUT — which retry policy applies to streaming calls?\nAlso confirm the timeout default.",
+		);
+	});
+
+	it("skips mid-sentence references before the marker heading", () => {
+		const prompt = [
+			"## In scope",
+			"",
+			"This work is subject to the NEEDS INPUT decision below.",
+			"",
+			"## NEEDS INPUT",
+			"",
+			"1. Confirm the completion command should be unhidden.",
+			"2. Decide where it should appear in help output.",
+			"",
+			"## Implementation guidance",
+			"",
+			"Do not include this guidance in the questions.",
+		].join("\n");
+		assert.equal(
+			extractNeedsInput(prompt),
+			"1. Confirm the completion command should be unhidden.\n2. Decide where it should appear in help output.",
 		);
 	});
 

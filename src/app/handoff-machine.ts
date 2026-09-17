@@ -28,6 +28,8 @@ export interface HandoffIdleState {
 export interface HandoffDraftingState {
 	readonly kind: "drafting";
 	readonly scope: string;
+	/** Retained only while user decisions are open, so a resumed session can reopen their gate. */
+	readonly pendingDraft?: { draft: Draft; promptPath: string };
 }
 
 export interface HandoffProposedState {
@@ -137,6 +139,12 @@ export interface HandoffMachine {
 	reviewing(): HandoffReviewingState | undefined;
 	/** Begins drafting from an idle session. */
 	beginDraft(scope: string): Result<HandoffDraftingState, HandoffConflict>;
+	/** Replaces the scope while a retry remains in the drafting phase. */
+	replaceDraftScope(scope: string): Result<HandoffDraftingState, HandoffConflict>;
+	/** Persists a NEEDS INPUT draft while the user decides how to resolve it. */
+	setPendingDraft(pendingDraft: { draft: Draft; promptPath: string }): Result<HandoffDraftingState, HandoffConflict>;
+	/** Clears a prior needs-input round before a re-draft resolves it. */
+	clearPendingDraft(): Result<HandoffDraftingState, HandoffConflict>;
 	/** Records Gate A's draft and chosen worker model. */
 	propose(draft: Draft, choice: ModelChoice): Result<HandoffProposedState, HandoffConflict>;
 	/** Replaces the editable draft before Gate A runs it. */
@@ -218,6 +226,33 @@ export function createHandoffMachine(): HandoffMachine {
 				return conflict(state, "beginDraft", message);
 			}
 			const drafting: HandoffDraftingState = { kind: "drafting", scope };
+			state = drafting;
+			return ok(drafting);
+		},
+
+		replaceDraftScope(scope: string): Result<HandoffDraftingState, HandoffConflict> {
+			if (state.kind !== "drafting") {
+				return conflict(state, "replaceDraftScope", "A draft scope can be replaced only while drafting");
+			}
+			const drafting: HandoffDraftingState = { ...state, scope };
+			state = drafting;
+			return ok(drafting);
+		},
+
+		setPendingDraft(pendingDraft: { draft: Draft; promptPath: string }): Result<HandoffDraftingState, HandoffConflict> {
+			if (state.kind !== "drafting") {
+				return conflict(state, "setPendingDraft", "A pending draft can be retained only while drafting");
+			}
+			const drafting: HandoffDraftingState = { ...state, pendingDraft };
+			state = drafting;
+			return ok(drafting);
+		},
+
+		clearPendingDraft(): Result<HandoffDraftingState, HandoffConflict> {
+			if (state.kind !== "drafting") {
+				return conflict(state, "clearPendingDraft", "A pending draft can be cleared only while drafting");
+			}
+			const drafting: HandoffDraftingState = { kind: "drafting", scope: state.scope };
 			state = drafting;
 			return ok(drafting);
 		},
@@ -347,7 +382,7 @@ export function serializeHandoffState(state: HandoffState): HandoffState {
 		case "idle":
 			return { kind: "idle" };
 		case "drafting":
-			return { kind: "drafting", scope: state.scope };
+			return { ...state };
 		case "proposed":
 			return { kind: "proposed", draft: state.draft, choice: state.choice };
 		case "running":
@@ -379,6 +414,8 @@ export function rehydrateHandoffState(state: HandoffState): HandoffState {
 		case "idle":
 			return IDLE;
 		case "drafting":
+			// Older drafting entries had no retained envelope and still downgrade to idle.
+			return state.pendingDraft === undefined ? IDLE : state;
 		case "proposed":
 			return IDLE;
 		case "running":

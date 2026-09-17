@@ -9,12 +9,14 @@
 
 import { type Static, type TSchema, Type } from "typebox";
 import { Check, Errors } from "typebox/value";
+import { normalizeDraftQuestions } from "../domain/draft/questions.ts";
 import { err, ok, type Result } from "../domain/result.ts";
 import type { CapturedReview, ReviewVerdict } from "../domain/review.ts";
 import type {
 	Checkpoint,
 	CheckpointPathStatus,
 	Draft,
+	DraftQuestion,
 	ModelCandidate,
 	ModelChoice,
 	Rubric,
@@ -76,6 +78,20 @@ export const RubricSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+/** A compact question bound keeps a malformed model response from opening an unbounded dialog sequence. */
+export const MAX_DRAFT_QUESTIONS = 3;
+
+const DraftQuestionSchema = Type.Object(
+	{
+		question: Type.String({ minLength: 1 }),
+		context: Type.Optional(Type.String({ minLength: 1, pattern: "^[^\\r\\n]*$" })),
+		choices: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 8 })),
+		// A bad index is repaired after structural validation instead of rejecting the entire envelope.
+		recommended: Type.Optional(Type.Integer()),
+	},
+	{ additionalProperties: false },
+);
+
 /** Strict envelope returned by the drafting model before it becomes a domain draft. */
 export const DraftSchema = Type.Object(
 	{
@@ -83,6 +99,7 @@ export const DraftSchema = Type.Object(
 		prompt: Type.String({ minLength: 1 }),
 		tier: TierSchema,
 		rationale: Type.String({ minLength: 1 }),
+		questions: Type.Optional(Type.Array(DraftQuestionSchema, { maxItems: MAX_DRAFT_QUESTIONS })),
 	},
 	{ additionalProperties: false },
 );
@@ -144,10 +161,20 @@ const CapturedReviewSchema = Type.Object(
 
 const IdleHandoffStateSchema = Type.Object({ kind: Type.Literal("idle") }, { additionalProperties: false });
 
+const PendingDraftSchema = Type.Object(
+	{
+		draft: DraftSchema,
+		promptPath: Type.String({ minLength: 1 }),
+	},
+	{ additionalProperties: false },
+);
+
 const DraftingHandoffStateSchema = Type.Object(
 	{
 		kind: Type.Literal("drafting"),
 		scope: Type.String(),
+		// Optional so entries recorded before NEEDS INPUT rounds were persisted still decode.
+		pendingDraft: Type.Optional(PendingDraftSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -245,7 +272,13 @@ export function validateRubric(value: unknown): Result<Rubric, DecodeError> {
 
 /** Validates a drafting-model JSON envelope before it enters the domain. */
 export function validateDraft(value: unknown): Result<Draft, DecodeError> {
-	return decode(DraftSchema, value);
+	const decoded = decode(DraftSchema, value);
+	if (!decoded.ok) return decoded;
+	const questions = decoded.value.questions;
+	return ok({
+		...decoded.value,
+		...(questions === undefined ? {} : { questions: normalizeDraftQuestions(questions) }),
+	});
 }
 
 /** Validates a custom session entry before the app layer attempts recovery. */
@@ -267,6 +300,7 @@ function assertSchemaMatches<A, B>(_matches: Exact<A, B>): void {}
 
 assertSchemaMatches<Static<typeof ThinkingLevelSchema>, ThinkingLevel>(true);
 assertSchemaMatches<Static<typeof TierSchema>, Tier>(true);
+assertSchemaMatches<Static<typeof DraftQuestionSchema>, DraftQuestion>(true);
 assertSchemaMatches<Static<typeof ModelCandidateSchema>, ModelCandidate>(true);
 assertSchemaMatches<Static<typeof RubricSchema>, Rubric>(true);
 assertSchemaMatches<Static<typeof DraftSchema>, Draft>(true);

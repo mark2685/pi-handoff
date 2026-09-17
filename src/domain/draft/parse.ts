@@ -112,21 +112,34 @@ export function parseDraft<T, E>(response: string, validate: DraftValidator<T, E
 }
 
 /**
- * Detects the explicit, case-sensitive `NEEDS INPUT` marker in a parsed prompt.
- *
- * Word boundaries prevent near-matches such as `NEEDS INPUTS`; lowercase prose
- * such as "needs input validation" deliberately does not divert Gate A.
+ * Matches a marker that raises an open decision instead of merely discussing the
+ * marker feature. Restricting it to line start keeps a handoff about NEEDS INPUT
+ * itself from being trapped behind its own gate.
  */
-export function hasNeedsInputMarker(prompt: string): boolean {
-	return /\bNEEDS INPUT\b/.test(prompt);
-}
+const NEEDS_INPUT_MARKER_LINE = /^\s*(?:#{1,6}\s+)?(?:[*_`]+)?NEEDS INPUT\b/;
 
 /** Matches a Markdown heading line and captures its `#` run, so its depth can be compared. */
 const HEADING_LINE = /^(#{1,6})\s+/;
 
-/** Finds the 0-based index of the first line containing the marker. */
+/** Returns whether one line raises the explicit, case-sensitive marker. */
+function hasNeedsInputMarkerLine(line: string): boolean {
+	return NEEDS_INPUT_MARKER_LINE.test(line);
+}
+
+/**
+ * Detects an explicit, case-sensitive `NEEDS INPUT` marker that starts its own
+ * line, optionally after indentation, a Markdown heading, or opening emphasis.
+ *
+ * Word boundaries prevent near-matches such as `NEEDS INPUTS`; lowercase prose
+ * and mid-sentence references deliberately do not divert Gate A.
+ */
+export function hasNeedsInputMarker(prompt: string): boolean {
+	return prompt.split("\n").some(hasNeedsInputMarkerLine);
+}
+
+/** Finds the 0-based index of the first line that raises the marker. */
 function findMarkerLineIndex(lines: readonly string[]): number {
-	return lines.findIndex((line) => hasNeedsInputMarker(line));
+	return lines.findIndex(hasNeedsInputMarkerLine);
 }
 
 /**
@@ -182,14 +195,15 @@ function extractParagraph(lines: readonly string[], markerLineIndex: number): st
  * Extracts only the NEEDS INPUT questions from a drafted prompt, for the gate
  * that shows them instead of the whole prompt.
  *
- * Three shapes, tried in order: a Markdown heading whose text contains the
- * marker yields that heading's body; otherwise the marker's own paragraph, from
- * the marker onward, up to the next blank line; otherwise the bare line
- * containing the marker. Only the first occurrence of the marker is used, so a
- * prompt with two NEEDS INPUT sections surfaces the first one.
+ * Three shapes, tried in order: a Markdown heading whose line-start marker
+ * yields that heading's body; otherwise the marker's own paragraph, from the
+ * marker onward, up to the next blank line; otherwise the bare marker line.
+ * Only the first marker line is used, so a prompt with two NEEDS INPUT sections
+ * surfaces the first one.
  *
- * Callers should only call this when `hasNeedsInputMarker(prompt)` is true; if
- * the marker is absent, the whole prompt is returned unchanged.
+ * Callers should only call this when `hasNeedsInputMarker(prompt)` is true; the
+ * marker must start a line after optional indentation, heading, or opening
+ * emphasis. If the marker is absent, the whole prompt is returned unchanged.
  */
 export function extractNeedsInput(prompt: string): string {
 	const lines = prompt.split("\n");

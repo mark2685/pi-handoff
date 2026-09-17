@@ -43,7 +43,7 @@ The extension registers:
 The extension uses these lifecycle hooks:
 
 - `session_start` rehydrates handoff state from a custom session entry so a resumed reviewing session knows a handoff is in flight or awaiting review.
-- `session_shutdown` kills any running worker process.
+- `session_shutdown` kills any running worker process. A drafting state stores an optional `{ draft, promptPath }` pending NEEDS INPUT round; the field is optional so old session entries still decode, and only that retained drafting state is resumed into its gate. Each re-draft replaces the drafting state's scope, preserving accumulated `Q:`/`A:` answers for later rounds and restart. A new scope argument supplied while resuming a pending round is ignored with a warning; Cancel followed by a fresh command is required to use it.
 - `agent_end` reopens Gate B after the review turn that **Review here** injected. It is inert in every other state; it never opens UI or changes state unless the machine is in `reviewing` with `awaitingReviewTurn` set.
 
 ### Flow
@@ -52,7 +52,7 @@ The extension uses these lifecycle hooks:
 /handoff [scope]
   │
   ├─ 1. DRAFT   side-call on the current model:
-  │              session transcript + scope → { prompt, tier, rationale }
+  │              session transcript + scope → { prompt, tier, rationale, questions? }
   │              rubric maps tier → candidate models; first available wins
   │
   ├─ GATE A     prompt + recommended provider/model:thinking + rationale
@@ -79,7 +79,7 @@ Handoff state is a discriminated union owned by one `HandoffMachine`, following 
 
 ```
 idle
-drafting   { scope }
+drafting   { scope, pendingDraft? }
 proposed   { draft, choice }
 running    { draft, choice, iteration, startedAt, checkpoint }
 reviewing  { draft, choice, iteration, checkpoint, report, diffstat, usage, review?, awaitingReviewTurn }
@@ -104,7 +104,7 @@ The draft step serializes the current session branch (`convertToLlm` + `serializ
 }
 ```
 
-Parsing is strict (`persistence/schemas.ts`). If the response does not parse, the user is shown the raw text and offered retry or cancel. A draft containing `NEEDS INPUT` opens the NEEDS INPUT gate described in §7 instead of Gate A. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A so the external fallback and manual inspection are available regardless of what happens next.
+Parsing is strict (`persistence/schemas.ts`). The envelope optionally carries up to three structured `questions`, each with a required `question`, optional one-line `context`, optional finite `choices`, and optional 0-based `recommended` choice. A recommendation that does not select a listed choice is normalized away rather than rejecting the otherwise usable draft. If the response does not parse, the user is shown the raw text and offered retry or cancel. A non-empty structured question array opens the NEEDS INPUT gate described in §7 instead of Gate A. A standalone prose `NEEDS INPUT` line, normally a `## NEEDS INPUT` heading with questions beneath it, remains a fallback for a model that ignores the envelope contract; mentions in prose or a title do not count. The gate asks each question independently with a select (and Other escape) or text input, renders deterministic `Q:`/`A:` pairs into the re-draft scope, and includes a read-only View full draft option. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A so the external fallback and manual inspection are available regardless of what happens next.
 
 ### 5.2 Rubric
 
@@ -173,7 +173,7 @@ Rendered with `ctx.ui.custom`, showing the report, `git diff --stat` against the
 
 ### 5.6 Session entries and recovery
 
-Each transition appends a `handoff-state` custom entry (`pi.appendEntry(customType, data?)`, which returns `void`) containing the serialized machine state minus the child process handle. Writing entries is an `ExtensionAPI` capability rather than a session-manager call, because `ctx.sessionManager` is a read-only `ReadonlySessionManager` with no append method. On `session_start`, the latest entry is decoded; `running` is downgraded to `reviewing` with a note that the worker was interrupted (the child cannot survive a Pi restart), and `/handoff` reopens the appropriate gate. `drafting` and `proposed` are downgraded to `idle` because the `/tmp` prompt file may be stale.
+Each transition appends a `handoff-state` custom entry (`pi.appendEntry(customType, data?)`, which returns `void`) containing the serialized machine state minus the child process handle. Writing entries is an `ExtensionAPI` capability rather than a session-manager call, because `ctx.sessionManager` is a read-only `ReadonlySessionManager` with no append method. On `session_start`, the latest entry is decoded; `running` is downgraded to `reviewing` with a note that the worker was interrupted (the child cannot survive a Pi restart), and `/handoff` reopens the appropriate gate. A bare legacy `drafting` state and `proposed` are downgraded to `idle` because the `/tmp` prompt file may be stale; `drafting` with an optional persisted pending NEEDS INPUT envelope is retained so `/handoff` can reopen that gate.
 
 ### 5.7 Package layout
 
@@ -220,7 +220,7 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 - `agent_end` must be a no-op unless the machine is in `reviewing` with `awaitingReviewTurn` set. It must clear the flag before opening Gate B so a second `agent_end` (for example after an auto-retry or queued follow-up) cannot open a second gate. It must never fire UI in a session where no handoff is active.
 - The `/tmp` prompt file must be written before Gate A so the external fallback works even if the extension fails afterwards.
 - Nothing is committed, pushed, or PR'd by the extension or, via the prompt, by the worker.
-- The drafting step must never fabricate context: the drafting prompt carries the template's instruction to ask rather than invent, and a draft that contains an explicit `NEEDS INPUT` marker is shown to the user instead of Gate A; the user sees the extracted questions in a gate with three options — answer them and re-draft (answers are appended to the drafting scope under the heading `Answers to the previous draft's NEEDS INPUT questions`, restated with the questions so the model treats them as decided), edit the prompt and continue to Gate A (refused while the marker remains), or cancel — and the draft is retained in the drafting state until one of those happens.
+- The drafting step must never fabricate context: the drafting prompt carries the instruction to ask rather than invent, and a draft with a non-empty structured `questions` array is shown to the user instead of Gate A. A standalone prose `## NEEDS INPUT` heading remains a fallback when a model ignores that contract; mentions in prose or a title are not markers. The gate renders numbered questions, context, finite choices, and recommendations, asks one answer at a time, and appends deterministic `Q:`/`A:` pairs under `Answers to the previous draft's NEEDS INPUT questions`; it also offers edit, a read-only full-draft view, and cancel. The pending envelope is retained in optional drafting state so `/handoff` can reopen it after a restart, while older bare drafting entries continue to downgrade to idle.
 - Session-entry rehydration must tolerate a missing or stale `/tmp` file.
 
 ## 8. Code-change Inventory

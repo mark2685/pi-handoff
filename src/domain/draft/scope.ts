@@ -13,13 +13,11 @@
  * Appends the user's answered editor text as a heading-labelled section under
  * the accumulated scope.
  *
- * `answeredText` is expected to already contain both the questions and the
- * user's answers, since the caller prefills the editor with the extracted
- * questions before the user types answers beneath them: the drafting model
- * receives only the scope text and the session transcript, and the original
- * questions are not part of either unless restated here. A blank result is a
- * no-op, matching `appendReviewFeedback`'s convention, so a user who dismisses
- * the editor with nothing left cannot create a misleading empty section.
+ * `answeredText` must deterministically restate each question beside its answer
+ * (normally as `Q:`/`A:` pairs). The drafting model receives only scope and the
+ * session transcript, so the original envelope is otherwise unavailable. A blank
+ * result is a no-op, matching `appendReviewFeedback`'s convention, so a user who
+ * dismisses an answer dialog cannot create a misleading empty section.
  */
 export function appendNeedsInputAnswers(scope: string, heading: string, answeredText: string): string {
 	const trimmedAnswered = answeredText.trim();

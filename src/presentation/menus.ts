@@ -58,7 +58,7 @@ export function unparseableMenu(): MenuOption<UnparseableOptionId>[] {
 	];
 }
 
-export type NeedsInputOptionId = "answer" | "edit" | "cancel";
+export type NeedsInputOptionId = "answer" | "edit" | "view" | "cancel";
 
 /**
  * Builds the menu shown when a draft contains the NEEDS INPUT marker.
@@ -71,6 +71,7 @@ export function needsInputMenu(): MenuOption<NeedsInputOptionId>[] {
 	return [
 		{ id: "answer", label: "Answer the questions and re-draft" },
 		{ id: "edit", label: "Edit the prompt and continue to Gate A" },
+		{ id: "view", label: "View full draft" },
 		{ id: "cancel", label: "Cancel" },
 	];
 }
