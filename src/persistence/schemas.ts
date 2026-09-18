@@ -175,6 +175,8 @@ const DraftingHandoffStateSchema = Type.Object(
 		scope: Type.String(),
 		// Optional so entries recorded before NEEDS INPUT rounds were persisted still decode.
 		pendingDraft: Type.Optional(PendingDraftSchema),
+		// Optional for the same reason; an absent counter reads as the first round.
+		needsInputRound: Type.Optional(Type.Number()),
 	},
 	{ additionalProperties: false },
 );
@@ -196,6 +198,9 @@ const RunningHandoffStateSchema = Type.Object(
 		iteration: Type.Number(),
 		startedAt: Type.String(),
 		checkpoint: CheckpointSchema,
+		// Optional so entries written before external runs and Run and review still decode.
+		external: Type.Optional(Type.Boolean()),
+		autoReview: Type.Optional(Type.Boolean()),
 	},
 	{ additionalProperties: false },
 );
@@ -210,7 +215,12 @@ const CompletedReviewingHandoffStateSchema = Type.Object(
 		checkpoint: CheckpointSchema,
 		report: Type.String(),
 		diffstat: Type.String(),
-		usage: WorkerUsageSchema,
+		// Nullable, not optional: an external run has no usage to report, and null says
+		// "not measured" where zeroes would claim the work was free. Older entries carry
+		// a usage object and still decode.
+		usage: Type.Union([WorkerUsageSchema, Type.Null()]),
+		external: Type.Optional(Type.Boolean()),
+		autoReview: Type.Optional(Type.Boolean()),
 		review: Type.Optional(CapturedReviewSchema),
 		awaitingReviewTurn: Type.Boolean(),
 	},
@@ -229,6 +239,9 @@ const InterruptedReviewingHandoffStateSchema = Type.Object(
 		diffstat: Type.Null(),
 		usage: Type.Null(),
 		interruptionNote: Type.String({ minLength: 1 }),
+		// Optional so entries recorded before crash evidence was retained still decode.
+		partialReport: Type.Optional(Type.String({ minLength: 1 })),
+		stderrTail: Type.Optional(Type.String({ minLength: 1 })),
 		review: Type.Optional(CapturedReviewSchema),
 		awaitingReviewTurn: Type.Boolean(),
 	},

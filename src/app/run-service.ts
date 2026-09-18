@@ -34,6 +34,16 @@
  * would put an abandoned half-report in front of the reviewer as though the run
  * had finished.
  *
+ * A *crash* is interrupted for exactly the same reason, and that generalization is
+ * load-bearing. `classifyOutcome` below treats an error stop reason, an error
+ * message, or a non-zero exit as interrupted **even when earlier assistant text
+ * exists**, because the adapter's report is "the last assistant text seen", not
+ * "the worker's conclusion". A two-hour run whose final message was an error once
+ * reached Gate B as a completed handoff whose entire report was a mid-task
+ * sentence about terminal width, shown next to a 2,816-line diff. That text is
+ * retained as `partialReport` and labelled as pre-crash output rather than
+ * dropped, since the user watched it appear, but it is never promoted to a report.
+ *
  * A restart reuses the checkpoint taken before iteration 1 rather than taking a
  * new one. That is what keeps Discard able to undo every iteration at once and
  * keeps Gate B's diffstat cumulative; a fresh checkpoint per iteration would
@@ -50,6 +60,7 @@ import type {
 	HandoffConflict,
 	HandoffInterruptedReviewingState,
 	HandoffMachine,
+	HandoffRunningState,
 } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
 
@@ -116,6 +127,13 @@ export interface StartRunOptions {
 	isChoiceRunnable: (choice: ModelChoice | undefined) => boolean;
 	/** Receives incremental worker progress for the running widget. */
 	onProgress?: (progress: RunProgress) => void;
+	/**
+	 * Records that a completed run should go straight into the review turn.
+	 *
+	 * Persisted on the run state rather than kept by the caller, so the intent
+	 * survives a session restart mid-run.
+	 */
+	autoReview?: boolean;
 }
 
 export interface RestartRunOptions extends StartRunOptions {
@@ -138,6 +156,34 @@ export interface DiscardResult {
 	skippedPaths: string[];
 }
 
+/** Input for recording a run the user launches in another terminal. */
+export interface StartExternalRunOptions {
+	/** Working directory for the checkpoint, and for the diffstat read later. */
+	cwd: string;
+}
+
+/** The external run was checkpointed and recorded; the user runs it themselves now. */
+export interface ExternalRunStarted {
+	kind: "external_started";
+	state: HandoffRunningState;
+}
+
+export type ExternalStartOutcome = ExternalRunStarted | RunCheckpointFailed | RunRefused;
+
+/** Input for bringing a finished external run to Gate B. */
+export interface CompleteExternalRunOptions {
+	cwd: string;
+	/**
+	 * The report the user pasted, which may legitimately be empty.
+	 *
+	 * An external worker's report lives in another terminal's scrollback, so demanding
+	 * it would block review on a copy-paste. Empty means "no report supplied", and the
+	 * run is recorded as interrupted so Gate B never presents an empty string as a
+	 * result.
+	 */
+	report: string;
+}
+
 export interface RunServiceDeps {
 	machine: HandoffMachine;
 	runner: WorkerRunner;
@@ -149,6 +195,18 @@ export interface RunServiceDeps {
 export interface RunService {
 	/** Re-checks the model, checkpoints, spawns the worker, and prepares Gate B. */
 	start(options: StartRunOptions): Promise<RunOutcome>;
+	/**
+	 * Checkpoints and records a run the user will launch in another terminal.
+	 *
+	 * Takes the same checkpoint a spawned run does, and that is the point: "Run
+	 * externally" used to return to idle, which left the user's own worker editing a
+	 * tree the extension had no boundary for, so its result came back as a pasted
+	 * message with no diffstat and no Discard. No child process is started, so
+	 * `isRunning` stays false and `session_shutdown` has nothing to kill.
+	 */
+	startExternal(options: StartExternalRunOptions): Promise<ExternalStartOutcome>;
+	/** Moves an external run to Gate B, reading the diffstat against its checkpoint. */
+	completeExternal(options: CompleteExternalRunOptions): Promise<RunOutcome>;
 	/**
 	 * Runs another iteration against the review's existing checkpoint.
 	 *
@@ -197,14 +255,85 @@ function interruptionNote(reason: {
 			? "The worker was stopped mid-run. Its partial output is not treated as a report."
 			: "The worker was stopped before it reported a result.";
 	}
-	if (reason.errorMessage !== undefined) return `The worker failed: ${reason.errorMessage}`;
+	// Stated explicitly, because the user watched this text stream into the widget and
+	// would otherwise read its demotion as the extension having lost the report.
+	const partialSuffix = reason.hadPartialReport
+		? " The text it had already produced is kept as pre-crash output, not as a report."
+		: "";
+	if (reason.errorMessage !== undefined) return `The worker failed: ${reason.errorMessage}${partialSuffix}`;
+	if (reason.stopReason === WORKER_ERROR_STOP_REASON) {
+		return `The worker ended on an error rather than finishing its turn.${partialSuffix}`;
+	}
 	if (reason.exitCode !== undefined && reason.exitCode !== 0) {
-		return `The worker exited with code ${reason.exitCode} without producing a report.`;
+		return reason.hadPartialReport
+			? `The worker exited with code ${reason.exitCode} before reporting a result.${partialSuffix}`
+			: `The worker exited with code ${reason.exitCode} without producing a report.`;
 	}
 	if (reason.stopReason !== undefined) {
 		return `The worker stopped (${reason.stopReason}) without producing a report.`;
 	}
 	return "The worker produced no report.";
+}
+
+/** The stop reason Pi reports when a worker's final message is an error rather than a turn. */
+const WORKER_ERROR_STOP_REASON = "error";
+
+/** How much of a failed worker's stderr is retained for the reviewer. */
+export const MAX_STDERR_TAIL_CHARS = 2_000;
+
+/**
+ * Keeps the end of a worker's stderr, which is where the failure is.
+ *
+ * Bounded because stderr can carry megabytes of progress noise, and the clip is
+ * marked so a reviewer never mistakes a truncated log for the whole one.
+ */
+export function stderrTail(stderr: string, limit = MAX_STDERR_TAIL_CHARS): string {
+	const trimmed = stderr.trim();
+	if (trimmed.length <= limit) return trimmed;
+	return `…${trimmed.slice(trimmed.length - limit)}`;
+}
+
+/** How a finished worker's outcome was classified, with the evidence it left behind. */
+export type OutcomeClassification =
+	{ kind: "completed" } | { kind: "interrupted"; note: string; partialReport: string };
+
+/**
+ * Decides whether a finished worker produced a result or died.
+ *
+ * Separated from `spawnAndSettle` and exported so each rule is unit-testable
+ * without a fake child process. The rule: a report only counts when the worker
+ * ended cleanly. Anything that signals death — an abort, an error stop reason, an
+ * error message, or a non-zero exit — is an interruption regardless of how much
+ * text arrived first, because the adapter reports the *last text seen*, not the
+ * worker's conclusion.
+ */
+export function classifyOutcome(outcome: {
+	report: string;
+	aborted: boolean;
+	exitCode: number | undefined;
+	stopReason: string | undefined;
+	errorMessage: string | undefined;
+}): OutcomeClassification {
+	const report = outcome.report.trim();
+	const died =
+		outcome.aborted ||
+		outcome.errorMessage !== undefined ||
+		outcome.stopReason === WORKER_ERROR_STOP_REASON ||
+		(outcome.exitCode !== undefined && outcome.exitCode !== 0);
+
+	if (!died && report !== "") return { kind: "completed" };
+
+	return {
+		kind: "interrupted",
+		note: interruptionNote({
+			aborted: outcome.aborted,
+			hadPartialReport: report !== "",
+			exitCode: outcome.exitCode,
+			errorMessage: outcome.errorMessage,
+			stopReason: outcome.stopReason,
+		}),
+		partialReport: report,
+	};
 }
 
 /** Wires a worker run to the machine, Git, and the clock behind their ports. */
@@ -275,21 +404,19 @@ export function createRunService(deps: RunServiceDeps): RunService {
 							},
 			});
 
-			const report = outcome.report.trim();
+			const classified = classifyOutcome(outcome);
 
-			// An aborted run is interrupted even if the worker emitted text first: partial
-			// output is not a result, and presenting it as one would let a killed worker
-			// reach Gate B as a finished report. An empty report is likewise never dressed
-			// up as a completed review.
-			if (outcome.aborted || report === "") {
-				const note = interruptionNote({
-					aborted: outcome.aborted,
-					hadPartialReport: report !== "",
-					exitCode: outcome.exitCode,
-					errorMessage: outcome.errorMessage,
-					stopReason: outcome.stopReason,
+			// An aborted or crashed run is interrupted even if the worker emitted text first:
+			// partial output is not a result, and presenting it as one would let a killed or
+			// failed worker reach Gate B as a finished report. An empty report is likewise
+			// never dressed up as a completed review.
+			if (classified.kind === "interrupted") {
+				const tail = stderrTail(outcome.stderr);
+				const interrupted = machine.interruptRun({
+					note: classified.note,
+					...(classified.partialReport === "" ? {} : { partialReport: classified.partialReport }),
+					...(tail === "" ? {} : { stderrTail: tail }),
 				});
-				const interrupted = machine.interruptRun(note);
 				if (!interrupted.ok) return { kind: "refused", conflict: interrupted.error };
 				record();
 				const { diffstat, failure } = await readDiffstat(input.cwd, input.checkpoint);
@@ -360,6 +487,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 				iteration: 1,
 				startedAt: clock.nowIso(),
 				checkpoint: checkpoint.value,
+				...(options.autoReview === true ? { autoReview: true } : {}),
 			});
 			if (!started.ok) return { kind: "refused", conflict: started.error };
 			record();
@@ -373,6 +501,83 @@ export function createRunService(deps: RunServiceDeps): RunService {
 					onProgress: options.onProgress,
 				}),
 			);
+		},
+
+		async startExternal(options: StartExternalRunOptions): Promise<ExternalStartOutcome> {
+			const proposed = machine.current();
+			if (proposed.kind !== "proposed") {
+				return {
+					kind: "refused",
+					conflict: {
+						kind: "conflict",
+						current: proposed.kind,
+						attempted: "startExternal",
+						message: "An external run can start only from an approved handoff proposal",
+					},
+				};
+			}
+
+			// The model is deliberately *not* re-checked: the user runs this command in their
+			// own terminal, where model availability is their business and this registry's
+			// view of it says nothing useful.
+			const checkpoint = await git.checkpoint(options.cwd);
+			if (!checkpoint.ok) return { kind: "checkpoint_failed", failure: checkpoint.error };
+
+			const started = machine.startRun({
+				iteration: 1,
+				startedAt: clock.nowIso(),
+				checkpoint: checkpoint.value,
+				external: true,
+			});
+			if (!started.ok) return { kind: "refused", conflict: started.error };
+			record();
+			return { kind: "external_started", state: started.value };
+		},
+
+		async completeExternal(options: CompleteExternalRunOptions): Promise<RunOutcome> {
+			const running = machine.running();
+			if (running === undefined || running.external !== true) {
+				return {
+					kind: "refused",
+					conflict: {
+						kind: "conflict",
+						current: machine.current().kind,
+						attempted: "completeExternal",
+						message: "No external handoff run is in progress",
+					},
+				};
+			}
+
+			const checkpoint = running.checkpoint;
+			const { diffstat, failure } = await readDiffstat(options.cwd, checkpoint);
+			const report = options.report.trim();
+
+			// An empty paste is interrupted rather than completed. Gate B's completed branch
+			// promises a report, and an empty string there would render as a worker that
+			// reported nothing instead of one whose report was never supplied.
+			if (report === "") {
+				const interrupted = machine.interruptRun({
+					note: "The handoff ran in another terminal and no report was supplied. Review the diff directly.",
+				});
+				if (!interrupted.ok) return { kind: "refused", conflict: interrupted.error };
+				record();
+				return {
+					kind: "interrupted",
+					state: interrupted.value,
+					diffstat,
+					diffstatFailure: failure,
+					exitCode: undefined,
+					aborted: false,
+					stderr: "",
+				};
+			}
+
+			// Null usage, never zeroes: no child process was measured, and zeroed metrics
+			// would report a real run as having cost nothing.
+			const completed = machine.completeRun({ report, diffstat, usage: null });
+			if (!completed.ok) return { kind: "refused", conflict: completed.error };
+			record();
+			return { kind: "completed", state: completed.value, exitCode: undefined, diffstatFailure: failure };
 		},
 
 		async restart(options: RestartRunOptions): Promise<RunOutcome> {

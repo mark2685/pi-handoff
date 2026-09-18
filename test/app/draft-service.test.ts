@@ -12,10 +12,16 @@ import { beforeEach, describe, it } from "node:test";
 import { createDraftService, type DraftOutcome, type DraftService } from "../../src/app/draft-service.ts";
 import { createHandoffMachine, type HandoffMachine, type HandoffState } from "../../src/app/handoff-machine.ts";
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
+import { buildLeftoversScope } from "../../src/domain/draft/leftovers.ts";
 import { ok, type Result } from "../../src/domain/result.ts";
 import { DEFAULT_RUBRIC } from "../../src/domain/rubric/defaults.ts";
 import type { AvailableModel, Draft, ModelChoice, Rubric } from "../../src/domain/types.ts";
-import type { DraftingModel, DraftingRequest, SessionTranscriptSource } from "../../src/ports/drafting-model.ts";
+import type {
+	DraftingFailure,
+	DraftingModel,
+	DraftingRequest,
+	SessionTranscriptSource,
+} from "../../src/ports/drafting-model.ts";
 import type { PromptFileWriter, PromptWriteFailure } from "../../src/ports/prompt-file-writer.ts";
 import { err } from "../../src/domain/result.ts";
 
@@ -41,12 +47,15 @@ interface Harness {
 	recorded: HandoffState[];
 	/** Ordered log proving the prompt file is written before an outcome is returned. */
 	events: string[];
+	/** How many times the transcript source was read, so a path can assert it was not. */
+	transcriptReads: () => number;
 }
 
 interface HarnessOptions {
-	response?: Result<string, { kind: "completion_failed"; detail: string }>;
+	/** Typed as the port's own failure union, so an abort is representable alongside a 500. */
+	response?: Result<string, DraftingFailure>;
 	/** Consumed in order across calls; the last entry repeats once exhausted. Overrides `response`. */
-	responses?: Result<string, { kind: "completion_failed"; detail: string }>[];
+	responses?: Result<string, DraftingFailure>[];
 	transcript?: SessionTranscriptSource;
 	models?: AvailableModel[];
 	rubric?: Rubric;
@@ -89,17 +98,30 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	};
 
 	const machine = createHandoffMachine();
+	// Wrapped rather than passed through, so a test can assert that a path which must
+	// not serialize the conversation genuinely never touched the source.
+	let transcriptReads = 0;
+	const source: SessionTranscriptSource = options.transcript ?? {
+		read: () => ({ kind: "text", text: "user: add retries" }),
+	};
+	const transcript: SessionTranscriptSource = {
+		read: () => {
+			transcriptReads += 1;
+			return source.read();
+		},
+	};
+
 	const service = createDraftService({
 		machine,
 		draftingModel,
-		transcript: options.transcript ?? { read: () => ({ kind: "text", text: "user: add retries" }) },
+		transcript,
 		promptWriter,
 		recorder,
 		rubric: options.rubric ?? DEFAULT_RUBRIC,
 		availableModels: () => options.models ?? STANDARD_MODELS,
 	});
 
-	return { service, machine, writes, requests, recorded, events };
+	return { service, machine, writes, requests, recorded, events, transcriptReads: () => transcriptReads };
 }
 
 /** Unwraps an outcome, failing loudly if the machine refused the transition instead. */
@@ -241,6 +263,7 @@ describe("DraftService.draft when the draft asks for context", () => {
 			kind: "drafting" as const,
 			scope: "add retries",
 			pendingDraft: { draft: needsInput, promptPath: PROMPT_PATH },
+			needsInputRound: 1,
 		};
 		assert.deepEqual(harness.machine.current(), expected);
 		assert.deepEqual(harness.recorded.at(-1), expected);
@@ -268,6 +291,8 @@ describe("DraftService.draft when the draft asks for context", () => {
 			kind: "drafting",
 			scope: answeredScope,
 			pendingDraft: { draft: second, promptPath: PROMPT_PATH },
+			// A second round of questions, counted so the gate can offer to end the sequence.
+			needsInputRound: 2,
 		});
 		assert.deepEqual(harness.recorded.at(-1), harness.machine.current());
 
@@ -326,7 +351,13 @@ describe("DraftService.draft when the draft asks for context", () => {
 			.slice(recordedBeforeSecond)
 			.filter((state): state is Extract<HandoffState, { kind: "drafting" }> => state.kind === "drafting")
 			.at(-1);
-		assert.deepEqual(secondDraftingState, { kind: "drafting", scope: secondScope });
+		assert.deepEqual(secondDraftingState, {
+			kind: "drafting",
+			scope: secondScope,
+			// Survives the cleared envelope: it counts rounds asked in this drafting phase,
+			// and clearing the pending draft is how a round ends rather than a reason to reset.
+			needsInputRound: 1,
+		});
 		assert.deepEqual(harness.recorded.at(-1), harness.machine.current());
 
 		// The retained draft is now the second draft's, resolved against the live models,
@@ -487,6 +518,160 @@ describe("DraftService.draft failure paths", () => {
 	});
 });
 
+/**
+ * The leftovers follow-up exists to avoid paying for the transcript twice, so its
+ * defining property is what it does *not* send. The accepted prompt and the review
+ * text are both already in hand; re-serializing the reviewing session alongside them
+ * would spend the drafting call's context on history the accepted work has just
+ * superseded, and tempts the model into re-proposing work the review accepted.
+ *
+ * An earlier version routed this through the ordinary drafting path, which read the
+ * transcript and prefixed the whole conversation as `## Conversation History` with
+ * the leftovers scope appended after it — the documented promise was false, and
+ * nothing caught it because this entry point had no test at all.
+ *
+ * It takes a built scope rather than the raw documents because it is called again for
+ * every retry and answered question round; the caller owns accumulating answers onto
+ * that scope, and these tests cover the re-entry as well as the first pass.
+ */
+describe("DraftService.draftLeftovers", () => {
+	const LEFTOVERS_INPUT = {
+		prompt: "Implement the retry logic in src/client.ts and run `npm test`.",
+		reviewText: "Accept. Two nits: the timeout is undocumented and the test name is misleading.",
+		slug: "add-retry-logic",
+	};
+
+	/** Built exactly as the command layer builds it, so the two cannot drift. */
+	const LEFTOVERS = buildLeftoversScope(LEFTOVERS_INPUT);
+
+	/** Unwraps a leftovers outcome, failing loudly on a refused transition. */
+	async function leftoversOutcome(harness: Harness, scope = LEFTOVERS): Promise<DraftOutcome> {
+		const result = await harness.service.draftLeftovers(scope, undefined);
+		assert.ok(result.ok, "expected the leftovers draft to produce an outcome rather than a conflict");
+		return result.value;
+	}
+
+	it("never reads the transcript source", async () => {
+		const harness = createHarness();
+		await leftoversOutcome(harness);
+		assert.equal(harness.transcriptReads(), 0);
+	});
+
+	it("sends no conversation history section", async () => {
+		const harness = createHarness();
+		await leftoversOutcome(harness);
+		const [request] = harness.requests;
+		assert.ok(request !== undefined);
+		assert.equal(request.userMessage.includes("## Conversation History"), false);
+	});
+
+	/** The transcript fake's text, which must not appear anywhere in the request. */
+	it("sends no transcript text", async () => {
+		const harness = createHarness({ transcript: { read: () => ({ kind: "text", text: "user: add retries" }) } });
+		await leftoversOutcome(harness);
+		const [request] = harness.requests;
+		assert.ok(request !== undefined);
+		assert.equal(request.userMessage.includes("user: add retries"), false);
+	});
+
+	it("sends the accepted prompt and the review text as its whole scope", async () => {
+		const harness = createHarness();
+		await leftoversOutcome(harness);
+		const [request] = harness.requests;
+		assert.ok(request !== undefined);
+		assert.match(request.userMessage, /the timeout is undocumented/);
+		assert.match(request.userMessage, /Implement the retry logic in src\/client\.ts/);
+		assert.match(request.userMessage, /only the remaining items the review flagged/);
+	});
+
+	/**
+	 * Without its own transcript-free path this returned `empty_session` on an empty
+	 * reviewing session, refusing a draft whose two source documents were both
+	 * supplied by the caller.
+	 */
+	it("drafts from an empty session, because the transcript is not its input", async () => {
+		const harness = createHarness({ transcript: { read: () => ({ kind: "empty" }) } });
+		const outcome = await leftoversOutcome(harness);
+		assert.equal(outcome.kind, "ready");
+	});
+
+	it("reaches Gate A through the ordinary path, with the prompt written first", async () => {
+		const harness = createHarness();
+		const outcome = await leftoversOutcome(harness);
+		assert.deepEqual(outcome, { kind: "ready", draft: DRAFT, choice: EXPECTED_CHOICE, promptPath: PROMPT_PATH });
+		assert.deepEqual(harness.events, ["complete", `write:${PROMPT_PATH}`], "expected the write to precede the outcome");
+	});
+
+	/** A follow-up must be as gated as any other handoff, questions included. */
+	it("diverts to NEEDS INPUT when the follow-up draft asks a question", async () => {
+		const harness = createHarness({
+			response: ok(JSON.stringify({ ...DRAFT, questions: [{ question: "Document the timeout where?" }] })),
+		});
+		const outcome = await leftoversOutcome(harness);
+		assert.equal(outcome.kind, "needs_input");
+	});
+
+	it("refuses to start while a handoff is already running", async () => {
+		const harness = createHarness();
+		await draftOutcome(harness);
+		const started = harness.machine.startRun({
+			iteration: 1,
+			startedAt: "2026-01-01T00:00:00.000Z",
+			checkpoint: { repositoryRoot: "/repo", head: "abc", statuses: [] },
+		});
+		assert.ok(started.ok);
+
+		const refused = await harness.service.draftLeftovers(LEFTOVERS, undefined);
+		assert.equal(refused.ok, false);
+	});
+
+	/**
+	 * A re-entry is the case the first implementation got wrong. Every retry and every
+	 * answered question round calls this again with the scope the caller has accumulated,
+	 * and each of those must stay transcript-free — otherwise the promise holds only for
+	 * a first pass that happens to parse and ask nothing.
+	 */
+	it("stays transcript-free when it is called again for a retry", async () => {
+		const harness = createHarness({
+			responses: [ok("not an envelope"), ok(JSON.stringify(DRAFT))],
+		});
+		const unparseable = await leftoversOutcome(harness);
+		assert.equal(unparseable.kind, "unparseable");
+
+		const retried = await leftoversOutcome(harness);
+		assert.equal(retried.kind, "ready");
+		assert.equal(harness.transcriptReads(), 0);
+		assert.equal(harness.requests.length, 2);
+		// Both calls carry the accepted prompt and the review text, so a retry does not
+		// silently re-draft from a scope the leftovers documents dropped out of.
+		for (const request of harness.requests) {
+			assert.match(request.userMessage, /the timeout is undocumented/);
+			assert.equal(request.userMessage.includes("## Conversation History"), false);
+		}
+	});
+
+	/** Answers arrive as an extended scope, which must replace the machine's, not be ignored. */
+	it("replaces the drafting scope when a later round appends answers", async () => {
+		const harness = createHarness({
+			responses: [ok(JSON.stringify({ ...DRAFT, questions: [{ question: "Document the timeout where?" }] }))],
+		});
+		await leftoversOutcome(harness);
+
+		const answered = `${LEFTOVERS}\n\n## Answers\n\nQ: Document the timeout where?\nA: In the README.`;
+		harness.requests.length = 0;
+		await leftoversOutcome(harness, answered);
+
+		const drafting = harness.machine.current();
+		assert.equal(drafting.kind, "drafting");
+		assert.equal(drafting.kind === "drafting" ? drafting.scope : "", answered);
+		const [request] = harness.requests;
+		assert.ok(request !== undefined);
+		assert.match(request.userMessage, /A: In the README\./);
+		assert.match(request.userMessage, /the timeout is undocumented/);
+		assert.equal(harness.transcriptReads(), 0);
+	});
+});
+
 describe("DraftService.chooseModel", () => {
 	const manual: ModelChoice = { provider: "bifrost", model: "claude-opus-5", thinking: "xhigh" };
 
@@ -585,5 +770,43 @@ describe("DraftService.abandon", () => {
 		harness.service.abandon();
 		const chosen = harness.service.chooseModel(EXPECTED_CHOICE);
 		assert.equal(chosen.ok, false);
+	});
+
+	/**
+	 * Abandonment is genuinely racy: escaping the drafting loader resolves the overlay
+	 * at the keypress and the command layer abandons, while the side-call it abandoned
+	 * settles separately, reports `aborted`, and abandons too. Recording
+	 * unconditionally appended two consecutive `idle` entries in the same second,
+	 * which reads in a session log as two abandoned handoffs.
+	 */
+	it("records one idle entry when both callers abandon the same cancellation", async () => {
+		const harness = createHarness();
+		await draftOutcome(harness);
+		const before = harness.recorded.length;
+
+		harness.service.abandon();
+		harness.service.abandon();
+
+		const idleEntries = harness.recorded.slice(before).filter((state) => state.kind === "idle");
+		assert.equal(idleEntries.length, 1);
+	});
+
+	it("records no idle entry at all when the machine was already idle", () => {
+		const harness = createHarness();
+		harness.service.abandon();
+		assert.deepEqual(harness.recorded, []);
+	});
+
+	it("records exactly one idle entry for an aborted drafting call", async () => {
+		// The failure the loader's abort produces, which `draft` abandons on.
+		const harness = createHarness({ response: err({ kind: "aborted" }) });
+		const outcome = await draftOutcome(harness);
+		assert.equal(outcome.kind, "failed");
+
+		// The command layer's own abandon for the same cancellation.
+		harness.service.abandon();
+
+		assert.equal(harness.recorded.filter((state) => state.kind === "idle").length, 1);
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 	});
 });

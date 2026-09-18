@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { appendReviewFeedback, normalizeReviewFeedback } from "../../src/domain/draft/feedback.ts";
 import { extractNeedsInput, hasNeedsInputMarker, parseDraft } from "../../src/domain/draft/parse.ts";
-import { formatNeedsInputAnswers } from "../../src/domain/draft/questions.ts";
+import {
+	buildRecommendedAnswers,
+	formatNeedsInputAnswers,
+	USE_BEST_JUDGEMENT_ANSWER,
+} from "../../src/domain/draft/questions.ts";
 import { appendNeedsInputAnswers } from "../../src/domain/draft/scope.ts";
 import {
 	FALLBACK_SLUG,
@@ -12,6 +16,7 @@ import {
 	MAX_SLUG_LENGTH,
 	buildPromptPath,
 	slugify,
+	stripIterationSuffix,
 } from "../../src/domain/draft/slug.ts";
 import type { Draft } from "../../src/domain/types.ts";
 import { validateDraft } from "../../src/persistence/schemas.ts";
@@ -122,6 +127,66 @@ describe("slugify", () => {
 	});
 });
 
+/**
+ * The drafting prompt forbids these outright; this is the belt to that braces.
+ * A model reading a transcript that already contains review rounds keeps counting,
+ * and a wrong number on the prompt filename is worse than none, because the
+ * filename is what a reviewer greps for.
+ */
+describe("stripIterationSuffix", () => {
+	it("strips a trailing iteration counter a model appended", () => {
+		assert.equal(stripIterationSuffix("tg-feedback-command-iteration-1"), "tg-feedback-command");
+	});
+
+	it("strips the other counter words a model reaches for", () => {
+		assert.equal(stripIterationSuffix("fix-nits-round-2"), "fix-nits");
+		assert.equal(stripIterationSuffix("fix-nits-attempt-3"), "fix-nits");
+		assert.equal(stripIterationSuffix("fix-nits-iter-2"), "fix-nits");
+	});
+
+	/**
+	 * A version number is part of the task's name, not a counter. Stripping `-v\d+`
+	 * turned `upgrade-next-v16` into `upgrade-next` and `migrate-api-v2` into
+	 * `migrate-api`, which loses the one detail identifying the work; `pass` did the
+	 * same to `first-pass-3`. Both are worse than leaving a stray counter, which the
+	 * prompt rule already prevents in the normal case.
+	 */
+	it("leaves version and pass numbers alone, because those name the work", () => {
+		assert.equal(stripIterationSuffix("upgrade-next-v16"), "upgrade-next-v16");
+		assert.equal(stripIterationSuffix("migrate-api-v2"), "migrate-api-v2");
+		assert.equal(stripIterationSuffix("fix-nits-pass-4"), "fix-nits-pass-4");
+		assert.equal(stripIterationSuffix("first-pass-3"), "first-pass-3");
+	});
+
+	it("strips a doubled counter, since a model that adds one sometimes adds two", () => {
+		assert.equal(stripIterationSuffix("fix-nits-round-2-iteration-1"), "fix-nits");
+	});
+
+	it("leaves a counter that is not trailing alone", () => {
+		assert.equal(stripIterationSuffix("iteration-cache-fix"), "iteration-cache-fix");
+	});
+
+	it("keeps a slug that is only a counter rather than emptying it", () => {
+		assert.equal(stripIterationSuffix("iteration-2"), "iteration-2");
+	});
+
+	it("leaves an ordinary slug untouched", () => {
+		assert.equal(stripIterationSuffix("add-retry-logic"), "add-retry-logic");
+	});
+
+	it("does not strip a trailing number that is part of the name", () => {
+		assert.equal(stripIterationSuffix("migrate-to-http2"), "migrate-to-http2");
+	});
+
+	it("is applied by slugify, so a prompt path never carries a false iteration", () => {
+		assert.equal(slugify("TG feedback command (iteration 1)"), "tg-feedback-command");
+		assert.equal(
+			buildPromptPath("fix review nits (iteration 3)"),
+			`${HANDOFF_TEMP_DIR}/${HANDOFF_PROMPT_PREFIX}fix-review-nits${HANDOFF_PROMPT_EXTENSION}`,
+		);
+	});
+});
+
 describe("normalizeReviewFeedback", () => {
 	it("strips every tolerated trailing Verdict form", () => {
 		for (const verdictLine of [
@@ -201,6 +266,69 @@ describe("formatNeedsInputAnswers", () => {
 			]),
 			"Q: Which mode?\nA: Safe\n\nQ: Which timeout?\nA: 30 seconds",
 		);
+	});
+});
+
+/**
+ * Backs "Proceed with recommended answers", the escape hatch from a drafting model
+ * that keeps asking rather than converging — four rounds and thirty-five minutes
+ * before Gate A, in the case that motivated it.
+ */
+describe("buildRecommendedAnswers", () => {
+	it("takes the recommended choice as the answer", () => {
+		assert.deepEqual(
+			buildRecommendedAnswers([{ question: "Which policy?", choices: ["Fixed", "Exponential"], recommended: 1 }]).map(
+				(entry) => entry.answer,
+			),
+			["Exponential"],
+		);
+	});
+
+	it("delegates judgement for a free-text question", () => {
+		assert.deepEqual(
+			buildRecommendedAnswers([{ question: "What timeout?" }]).map((entry) => entry.answer),
+			[USE_BEST_JUDGEMENT_ANSWER],
+		);
+	});
+
+	it("delegates judgement for choices the model would not rank", () => {
+		assert.deepEqual(
+			buildRecommendedAnswers([{ question: "Which policy?", choices: ["Fixed", "Exponential"] }]).map(
+				(entry) => entry.answer,
+			),
+			[USE_BEST_JUDGEMENT_ANSWER],
+		);
+	});
+
+	/** Normalization drops an unusable index, so it can never be read as an answer. */
+	it("delegates judgement when the recommendation does not select a real choice", () => {
+		assert.deepEqual(
+			buildRecommendedAnswers([{ question: "Which policy?", choices: ["Fixed"], recommended: 7 }]).map(
+				(entry) => entry.answer,
+			),
+			[USE_BEST_JUDGEMENT_ANSWER],
+		);
+	});
+
+	it("closes the question explicitly, so the next draft cannot re-ask it", () => {
+		assert.match(USE_BEST_JUDGEMENT_ANSWER, /do not ask again/);
+	});
+
+	it("answers every question, since a partial set would reopen the gate", () => {
+		const answers = buildRecommendedAnswers([
+			{ question: "A?", choices: ["x", "y"], recommended: 0 },
+			{ question: "B?" },
+			{ question: "C?", choices: ["p"] },
+		]);
+		assert.equal(answers.length, 3);
+		assert.ok(answers.every((entry) => entry.answer !== ""));
+	});
+
+	it("renders through the ordinary answer transcript", () => {
+		const answered = formatNeedsInputAnswers(
+			buildRecommendedAnswers([{ question: "Which policy?", choices: ["Fixed", "Exponential"], recommended: 1 }]),
+		);
+		assert.equal(answered, "Q: Which policy?\nA: Exponential");
 	});
 });
 

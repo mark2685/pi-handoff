@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { formatNeedsInputSummary, type NeedsInputView } from "../../src/presentation/needs-input-gate.ts";
-import { needsInputMenu } from "../../src/presentation/menus.ts";
+import { needsInputMenu, PROCEED_WITH_RECOMMENDED_ROUND } from "../../src/presentation/menus.ts";
 
 const VIEW: NeedsInputView = {
 	slug: "add-retry-logic",
@@ -25,6 +25,63 @@ describe("needsInputMenu", () => {
 			needsInputMenu().map((option) => option.id),
 			["answer", "edit", "view", "cancel"],
 		);
+	});
+
+	/**
+	 * Withheld before the third round because it is a blunt instrument: it answers every
+	 * open question at once, including the ones the model gave no recommendation for.
+	 * Two rounds is a model converging; four rounds and thirty-five minutes is not.
+	 */
+	it("withholds the proceed escape hatch for the first two rounds", () => {
+		for (const round of [1, 2]) {
+			assert.equal(
+				needsInputMenu({ round }).some((option) => option.id === "proceed"),
+				false,
+				`round ${round} must not offer proceed`,
+			);
+		}
+	});
+
+	it("offers the proceed escape hatch from the third round on", () => {
+		for (const round of [PROCEED_WITH_RECOMMENDED_ROUND, 4, 9]) {
+			assert.ok(
+				needsInputMenu({ round }).some((option) => option.id === "proceed"),
+				`round ${round} must offer proceed`,
+			);
+		}
+	});
+
+	it("keeps Answer first, so proceeding is never the default landing position", () => {
+		assert.equal(needsInputMenu({ round: 4 })[0]?.id, "answer");
+	});
+
+	it("names the round in the proceed description", () => {
+		const proceed = needsInputMenu({ round: 4 }).find((option) => option.id === "proceed");
+		assert.match(proceed?.description ?? "", /Round 4/);
+	});
+
+	it("keeps every existing option when proceed is added", () => {
+		const ids = needsInputMenu({ round: 3 }).map((option) => option.id);
+		for (const id of ["answer", "edit", "view", "cancel"]) {
+			assert.ok(ids.includes(id as (typeof ids)[number]), `${id} must survive`);
+		}
+	});
+});
+
+describe("formatNeedsInputSummary round", () => {
+	/** A user four rounds deep has no other way to see the questioning is not converging. */
+	it("states the round from the second round on", () => {
+		const lines = formatNeedsInputSummary({ ...VIEW, round: 3 });
+		assert.ok(lines.includes("Round:     3 of questions for this handoff"));
+	});
+
+	it("stays silent about the round on the first one", () => {
+		for (const view of [VIEW, { ...VIEW, round: 1 }]) {
+			assert.equal(
+				formatNeedsInputSummary(view).some((line) => line.startsWith("Round:")),
+				false,
+			);
+		}
 	});
 });
 

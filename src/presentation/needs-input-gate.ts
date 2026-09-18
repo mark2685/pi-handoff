@@ -14,6 +14,13 @@ export interface NeedsInputView {
 	promptPath: string;
 	/** Structured questions, or one fallback question extracted from prose. */
 	questions: DraftQuestion[];
+	/**
+	 * Which round of questions this is, counted from 1.
+	 *
+	 * Shown to the user and used to decide whether the gate offers to end the
+	 * questioning by taking the model's own recommendations.
+	 */
+	round?: number;
 }
 
 /** The maximum number of question lines a non-scrolling gate can display legibly. */
@@ -33,13 +40,19 @@ function formatQuestion(question: DraftQuestion, index: number): string[] {
 /**
  * Builds the gate's summary lines. The cap protects the non-scrolling shell even
  * for the prose fallback, whose model-authored extraction is necessarily looser.
+ *
+ * The round is stated from the second round onward. A user four rounds deep has
+ * no other way to see that the model keeps asking rather than converging, which is
+ * the signal that the Proceed option exists to act on.
  */
 export function formatNeedsInputSummary(view: NeedsInputView): string[] {
 	const questionLines = view.questions.flatMap(formatQuestion);
 	const truncated = questionLines.length > MAX_QUESTION_LINES;
+	const round = view.round ?? 1;
 
 	return [
 		`The draft for "${view.slug}" left decisions open and cannot run until they are answered.`,
+		...(round > 1 ? [`Round:     ${round} of questions for this handoff`] : []),
 		`Prompt:    ${view.promptPath}`,
 		"",
 		...questionLines.slice(0, MAX_QUESTION_LINES),
@@ -52,7 +65,7 @@ export async function openNeedsInputGate(
 	ctx: ExtensionContext,
 	view: NeedsInputView,
 ): Promise<NeedsInputOptionId | undefined> {
-	const options = needsInputMenu();
+	const options = needsInputMenu({ round: view.round ?? 1 });
 	const items: SelectItem[] = options.map((option) => ({
 		value: option.id,
 		label: option.label,

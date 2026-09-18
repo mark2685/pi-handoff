@@ -35,3 +35,40 @@ export function normalizeDraftQuestions(questions: readonly DraftQuestion[]): Dr
 export function formatNeedsInputAnswers(answers: readonly { question: DraftQuestion; answer: string }[]): string {
 	return answers.map(({ question, answer }) => `Q: ${question.question}\nA: ${answer.trim()}`).join("\n\n");
 }
+
+/**
+ * The answer given for a question the model left without a recommendation.
+ *
+ * Phrased as a delegation rather than a refusal, and it closes the question
+ * explicitly ("do not ask again"), because the drafting prompt treats answered
+ * `Q:`/`A:` pairs as decided — an answer that merely declined to choose would
+ * invite the same question next round, which is the loop this option exists to
+ * break.
+ */
+export const USE_BEST_JUDGEMENT_ANSWER = "Use your best judgement; do not ask again.";
+
+/**
+ * Folds every open question into an answer without asking the user.
+ *
+ * Reached from "Proceed with recommended answers" once a drafting model has spent
+ * three rounds asking (four rounds and thirty-five minutes to Gate A, in the case
+ * that motivated this). A recommendation is taken as the answer; a question with
+ * no usable recommendation — free text, or choices the model would not rank — is
+ * delegated back with `USE_BEST_JUDGEMENT_ANSWER`.
+ *
+ * `normalizeDraftQuestion` has already dropped any recommendation that does not
+ * select a real choice, so an out-of-range index cannot reach this and be read as
+ * an answer of `undefined`.
+ */
+export function buildRecommendedAnswers(
+	questions: readonly DraftQuestion[],
+): { question: DraftQuestion; answer: string }[] {
+	return questions.map((question) => {
+		const normalized = normalizeDraftQuestion(question);
+		const recommended = normalized.recommended === undefined ? undefined : normalized.choices?.[normalized.recommended];
+		return {
+			question,
+			answer: recommended ?? USE_BEST_JUDGEMENT_ANSWER,
+		};
+	});
+}

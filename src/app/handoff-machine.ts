@@ -30,6 +30,15 @@ export interface HandoffDraftingState {
 	readonly scope: string;
 	/** Retained only while user decisions are open, so a resumed session can reopen their gate. */
 	readonly pendingDraft?: { draft: Draft; promptPath: string };
+	/**
+	 * Which NEEDS INPUT round this is, counted from 1.
+	 *
+	 * Persisted so the count survives a restart, and optional so entries written
+	 * before it existed still decode as the first round. It exists to make repeated
+	 * questioning visible: the gate offers to take the model's own recommendations
+	 * once this reaches `PROCEED_WITH_RECOMMENDED_ROUND`.
+	 */
+	readonly needsInputRound?: number;
 }
 
 export interface HandoffProposedState {
@@ -45,6 +54,29 @@ export interface HandoffRunningState {
 	readonly iteration: number;
 	readonly startedAt: string;
 	readonly checkpoint: Checkpoint;
+	/**
+	 * True when the worker is running in another terminal rather than as a child.
+	 *
+	 * Modelled as a discriminator on `running` rather than as a fourth state kind,
+	 * because everything that makes `running` what it is — a draft, a chosen model, an
+	 * iteration, and above all a checkpoint Discard can return to — is equally true of
+	 * an external run. A separate kind would have to restate all of it and would
+	 * double every transition that reads a checkpoint. What differs is only that no
+	 * child process exists, which matters in exactly two places: `session_shutdown`
+	 * has nothing to kill, and a restart must not downgrade the run to an interrupted
+	 * review, because the terminal running it is unaffected by this session dying.
+	 *
+	 * Optional so entries written before external runs were recorded still decode.
+	 */
+	readonly external?: boolean;
+	/**
+	 * True when the user chose "Run and review", so a completed run injects the
+	 * review turn without a second click.
+	 *
+	 * Persisted on the run rather than held in the command handler so the intent
+	 * survives a session restart mid-run, and optional for backward compatibility.
+	 */
+	readonly autoReview?: boolean;
 }
 
 /** A worker completed normally, so Gate B may render its report and metrics. */
@@ -57,15 +89,33 @@ export interface HandoffCompletedReviewingState {
 	readonly checkpoint: Checkpoint;
 	readonly report: string;
 	readonly diffstat: string;
-	readonly usage: WorkerUsage;
+	/**
+	 * Null when the run had no child process to measure — an external run.
+	 *
+	 * Distinct from zeroed usage, which would claim a worker ran for free. Gate B and
+	 * the usage formatter both render the absence as a sentence instead.
+	 */
+	readonly usage: WorkerUsage | null;
+	/** True when the report was pasted in after an external run rather than captured. */
+	readonly external?: boolean;
+	/** Carried from the run so a restart mid-run does not lose Run and review's intent. */
+	readonly autoReview?: boolean;
 	/** The final response captured from Review here, when this iteration was reviewed. */
 	readonly review?: CapturedReview;
 	readonly awaitingReviewTurn: boolean;
 }
 
 /**
- * A Pi restart ended a worker before its result could be collected. Null review
- * fields deliberately mean unavailable, never "an empty worker response".
+ * A Pi restart, an abort, or a worker failure ended a run before its result could
+ * be collected. Null review fields deliberately mean unavailable, never "an empty
+ * worker response".
+ *
+ * `partialReport` and `stderrTail` are the crash evidence. A worker that dies
+ * mid-task has usually already streamed assistant text, and that text is not a
+ * report: showing it as one is how a mid-task sentence once reached a reviewer as
+ * though it were a finished result. It is retained here so Gate B and the review
+ * turn can show it *labelled as pre-crash output*, which is a different claim from
+ * `report`. Both fields are optional so older entries still decode.
  */
 export interface HandoffInterruptedReviewingState {
 	readonly kind: "reviewing";
@@ -78,6 +128,10 @@ export interface HandoffInterruptedReviewingState {
 	readonly diffstat: null;
 	readonly usage: null;
 	readonly interruptionNote: string;
+	/** Assistant text the worker emitted before it died. Never a report. */
+	readonly partialReport?: string;
+	/** Bounded tail of the worker's stderr, which usually names the real failure. */
+	readonly stderrTail?: string;
 	/** Present only if a reviewer response was captured before the interrupted review was reopened. */
 	readonly review?: CapturedReview;
 	readonly awaitingReviewTurn: boolean;
@@ -103,6 +157,10 @@ export interface StartRunInput {
 	iteration: number;
 	startedAt: string;
 	checkpoint: Checkpoint;
+	/** True for a run the user launched in another terminal. */
+	external?: boolean;
+	/** True when a completed run should inject the review turn without another click. */
+	autoReview?: boolean;
 }
 
 export interface RestartRunInput extends StartRunInput {
@@ -113,7 +171,18 @@ export interface RestartRunInput extends StartRunInput {
 export interface CompleteRunInput {
 	report: string;
 	diffstat: string;
-	usage: WorkerUsage;
+	/** Null for an external run, which has no child process to measure. */
+	usage: WorkerUsage | null;
+}
+
+/** Why a run ended without a usable report, plus whatever evidence it left behind. */
+export interface InterruptRunInput {
+	/** Human-readable reason, shown at Gate B and in the review turn. */
+	note: string;
+	/** Assistant text emitted before the worker died, if any. Never treated as a report. */
+	partialReport?: string;
+	/** Bounded tail of the worker's stderr, if any. */
+	stderrTail?: string;
 }
 
 /** A structurally compatible view of Pi's persisted custom session entries. */
@@ -143,6 +212,10 @@ export interface HandoffMachine {
 	replaceDraftScope(scope: string): Result<HandoffDraftingState, HandoffConflict>;
 	/** Persists a NEEDS INPUT draft while the user decides how to resolve it. */
 	setPendingDraft(pendingDraft: { draft: Draft; promptPath: string }): Result<HandoffDraftingState, HandoffConflict>;
+	/** Records that another NEEDS INPUT round has opened, so the gate can offer to end it. */
+	beginNeedsInputRound(): Result<HandoffDraftingState, HandoffConflict>;
+	/** The current NEEDS INPUT round, counted from 1. */
+	needsInputRound(): number;
 	/** Clears a prior needs-input round before a re-draft resolves it. */
 	clearPendingDraft(): Result<HandoffDraftingState, HandoffConflict>;
 	/** Records Gate A's draft and chosen worker model. */
@@ -162,8 +235,11 @@ export interface HandoffMachine {
 	 * `idle` because the worker may already have edited the tree, and Discard needs
 	 * the checkpoint to undo that; returning to `idle` would strand those edits with
 	 * no safe way to revert them.
+	 *
+	 * Accepts a plain note for callers that have only a reason, or an input object
+	 * when crash evidence (pre-crash text, stderr) is available to retain.
 	 */
-	interruptRun(note: string): Result<HandoffInterruptedReviewingState, HandoffConflict>;
+	interruptRun(input: string | InterruptRunInput): Result<HandoffInterruptedReviewingState, HandoffConflict>;
 	/** Arms the one `agent_end` event caused by Review here. */
 	beginReviewTurn(): Result<HandoffCompletedReviewingState, HandoffConflict>;
 	/** Clears the Review here arm and records the response that caused Gate B to reopen. */
@@ -248,11 +324,34 @@ export function createHandoffMachine(): HandoffMachine {
 			return ok(drafting);
 		},
 
+		beginNeedsInputRound(): Result<HandoffDraftingState, HandoffConflict> {
+			if (state.kind !== "drafting") {
+				return conflict(state, "beginNeedsInputRound", "A needs-input round can open only while drafting");
+			}
+			// An older entry carries no counter, but a retained envelope is itself evidence that
+			// a round was already asked, so resuming one continues the count instead of
+			// restarting it and under-reporting how long the questioning has gone on.
+			const asked = state.needsInputRound ?? (state.pendingDraft === undefined ? 0 : 1);
+			const drafting: HandoffDraftingState = { ...state, needsInputRound: asked + 1 };
+			state = drafting;
+			return ok(drafting);
+		},
+
+		needsInputRound(): number {
+			return state.kind === "drafting" ? (state.needsInputRound ?? 1) : 1;
+		},
+
 		clearPendingDraft(): Result<HandoffDraftingState, HandoffConflict> {
 			if (state.kind !== "drafting") {
 				return conflict(state, "clearPendingDraft", "A pending draft can be cleared only while drafting");
 			}
-			const drafting: HandoffDraftingState = { kind: "drafting", scope: state.scope };
+			// The round counter deliberately survives: it counts rounds asked in this
+			// drafting phase, and clearing the envelope is how each round ends.
+			const drafting: HandoffDraftingState = {
+				kind: "drafting",
+				scope: state.scope,
+				...(state.needsInputRound === undefined ? {} : { needsInputRound: state.needsInputRound }),
+			};
 			state = drafting;
 			return ok(drafting);
 		},
@@ -283,7 +382,12 @@ export function createHandoffMachine(): HandoffMachine {
 				kind: "running",
 				draft: state.draft,
 				choice: state.choice,
-				...input,
+				iteration: input.iteration,
+				startedAt: input.startedAt,
+				checkpoint: input.checkpoint,
+				// Omitted unless true, so an ordinary run's entry is unchanged from before.
+				...(input.external === true ? { external: true } : {}),
+				...(input.autoReview === true ? { autoReview: true } : {}),
 			};
 			state = running;
 			return ok(running);
@@ -317,16 +421,23 @@ export function createHandoffMachine(): HandoffMachine {
 				iteration: state.iteration,
 				checkpoint: state.checkpoint,
 				...input,
+				// Carried across the transition: Gate B needs to know the report was pasted in,
+				// and Run and review's intent has to outlive the run it was chosen on.
+				...(state.external === true ? { external: true } : {}),
+				...(state.autoReview === true ? { autoReview: true } : {}),
 				awaitingReviewTurn: false,
 			};
 			state = reviewing;
 			return ok(reviewing);
 		},
 
-		interruptRun(note: string): Result<HandoffInterruptedReviewingState, HandoffConflict> {
+		interruptRun(input: string | InterruptRunInput): Result<HandoffInterruptedReviewingState, HandoffConflict> {
 			if (state.kind !== "running") {
 				return conflict(state, "interruptRun", "No worker run is active to interrupt");
 			}
+			const details: InterruptRunInput = typeof input === "string" ? { note: input } : input;
+			const partialReport = details.partialReport?.trim();
+			const stderrTail = details.stderrTail?.trim();
 			const reviewing: HandoffInterruptedReviewingState = {
 				kind: "reviewing",
 				completion: "interrupted",
@@ -337,7 +448,10 @@ export function createHandoffMachine(): HandoffMachine {
 				report: null,
 				diffstat: null,
 				usage: null,
-				interruptionNote: note,
+				interruptionNote: details.note,
+				// Omitted rather than stored empty, so "absent" and "the worker said nothing" stay distinct.
+				...(partialReport === undefined || partialReport === "" ? {} : { partialReport }),
+				...(stderrTail === undefined || stderrTail === "" ? {} : { stderrTail }),
 				awaitingReviewTurn: false,
 			};
 			state = reviewing;
@@ -393,6 +507,8 @@ export function serializeHandoffState(state: HandoffState): HandoffState {
 				iteration: state.iteration,
 				startedAt: state.startedAt,
 				checkpoint: state.checkpoint,
+				...(state.external === true ? { external: true } : {}),
+				...(state.autoReview === true ? { autoReview: true } : {}),
 			};
 		case "reviewing":
 			switch (state.completion) {
@@ -419,6 +535,12 @@ export function rehydrateHandoffState(state: HandoffState): HandoffState {
 		case "proposed":
 			return IDLE;
 		case "running":
+			// An external run is not downgraded. Its worker lives in another terminal, which
+			// this session's death did not touch, so the run may well still be in flight and
+			// its "I ran it — review now" path must survive a restart. A child-process run is
+			// downgraded because the child cannot outlive its parent: reporting it as
+			// interrupted is what keeps the checkpoint reachable for Discard.
+			if (state.external === true) return state;
 			return {
 				kind: "reviewing",
 				completion: "interrupted",

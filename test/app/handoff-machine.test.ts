@@ -394,6 +394,21 @@ describe("handoff session persistence", () => {
 		});
 	});
 
+	/**
+	 * The exception to the downgrade, and the reason it is an exception: an external
+	 * worker lives in another terminal that this session's death did not touch, so the
+	 * run may still be in flight and its review-now path has to survive the restart.
+	 */
+	it("keeps an external run running on rehydration, since its worker is elsewhere", () => {
+		const state = { kind: "running" as const, draft, choice, ...startInput(), external: true };
+		assert.deepEqual(rehydrateHandoffState(state), state);
+	});
+
+	it("still downgrades a child-process run that recorded Run and review", () => {
+		const state = { kind: "running" as const, draft, choice, ...startInput(), autoReview: true };
+		assert.equal(rehydrateHandoffState(state).kind, "reviewing");
+	});
+
 	it("keeps a completed review while clearing its stale Review here arm", () => {
 		const state = completedRun(machine);
 		const armed = { ...state, awaitingReviewTurn: true };
@@ -509,6 +524,107 @@ describe("handoff run interruption", () => {
 
 	it("refuses to interrupt when no worker is running", () => {
 		assertConflict(machine.interruptRun("stopped"), "idle", "interruptRun", "No worker run is active to interrupt");
+	});
+
+	it("retains a crashed worker's pre-crash text without promoting it to a report", () => {
+		machine.beginDraft("crashed run");
+		machine.propose(draft, choice);
+		machine.startRun(startInput());
+
+		const result = machine.interruptRun({
+			note: "The worker ended on an error rather than finishing its turn.",
+			partialReport: "The pty defaulted to 80 columns…",
+			stderrTail: "pi: fatal: provider returned 503",
+		});
+
+		assert.ok(result.ok);
+		assert.equal(result.value.report, null);
+		assert.equal(result.value.partialReport, "The pty defaulted to 80 columns…");
+		assert.equal(result.value.stderrTail, "pi: fatal: provider returned 503");
+	});
+
+	/** Absent and "the worker said nothing" are different facts, so blanks are omitted. */
+	it("omits blank crash evidence rather than storing empty strings", () => {
+		machine.beginDraft("crashed run");
+		machine.propose(draft, choice);
+		machine.startRun(startInput());
+
+		const result = machine.interruptRun({ note: "stopped", partialReport: "   ", stderrTail: "" });
+
+		assert.ok(result.ok);
+		assert.equal("partialReport" in result.value, false);
+		assert.equal("stderrTail" in result.value, false);
+	});
+
+	it("still accepts a bare note, for callers that have only a reason", () => {
+		machine.beginDraft("crashed run");
+		machine.propose(draft, choice);
+		machine.startRun(startInput());
+
+		const result = machine.interruptRun("stopped");
+
+		assert.ok(result.ok);
+		assert.equal(result.value.interruptionNote, "stopped");
+		assert.equal("partialReport" in result.value, false);
+	});
+});
+
+/**
+ * The round counter is what lets the NEEDS INPUT gate notice a drafting model that
+ * keeps asking instead of converging, so it has to be persisted with the round it
+ * describes and it has to survive the envelope being cleared.
+ */
+describe("needs-input round counting", () => {
+	it("reports the first round before any round has opened", () => {
+		machine.beginDraft("scope");
+		assert.equal(machine.needsInputRound(), 1);
+	});
+
+	it("counts each opened round", () => {
+		machine.beginDraft("scope");
+		machine.beginNeedsInputRound();
+		assert.equal(machine.needsInputRound(), 1);
+		machine.beginNeedsInputRound();
+		assert.equal(machine.needsInputRound(), 2);
+		machine.beginNeedsInputRound();
+		assert.equal(machine.needsInputRound(), 3);
+	});
+
+	it("keeps the count when a pending envelope is cleared, since that ends a round", () => {
+		machine.beginDraft("scope");
+		machine.beginNeedsInputRound();
+		machine.setPendingDraft({ draft, promptPath: "/tmp/pi-handoff-x.md" });
+		machine.clearPendingDraft();
+		assert.equal(machine.needsInputRound(), 1);
+		// The next round continues the count rather than re-asking as though it were the first.
+		machine.beginNeedsInputRound();
+		assert.equal(machine.needsInputRound(), 2);
+	});
+
+	it("resets with the handoff, so a later draft does not inherit a stale count", () => {
+		machine.beginDraft("scope");
+		machine.beginNeedsInputRound();
+		machine.beginNeedsInputRound();
+		machine.reset();
+		machine.beginDraft("a different handoff");
+		assert.equal(machine.needsInputRound(), 1);
+	});
+
+	/** An older entry resuming here continues the count rather than restarting it. */
+	it("treats an absent counter as the first round when resuming an old entry", () => {
+		machine.restore({ kind: "drafting", scope: "old", pendingDraft: { draft, promptPath: "/tmp/x.md" } });
+		assert.equal(machine.needsInputRound(), 1);
+		machine.beginNeedsInputRound();
+		assert.equal(machine.needsInputRound(), 2);
+	});
+
+	it("refuses to count a round outside drafting", () => {
+		assertConflict(
+			machine.beginNeedsInputRound(),
+			"idle",
+			"beginNeedsInputRound",
+			"A needs-input round can open only while drafting",
+		);
 	});
 
 	it("produces a state that survives its own schema validation", () => {

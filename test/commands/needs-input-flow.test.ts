@@ -26,6 +26,8 @@ interface HarnessOptions {
 	selectResults?: (string | undefined)[];
 	inputResults?: (string | undefined)[];
 	editorResults?: (string | undefined)[];
+	/** The NEEDS INPUT round the fake service reports, for the Proceed option. */
+	round?: number;
 }
 
 interface Harness {
@@ -83,6 +85,8 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 		continueWithPrompt: async () => ok(READY),
 		draft: async () => ok(READY),
+		draftLeftovers: async () => ok(READY),
+		needsInputRound: () => options.round ?? 1,
 		chooseModel: (_choice: ModelChoice) => ok(READY),
 		revisePrompt: async () => ok(READY),
 		isChoiceRunnable: () => true,
@@ -204,12 +208,45 @@ describe("runNeedsInputFlow", () => {
 	});
 
 	it("views the full draft read-only and returns to the gate", async () => {
-		const harness = createHarness({ gateSelections: ["view", "cancel"], editorResults: ["edited but discarded"] });
+		const harness = createHarness({ gateSelections: ["view", "cancel"] });
 		const result = await runNeedsInputFlow(harness.ctx, harness.service, initialDraft(), "scope");
 
 		assert.deepEqual(result, { kind: "cancelled" });
-		assert.deepEqual(harness.editorPrefills, [DRAFT.prompt]);
-		assert.equal(harness.overlays.length, 2);
+		// The viewer is its own overlay now, not an editor whose edits are silently dropped,
+		// so it shows up as an extra `ctx.ui.custom` call rather than an editor prefill.
+		assert.deepEqual(harness.editorPrefills, []);
+		assert.equal(harness.overlays.length, 3);
+	});
+
+	it("folds in recommendations and delegated judgement when proceeding", async () => {
+		const harness = createHarness({ gateSelections: ["proceed"], round: 3 });
+		const result = await runNeedsInputFlow(
+			harness.ctx,
+			harness.service,
+			initialDraft([
+				{ question: "Which policy?", choices: ["Fixed", "Exponential"], recommended: 1 },
+				{ question: "What timeout?" },
+			]),
+			"retry the client",
+		);
+
+		assert.equal(result.kind, "rescoped");
+		const scope = result.kind === "rescoped" ? result.scope : "";
+		assert.match(scope, /Q: Which policy\?\nA: Exponential/);
+		assert.match(scope, /Q: What timeout\?\nA: Use your best judgement; do not ask again\./);
+	});
+
+	it("asks nothing when proceeding, since that is the point of the option", async () => {
+		const harness = createHarness({ gateSelections: ["proceed"], round: 3 });
+		await runNeedsInputFlow(
+			harness.ctx,
+			harness.service,
+			initialDraft([{ question: "Which policy?", choices: ["Fixed"], recommended: 0 }]),
+			"scope",
+		);
+
+		assert.deepEqual(harness.selectCalls, []);
+		assert.deepEqual(harness.inputCalls, []);
 	});
 
 	it("cancels and abandons the handoff", async () => {

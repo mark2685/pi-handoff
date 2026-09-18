@@ -109,3 +109,62 @@ describe("buildReviewMessage", () => {
 		assert.ok(buildReviewMessage({ ...INPUT, report: null, interruptionNote: undefined }).includes("Verdict:"));
 	});
 });
+
+/**
+ * A crashed worker's evidence in the review turn.
+ *
+ * The reviewer is the one person who can catch a handoff that died mid-task, so
+ * the message has to hand over what actually happened rather than a bare "no
+ * report" line — and it has to deny the pre-crash text the status of a report,
+ * because it reads exactly like one.
+ */
+describe("buildReviewMessage crash evidence", () => {
+	const CRASHED = {
+		...INPUT,
+		report: null,
+		interruptionNote: "The worker ended on an error rather than finishing its turn.",
+		partialReport: "The pty defaulted to 80 columns… Let me set a larger window size.",
+		stderrTail: "pi: fatal: provider returned 503",
+	};
+
+	it("states the interruption reason", () => {
+		assert.ok(buildReviewMessage(CRASHED).includes("ended on an error rather than finishing its turn"));
+	});
+
+	it("includes the pre-crash text under a heading that denies it is a report", () => {
+		const message = buildReviewMessage(CRASHED);
+		assert.ok(message.includes("### Partial output before it died"));
+		assert.ok(message.includes("The pty defaulted to 80 columns"));
+	});
+
+	it("tells the reviewer not to read the pre-crash text as a summary of the work", () => {
+		const message = buildReviewMessage(CRASHED);
+		assert.ok(message.includes("not a report of finished work"));
+		assert.ok(message.includes("may be far ahead of or behind it"));
+	});
+
+	it("includes the stderr tail", () => {
+		const message = buildReviewMessage(CRASHED);
+		assert.ok(message.includes("### Worker stderr (tail)"));
+		assert.ok(message.includes("provider returned 503"));
+	});
+
+	it("keeps asking for scepticism about a missing report", () => {
+		assert.ok(buildReviewMessage(CRASHED).includes("reason for scepticism"));
+	});
+
+	it("still requires the verdict line after a crash", () => {
+		assert.ok(buildReviewMessage(CRASHED).trimEnd().endsWith("on that line."));
+	});
+
+	it("omits both sections when a crash left no evidence", () => {
+		const message = buildReviewMessage({ ...INPUT, report: null, interruptionNote: "The worker was stopped." });
+		assert.equal(message.includes("### Partial output before it died"), false);
+		assert.equal(message.includes("### Worker stderr (tail)"), false);
+	});
+
+	it("does not add crash sections to a completed run", () => {
+		const message = buildReviewMessage(INPUT);
+		assert.equal(message.includes("### Partial output before it died"), false);
+	});
+});

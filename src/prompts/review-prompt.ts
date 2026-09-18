@@ -41,6 +41,17 @@ export interface ReviewMessageInput {
 	diffstat: string;
 	/** Present instead of a report when the run did not finish. */
 	interruptionNote: string | undefined;
+	/**
+	 * Text a crashed worker emitted before it died, if any.
+	 *
+	 * Included so a reviewer can see what the worker thought it was doing, but under
+	 * a heading that denies it the status of a report: it is the last thing said, not
+	 * a conclusion, and treating the two as equivalent is what let a mid-task
+	 * sentence stand in for a finished result.
+	 */
+	partialReport?: string;
+	/** Bounded tail of a failed worker's stderr, which usually names the real failure. */
+	stderrTail?: string;
 }
 
 /**
@@ -74,7 +85,30 @@ function diffstatBlock(diffstat: string): string {
 function reportBlock(input: ReviewMessageInput): string {
 	if (input.report === null) {
 		const note = input.interruptionNote ?? "The worker did not finish.";
-		return `The worker produced no report. ${note}\n\nReview whatever it managed to write to the working tree, and treat the absence of a report as a reason for scepticism rather than as a neutral fact.`;
+		const sections = [
+			`The worker produced no report. ${note}`,
+			"",
+			"Review whatever it managed to write to the working tree, and treat the absence of a report as a reason for scepticism rather than as a neutral fact.",
+		];
+
+		const partial = input.partialReport?.trim();
+		if (partial !== undefined && partial !== "") {
+			sections.push(
+				"",
+				"### Partial output before it died",
+				"",
+				"This is the last thing the worker said, not a report of finished work. Do not read it as a summary of what was done; the changes in the tree may be far ahead of or behind it.",
+				"",
+				`\`\`\`\n${partial}\n\`\`\``,
+			);
+		}
+
+		const stderr = input.stderrTail?.trim();
+		if (stderr !== undefined && stderr !== "") {
+			sections.push("", "### Worker stderr (tail)", "", `\`\`\`\n${stderr}\n\`\`\``);
+		}
+
+		return sections.join("\n");
 	}
 	return input.report.trim();
 }

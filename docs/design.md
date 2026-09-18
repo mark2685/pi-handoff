@@ -43,8 +43,8 @@ The extension registers:
 The extension uses these lifecycle hooks:
 
 - `session_start` rehydrates handoff state from a custom session entry so a resumed reviewing session knows a handoff is in flight or awaiting review.
-- `session_shutdown` kills any running worker process. A drafting state stores an optional `{ draft, promptPath }` pending NEEDS INPUT round; the field is optional so old session entries still decode, and only that retained drafting state is resumed into its gate. Each re-draft replaces the drafting state's scope, preserving accumulated `Q:`/`A:` answers for later rounds and restart. A new scope argument supplied while resuming a pending round is ignored with a warning; Cancel followed by a fresh command is required to use it.
-- `agent_end` reopens Gate B after the review turn that **Review here** injected. It is inert in every other state; it never opens UI or changes state unless the machine is in `reviewing` with `awaitingReviewTurn` set.
+- `session_shutdown` kills any running child worker process. A drafting state stores an optional `{ draft, promptPath }` pending NEEDS INPUT round; the field is optional so old session entries still decode, and only that retained drafting state is resumed into its gate. Each re-draft replaces the drafting state's scope, preserving accumulated `Q:`/`A:` answers for later rounds and restart. A new scope argument supplied while resuming a pending round is ignored with a warning; Cancel followed by a fresh command is required to use it. An external run has no child process, so the hook finds nothing to abort and returns immediately.
+- `agent_end` reopens Gate B after the review turn that **Review here** or **Run and review** injected. It is inert in every other state; it never opens UI or changes state unless the machine is in `reviewing` with `awaitingReviewTurn` set.
 
 ### Flow
 
@@ -54,20 +54,26 @@ The extension uses these lifecycle hooks:
   ├─ 1. DRAFT   side-call on the current model:
   │              session transcript + scope → { prompt, tier, rationale, questions? }
   │              rubric maps tier → candidate models; first available wins
+  │              NEEDS INPUT rounds are counted; from round 3 the gate offers
+  │              "Proceed with recommended answers"
   │
   ├─ GATE A     prompt + recommended provider/model:thinking + rationale
-  │              [Run] [Edit prompt] [Change model] [Run externally] [Cancel]
+  │              [Run] [Run and review] [View full prompt] [Edit prompt]
+  │              [Change model] [Run externally] [Cancel]
   │
   ├─ 2. RUN     git checkpoint (stash-free: record HEAD + `git status --porcelain`)
   │              spawn: pi --mode json -p --no-session --model P/M --thinking L @prompt
   │              stream events into a widget; Escape kills the child
+  │              (Run externally checkpoints too, and records an external run)
   │
   ├─ GATE B     worker's final report + `git diff --stat` + usage/cost
   │              [Review here] [Send feedback to worker] [Discard changes] [Accept]
+  │              [Accept and hand off leftovers] [View full report] [View full diffstat]
   │
   ├─ 3. REVIEW  "Review here" injects report + diffstat into the reviewing
   │              session via sendUserMessage with review instructions;
-  │              when that turn ends, agent_end reopens Gate B automatically
+  │              when that turn ends, agent_end reopens Gate B automatically.
+  │              "Run and review" injects the same message without the click.
   │
   └─ 4. LOOP    "Send feedback" reopens the editor, appends feedback to the
                  prompt as a follow-up section, and returns to RUN (max N iterations)
@@ -79,13 +85,18 @@ Handoff state is a discriminated union owned by one `HandoffMachine`, following 
 
 ```
 idle
-drafting   { scope, pendingDraft? }
+drafting   { scope, pendingDraft?, needsInputRound? }
 proposed   { draft, choice }
-running    { draft, choice, iteration, startedAt, checkpoint }
-reviewing  { draft, choice, iteration, checkpoint, report, diffstat, usage, review?, awaitingReviewTurn }
+running    { draft, choice, iteration, startedAt, checkpoint, external?, autoReview? }
+reviewing  { draft, choice, iteration, checkpoint, report, diffstat, usage, review?, awaitingReviewTurn,
+             partialReport?, stderrTail?, external?, autoReview? }
 ```
 
 `awaitingReviewTurn` is true only between **Review here** and the end of the turn it triggered. It is the sole condition under which `agent_end` acts. `review` is optional for compatibility with older session entries and contains `{ iteration, verdict?, text }` after an armed review turn ends; `verdict` is absent when the final non-empty line is not a recognized `Verdict: accept|fix|discard` line. The line parser tolerates case differences, simple `*`, `_`, or backtick emphasis around the label or value, and an optional trailing period, but rejects extra words.
+
+Every field marked optional above was added after the first release and is optional for the same reason: a session entry written by an earlier version must still decode. `needsInputRound` counts NEEDS INPUT rounds so the gate can offer to end a non-convergent sequence; `external` marks a run the user launched in another terminal; `autoReview` records that Gate A's **Run and review** was chosen; `partialReport` and `stderrTail` retain a crashed worker's evidence. A completed review's `usage` is additionally _nullable_, because an external run has no child process to measure and zeroed usage would claim the work was free.
+
+An external run is modelled as a discriminator on `running` rather than a fourth state kind. Everything that makes `running` what it is — a draft, a chosen model, an iteration, and above all a checkpoint that Discard can return to — is equally true of an external run, so a separate kind would restate all of it and double every transition that reads a checkpoint. What actually differs is only that no child process exists, which matters in exactly two places: `session_shutdown` has nothing to kill, and rehydration must _not_ downgrade the run, because the terminal running it is unaffected by this session's death.
 
 Only one handoff can exist per session. Starting `/handoff` while `running` is refused; starting it while `reviewing` reopens Gate B rather than drafting, since Gate B already offers Discard and Accept.
 
@@ -104,7 +115,11 @@ The draft step serializes the current session branch (`convertToLlm` + `serializ
 }
 ```
 
-Parsing is strict (`persistence/schemas.ts`). The envelope optionally carries up to three structured `questions`, each with a required `question`, optional one-line `context`, optional finite `choices`, and optional 0-based `recommended` choice. A recommendation that does not select a listed choice is normalized away rather than rejecting the otherwise usable draft. If the response does not parse, the user is shown the raw text and offered retry or cancel. A non-empty structured question array opens the NEEDS INPUT gate described in §7 instead of Gate A. A standalone prose `NEEDS INPUT` line, normally a `## NEEDS INPUT` heading with questions beneath it, remains a fallback for a model that ignores the envelope contract; mentions in prose or a title do not count. The gate asks each question independently with a select (and Other escape) or text input, renders deterministic `Q:`/`A:` pairs into the re-draft scope, and includes a read-only View full draft option. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A so the external fallback and manual inspection are available regardless of what happens next.
+Parsing is strict (`persistence/schemas.ts`). The envelope optionally carries up to three structured `questions`, each with a required `question`, optional one-line `context`, optional finite `choices`, and optional 0-based `recommended` choice. A recommendation that does not select a listed choice is normalized away rather than rejecting the otherwise usable draft. If the response does not parse, the user is shown the raw text and offered retry or cancel. A non-empty structured question array opens the NEEDS INPUT gate described in §7 instead of Gate A. A standalone prose `NEEDS INPUT` line, normally a `## NEEDS INPUT` heading with questions beneath it, remains a fallback for a model that ignores the envelope contract; mentions in prose or a title do not count. The gate asks each question independently with a select (and Other escape) or text input, renders deterministic `Q:`/`A:` pairs into the re-draft scope, and includes a read-only View draft option. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A so the external fallback and manual inspection are available regardless of what happens next.
+
+Iteration numbering belongs to the extension, and the drafting prompt says so explicitly: neither the `slug` nor the prompt's top heading may encode an iteration, round, attempt, or pass number. The transcript handed to the drafting call may already contain earlier handoffs and their review rounds, so a model reading it keeps counting — producing a slug of `tg-feedback-command-iteration-1` for what ran as iteration 2, and a draft titled "… fix review nits (iteration 3)" for a brand-new handoff at iteration 1. The prompt instruction is the fix; `slugify` additionally strips a trailing `-iteration-N`-style counter, because a wrong number on the prompt filename is worse than none when the filename is what a reviewer greps for. That defensive strip recognizes only `iteration`, `iter`, `round`, and `attempt`, the words that can only mean a counter: `v` and `pass` were tried and removed, because they mangle real task names — turning `upgrade-next-v16` into `upgrade-next` and `first-pass-3` into `first` — and silently deleting the version that identifies the work is a worse failure than leaving a stray counter the prompt rule already prevents.
+
+NEEDS INPUT rounds are counted in the drafting state (`needsInputRound`, optional). From the third round the gate adds **Proceed with recommended answers**, which folds each question's `recommended` choice in as its answer and answers the rest with "Use your best judgement; do not ask again", then re-enters drafting exactly as Answer does; the existing rule that answered `Q:`/`A:` pairs are decided is what stops those questions coming back. It is withheld for the first two rounds because it is a blunt instrument — it answers every open question at once, including those the model declined to rank. Two rounds is a model converging; the case that motivated this took four rounds and thirty-five minutes to reach Gate A, one round of it taking twenty-two minutes.
 
 ### 5.2 Rubric
 
@@ -141,9 +156,11 @@ Defaults ship in `src/domain/rubric/defaults.ts` and are written to `handoff.jso
 Rendered with `ctx.ui.custom` so the prompt, model line, and rationale are visible together. Options:
 
 - **Run** — proceed to 5.4.
+- **Run and review** — identical to Run, and on a _completed_ outcome it injects the review turn that **Review here** would have, reusing the same arming and message construction rather than duplicating it. An interrupted outcome opens Gate B instead, because there is no report to review and a crash is something the user should see before spending reviewing context on it. The intent is recorded as `autoReview` on the run state for consistency with the rest of that state rather than for recovery: a child-process run cannot outlive its parent, so a rehydrated run is always an interrupted review and never auto-reviews. It applies to the run it was chosen on — a later iteration started by **Send review to worker** returns to Gate B, where Review here is one keypress away — rather than latching for the whole handoff, since the reviewer's verdict is the natural point to re-decide whether the next pass should come straight back for review. It exists as a separate option rather than a default or a config flag: in the observed sessions every completed run ended with the user choosing Review here, three to six minutes after the worker finished, while plain Run remains the right choice when the user wants to read the diffstat before committing reviewing context.
+- **View full prompt** — opens the whole prompt in the read-only scrollable viewer (§5.8) and returns to the gate. The gate's own preview stays bounded at twelve lines because a gate that renders a 165-line prompt pushes its own options off the screen; the previous behaviour left users approving, or sitting for up to twenty-eight minutes over, text they could only see the head of.
 - **Edit prompt** — `ctx.ui.editor` prefilled with the prompt; rewrites the `/tmp` file.
 - **Change model** — Phase Runner's `pickModel` pattern: select from the live registry, then a thinking level. The tier is kept for the record; the choice overrides it.
-- **Run externally** — copies `pi --model "P/M:L" @/tmp/pi-handoff-<slug>.md` to the clipboard via `pbcopy` (falls back to `ctx.ui.notify` with the command), and returns to `idle`. This preserves today's workflow for cases where the user wants a real second terminal.
+- **Run externally** — copies `pi --model "P/M:L" @/tmp/pi-handoff-<slug>.md` to the clipboard via `pbcopy` (falls back to `ctx.ui.notify` with the command), then **takes the same checkpoint Run takes** and records a `running` state marked `external`. It no longer returns to `idle`: doing so meant the extension forgot the handoff, so the user's own worker edited the tree with no checkpoint, and its result came back as a pasted message with no diffstat and no Discard. See §5.9.
 - **Cancel** — returns to `idle`; the `/tmp` file is left in place.
 
 ### 5.4 Run
@@ -160,7 +177,9 @@ in `ctx.cwd`, with the same event handling as `examples/extensions/subagent/inde
 
 While running, a widget shows elapsed time, turns, tokens, cost, and the last few tool calls. The reviewing session's agent is not invoked during this phase; the command handler awaits the child process directly, so the user sees the widget and can press Escape in it to stop the worker. The overlay owns the `AbortController` for the run because there is no external signal to borrow: `ExtensionCommandContext` has no abort member, and `ExtensionContext.signal` is undefined when the agent is not streaming, which is exactly the case while a command handler awaits a child process.
 
-The worker's final assistant text is the report. Its expected shape is the "final report" section the drafting prompt requires: summary, files changed, validation performed, blockers. The extension does not parse this structurally in v1; it is passed through verbatim.
+The worker's final assistant text is the report _only when the worker ended cleanly_. Its expected shape is the "final report" section the drafting prompt requires: summary, files changed, validation performed, blockers. The extension does not parse this structurally in v1; it is passed through verbatim.
+
+Classification is owned by one exported function, `classifyOutcome`, so each rule is unit-testable without a child process. A run is interrupted when it was aborted, when its final assistant message carried an error stop reason or an error message, when the process exited non-zero, or when no text arrived at all — **and the first three of those hold even when earlier assistant text exists**. The reason is that the adapter's report is "the last assistant text seen", not "the worker's conclusion": a 2h19m, 203-turn, $45.79 run whose final message was an error reached Gate B as a _completed_ handoff whose entire report was a mid-task sentence about terminal width, presented next to a 2,816-line diff with no indication the worker had died. The pre-crash text is retained as `partialReport`, and a bounded tail of stderr as `stderrTail`, because the user watched that text stream into the widget and silently dropping it would read as the extension having lost the report; both are rendered under headings that deny them the status of a report.
 
 ### 5.5 Gate B
 
@@ -170,6 +189,11 @@ Rendered with `ctx.ui.custom`, showing the report, `git diff --stat` against the
 - **Send feedback to worker** — `ctx.ui.editor` is blank before a review and prefilled with the captured reviewer text after one, with a trailing `Verdict:` line removed using the same tolerated forms described above. The user still confirms the text by editing or submitting it. Normalization happens before the emptiness check, so a verdict-only submission is refused without starting a worker iteration. The extension normalizes that feedback the same way before appending a `## Review feedback (iteration N)` section to the prompt file: a generated preamble names the iteration and seven-character original checkpoint, says the working tree already has prior iteration changes that must not be restarted or reverted unless requested, and instructs the worker to address only the reviewer findings. It then returns to 5.4. Refused when `iteration >= maxIterations`. The restart reuses the checkpoint taken before iteration 1 rather than taking a new one, so Discard still undoes every iteration and the diffstat stays cumulative across the loop.
 - **Discard changes** — `git checkout -- <files changed since checkpoint>` and `git clean` limited to files that were untracked-and-absent at checkpoint. Then `idle`. Paths that were already dirty when the checkpoint was taken are skipped, so a worker's edits to those paths survive Discard; this is why Gate B leads its discard summary with the skipped paths rather than reporting only what was reverted.
 - **Accept** — marks the handoff complete, leaves the working tree as is, records the report in the session as a custom entry, and returns to `idle`. Nothing is committed.
+- **Accept and hand off leftovers** — offered only when the captured verdict is `accept`. Performs the ordinary Accept, then enters `drafting` with a scope built by a pure domain function from **the accepted prompt and the captured review text only**. No transcript is re-serialized: both documents that define the leftovers are already in hand, the accepted work has just superseded the history, and a drafting model given the transcript tends to re-propose work the review accepted. The result goes through `DraftService` into the ordinary NEEDS INPUT and Gate A flow, so a follow-up can never be launched with less approval than any other handoff. This exists because the pattern was already happening by hand: after an `accept` with minor items listed, the user repeatedly started a fresh `/handoff` ("fix the nits", "the remaining weaknesses", "fold the four deferred nits in"), paying a full drafting cycle over the whole transcript each time.
+
+  The transcript-free guarantee is a property of the **whole drafting loop**, not of its first pass. `DraftService.draftLeftovers` therefore takes an already-built scope rather than the two raw documents, because it is called again for every retry after an unparseable envelope and every re-draft after an answered NEEDS INPUT round, and the command layer seeds its scope with the leftovers text before the first call and appends answers onto it. An earlier version built the scope inside the service and let those continuation paths fall back to `draft`, which re-serialized the conversation _and_ replaced the machine's scope with one the accepted prompt and review text had dropped out of — so the promise held only when the first leftovers draft happened to parse and ask nothing. Both the service and the command loop are tested for zero transcript reads across a retry and an answered round.
+
+- **View full report** / **View full diffstat** — open the whole report (or a crashed worker's pre-crash text) and the whole diffstat in the read-only viewer of §5.8, then re-render Gate B unchanged. The diffstat view also carries the stderr tail when a crash left one, since an interrupted run has no report view worth opening for stderr alone.
 
 ### 5.6 Session entries and recovery
 
@@ -183,20 +207,44 @@ src/domain/             pure, no IO, no Pi imports
   types.ts              HandoffState, Draft, ModelChoice, Report, Checkpoint
   result.ts             Result type (copied from phase-runner)
   rubric/               tier resolution, defaults, validation
-  draft/                draft JSON parsing, slug normalization, feedback append
+  draft/                draft JSON parsing, slug normalization, feedback append, leftovers scope
   report/               usage formatting, discard summaries (the report itself is passed through verbatim, never parsed)
 src/ports/              WorkerRunner, Git, Clipboard, ConfigStore, Clock
 src/adapters/           child-process runner, exec-based git, pbcopy, json file
 src/persistence/        schemas for handoff.json, session entries, draft JSON
 src/app/                HandoffMachine, DraftService, RunService, ReviewService
-src/presentation/       gate-a.ts, gate-b.ts, widget.ts, model-picker.ts
+src/presentation/       gate-a.ts, gate-b.ts, widget.ts, model-picker.ts, text-viewer.ts
 src/prompts/            drafting system prompt, review injection prompt
 src/commands/           /handoff argument parsing and dispatch
-test/domain/            rubric, draft parsing, feedback append, diffstat
+test/domain/            rubric, draft parsing, leftovers scope, feedback append, diffstat
 test/extension/         entry point loads and registers the expected surface
 ```
 
 Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only `index.ts` constructs adapters.
+
+One cycle is resolved explicitly in the composition root: Gate B's leftovers option starts a draft, while the drafting flow ends at a run whose result Gate B renders. The command object is built after the Gate B flow and injected into it through a late-bound callback, rather than duplicating the drafting flow inside Gate B.
+
+### 5.8 Read-only scrollable viewer
+
+Every gate shows a bounded preview — twelve prompt lines at Gate A, twenty-four report lines and twelve diffstat lines at Gate B — because the gates do not scroll. Observed prompts ran to 165 lines, reports to roughly 10k characters, and diffstats to 21 files, so the previews routinely hid most of what the user was deciding about. The remedy is a separate surface rather than larger previews, since a gate that fills the screen hides its own options.
+
+`src/presentation/text-viewer.ts` splits the same way as the gates: `windowLines` is pure and owns the scrolling arithmetic, clamping, and the position line, so paging and end-of-content behaviour are unit-tested without a TUI; the component around it renders a window and translates keys. It is genuinely read-only, replacing the previous stand-in of an editor titled "read-only; edits are discarded" — a surface that invited typing into a buffer whose changes were thrown away. Gate A's View full prompt, Gate B's two view options, and the NEEDS INPUT gate's View draft all use it.
+
+Two mechanics are load-bearing rather than incidental. The window is measured in **rendered rows, not source lines**, and the measurement happens inside `render(width)` where the real width is known: the content this viewer exists for is prompts written as unwrapped paragraphs and report bullets, which occupy three or four rows each, so a window of twenty source lines painted forty-six rows into a twenty-row viewport and pushed the heading and the top of the window off the screen. `windowLines` therefore takes an optional per-line height function — defaulting to one row, which keeps plain line windowing as the degenerate case — and anchors its final window by walking heights backwards from the end, since with variable heights the last window's line count is not fixed. The position line stays numbered in source lines, because those are what the text's own numbering means to a reader.
+
+Paging follows from that measurement, and getting it wrong is a second, quieter way to hide content. Rows and source lines are not interchangeable in either direction, so a page computed as a row count and applied as a line offset skipped whatever lay between two screens: at width 80 the first window showed lines 1–5 and one page down jumped to lines 21–25, losing fifteen lines with no indication they had been passed. `windowLines` therefore returns the paging destinations alongside the window — `nextOffset`, the first line past the window it just built, and `previousOffset`, found by filling a viewport backwards from the window's top with the same walk that anchors the final window — and the component navigates by the window it last rendered rather than by arithmetic of its own. Paging up and down over the same boundary is therefore symmetric, and both directions always move by at least one line, so a paragraph taller than the viewport cannot trap the scroll.
+
+Keys are matched with pi-tui's `matchesKey` rather than by comparing raw bytes. Under the Kitty keyboard protocol — Ghostty, WezTerm, Kitty — plain Escape arrives as `\x1b[27u`, so a byte comparison against `\x1b` silently never fires while the footer still advertises `esc close`. Matching parsed keys also removes an ordering hazard the byte version had to work around: Escape is a prefix of every arrow and page sequence, so the close test had to run last to avoid closing the viewer on every scroll key.
+
+### 5.9 External runs
+
+An external run is a `running` state marked `external`, taken with the same checkpoint an internal run takes and holding no child process. `/handoff status` reports it as awaiting the user rather than as work in progress here, and `/handoff` offers a small gate instead of drafting: **I ran it — review now**, **Discard changes**, and **Leave this for later**.
+
+Review now reads the diffstat against the checkpoint exactly as `spawnAndSettle` does, optionally accepts a pasted report, and transitions to `reviewing`, so the whole of Gate B applies unchanged. Two details follow from having no child process. `usage` is null rather than zeroed, because zeroes would report a real run as having cost nothing; the completed reviewing state's `usage` is therefore nullable and Gate B renders the absence as a sentence naming the other terminal. And an empty pasted report reaches Gate B as _interrupted_ rather than as a completed run with an empty report: the report lives in another terminal's scrollback, requiring it would block review on a copy the user may not have kept, and Gate B's completed branch promises a report that an empty string would misrepresent.
+
+**Send feedback to worker** from that Gate B starts an ordinary internal child-process iteration: `restartRun` does not carry `external` forward. Running the first pass by hand does not commit the follow-up passes to the same terminal, and an internal worker is the only kind the extension can measure, stream, and abort. The checkpoint is unchanged, so Discard still spans the manual pass and every iteration after it.
+
+Rehydration keeps an external run intact, which is the single exception to downgrading `running`. A child cannot outlive its parent, so a child-process run comes back as an interrupted review; an external worker is unaffected by this session dying, so downgrading it would discard a run that may still be in flight and lose its review-now path.
 
 ## 6. Rejected Alternatives
 
@@ -205,8 +253,13 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 - Use `ctx.newSession` and switch back with `ctx.switchSession` after implementation: rejected because it serializes the two sessions in one TUI and loses the live review context; the child-process model keeps the reviewing session intact.
 - Run the worker in a git worktree: deferred. It gives true isolation but complicates untracked files, `node_modules`, and generated artifacts. The checkpoint plus Discard covers the v1 failure mode.
 - Non-blocking worker with a background widget: deferred. The current workflow already waits; blocking keeps the state machine and abort handling simple.
-- Let the drafting model pick a concrete model ID: rejected because it can hallucinate IDs or pick unavailable ones. It picks a tier; resolution to a model is deterministic and registry-validated.
 - Structured parsing of the worker report: deferred. The report is prose for a human reviewer; parsing adds a failure mode with little v1 benefit.
+- Make "Run and review" the behaviour of Run, or a configurable default: rejected in favour of a separate option. Automatic review was right in every observed completed run, but plain Run is still the honest choice when the user wants to see the diffstat before spending reviewing context, and a config default would decide that for them invisibly.
+- Build the leftovers follow-up from the session transcript, like an ordinary draft: rejected. The accepted prompt and the review text already define the leftovers, re-serializing a long reviewing session spends the drafting call's context on history the accepted work just superseded, and a model given the transcript tends to re-propose work the review accepted.
+- Model an external run as a fourth state kind: rejected in favour of a discriminator on `running`. A separate kind would restate the draft, model, iteration, and checkpoint that `running` already carries, and double every transition that reads a checkpoint, to express one difference: that no child process exists.
+- Enlarge the gates' previews instead of adding a viewer: rejected. A gate that renders a 165-line prompt or a 10k-character report pushes its own options off the screen; the previews identify what is being decided, and a separate scrollable surface shows all of it.
+- Keep using `ctx.ui.editor` as the read-only viewer: rejected. It invites the user to type into a buffer whose changes are discarded, which is a surface that lies about what it does.
+- Let the drafting model pick a concrete model ID: rejected because it can hallucinate IDs or pick unavailable ones. It picks a tier; resolution to a model is deterministic and registry-validated.
 - Require `/handoff` to reopen Gate B after the review turn instead of hooking `agent_end`: rejected in favour of the automatic reopen because the extra command is friction on every handoff, while the hook's misfire risk is contained by a single flag that is cleared on first use. If the review turn ends early (permission prompt, token limit), the user dismisses the gate and continues; `/handoff` remains available to reopen it.
 
 ## 7. Correctness Hazards / Non-negotiables
@@ -215,10 +268,15 @@ Layering rules match Phase Runner: `domain <- app <- adapters <- index.ts`; only
 - The worker must receive exactly the prompt approved at Gate A. No hidden system prompt additions.
 - The chosen model must exist in `ctx.modelRegistry.getAvailable()` at spawn time; otherwise Gate A must block Run.
 - Discard must only touch files changed since the checkpoint. Files dirty before the run are out of bounds.
-- `session_shutdown` and command abort must kill the child (SIGTERM, then SIGKILL after a grace period). A worker must never outlive the reviewing session unnoticed.
+- A worker that died must never reach Gate B as one that finished. An abort, an error stop reason, an error message, or a non-zero exit is an interruption even when assistant text already arrived; that text may be shown only as pre-crash output, never as the report.
+- An external run must take a checkpoint before the command is handed to the user, for the same reason a spawned run does: without it, Discard has no boundary and the run's changes are unrecoverable.
+- `session_shutdown` and command abort must kill the child (SIGTERM, then SIGKILL after a grace period). A worker must never outlive the reviewing session unnoticed. An external run has no child and must not be treated as though it does.
 - The fix loop must be bounded by `maxIterations` and must require a gate between iterations.
 - `agent_end` must be a no-op unless the machine is in `reviewing` with `awaitingReviewTurn` set. It must clear the flag before opening Gate B so a second `agent_end` (for example after an auto-retry or queued follow-up) cannot open a second gate. It must never fire UI in a session where no handoff is active.
 - The `/tmp` prompt file must be written before Gate A so the external fallback works even if the extension fails afterwards.
+- Iteration and round numbering belongs to the extension. A drafting model must not encode one in a slug or a prompt heading, because the transcript it reads makes any number it infers unreliable.
+- Exactly one `idle` session entry per abandoned handoff. Cancellation is racy — the drafting loader resolves at the keypress while the side-call it abandoned settles separately — so `DraftService.abandon` is idempotent rather than trusting its callers to coordinate.
+- A follow-up handoff must pass through Gate A. "Accept and hand off leftovers" routes through `DraftService` and the ordinary NEEDS INPUT and Gate A flow; there is no second, less-guarded path to a worker.
 - Nothing is committed, pushed, or PR'd by the extension or, via the prompt, by the worker.
 - The drafting step must never fabricate context: the drafting prompt carries the instruction to ask rather than invent, and a draft with a non-empty structured `questions` array is shown to the user instead of Gate A. A standalone prose `## NEEDS INPUT` heading remains a fallback when a model ignores that contract; mentions in prose or a title are not markers. The gate renders numbered questions, context, finite choices, and recommendations, asks one answer at a time, and appends deterministic `Q:`/`A:` pairs under `Answers to the previous draft's NEEDS INPUT questions`; it also offers edit, a read-only full-draft view, and cancel. The pending envelope is retained in optional drafting state so `/handoff` can reopen it after a restart, while older bare drafting entries continue to downgrade to idle.
 - Session-entry rehydration must tolerate a missing or stale `/tmp` file.

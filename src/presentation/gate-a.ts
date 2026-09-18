@@ -7,6 +7,11 @@
  * `openGateA` shell only renders those lines with a `ctx.ui.custom` component and
  * resolves the chosen option id, because an overlay's key handling is not
  * practically testable and should therefore hold no decisions.
+ *
+ * The prompt preview stays bounded at twelve lines even though observed prompts
+ * run to 165. A gate that renders a whole prompt pushes its own options off the
+ * screen, so the full text belongs on the separate scrollable surface View full
+ * prompt opens, and the preview's job is only to identify what is about to run.
  */
 
 import { Container, SelectList, Spacer, Text, type SelectItem } from "@earendil-works/pi-tui";
@@ -32,7 +37,12 @@ function previewPrompt(prompt: string): string[] {
 	const lines = prompt.split("\n");
 	if (lines.length <= PROMPT_PREVIEW_LINES) return lines;
 	const hidden = lines.length - PROMPT_PREVIEW_LINES;
-	return [...lines.slice(0, PROMPT_PREVIEW_LINES), `… ${hidden} more line${hidden === 1 ? "" : "s"}`];
+	// Names the option that shows the rest, so the truncation is a signpost rather
+	// than a dead end the user has to guess their way out of.
+	return [
+		...lines.slice(0, PROMPT_PREVIEW_LINES),
+		`… ${hidden} more line${hidden === 1 ? "" : "s"} — choose "View full prompt" to read all of it`,
+	];
 }
 
 /**

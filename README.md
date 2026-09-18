@@ -25,19 +25,33 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
 
 ## Flow
 
-1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale, questions? }`. `questions` is bounded to three structured items (`question`, optional one-line `context`, optional `choices`, optional 0-based `recommended` choice); a bad recommendation index is ignored rather than rejecting the envelope. A non-empty `questions` array opens NEEDS INPUT as the primary signal. A standalone prose `NEEDS INPUT` line — normally `## NEEDS INPUT` — remains a fallback for a non-compliant model, but prose mentions and titles do not count. The gate shows numbered questions, context, choices, and recommendations, and offers **Answer**, **Edit**, **View full draft**, and **Cancel**. It asks one question at a time using a select plus Other or a text input, then feeds deterministic `Q:`/`A:` pairs into the re-draft scope; dismissing a question submits no partial answers. View full draft is read-only and discards edits. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
+1. **Draft** — a side-call on the current model serializes the session transcript and returns a strict JSON envelope: `{ slug, prompt, tier, rationale, questions? }`. `questions` is bounded to three structured items (`question`, optional one-line `context`, optional `choices`, optional 0-based `recommended` choice); a bad recommendation index is ignored rather than rejecting the envelope. A non-empty `questions` array opens NEEDS INPUT as the primary signal. A standalone prose `NEEDS INPUT` line — normally `## NEEDS INPUT` — remains a fallback for a non-compliant model, but prose mentions and titles do not count. The gate shows numbered questions, context, choices, and recommendations, and offers **Answer**, **Edit**, **View draft**, **Cancel**, and — from the third round — **Proceed with recommended answers**. It asks one question at a time using a select plus Other or a text input, then feeds deterministic `Q:`/`A:` pairs into the re-draft scope; dismissing a question submits no partial answers. The prompt is always written to `/tmp/pi-handoff-<slug>.md` before Gate A, so the external fallback and manual inspection survive whatever happens next.
+
+   The extension owns iteration numbering, and the drafting prompt forbids the model from encoding an iteration, round, or attempt number in the `slug` or the prompt's top heading. The transcript fed to the drafting call may already contain earlier review rounds, so a number the model infers from it is usually wrong; a trailing `-iteration-N` on a slug is also stripped defensively when building the prompt path.
+
+   The NEEDS INPUT round is counted and persisted. From the third round the gate offers **Proceed with recommended answers**, which folds in every question's `recommended` choice as its answer and answers the rest with "Use your best judgement; do not ask again", then re-enters drafting exactly as Answer does. It is withheld earlier because it answers every open question at once, including those with no recommendation.
+
 2. **Gate A** — shows the prompt, the recommended `provider/model:thinking`, and the rationale. Options:
    - **Run** (shown as "Run (blocked: choose an available model first)" until an available model is chosen)
+   - **Run and review** — identical to Run, and when the worker finishes normally it injects the review turn that **Review here** would have, with no second click. An interrupted run opens Gate B instead, since there is no report to review. The intent applies to the run it was chosen on: a later iteration started by **Send review to worker** returns to Gate B, where Review here is one keypress away.
+   - **View full prompt** — opens the whole prompt in a read-only, scrollable view and returns to Gate A. The gate itself previews only twelve lines, because a gate that renders a 165-line prompt pushes its own options off the screen.
    - **Edit prompt** — opens an editor prefilled with the prompt and rewrites the `/tmp` file.
    - **Change model** — pick a model from the live registry, then a thinking level; the tier is kept for the record but the choice overrides it.
-   - **Run externally (copy command)** — copies `pi --model "provider/model:thinking" @/tmp/pi-handoff-<slug>.md` to the clipboard via `pbcopy`, falling back to a notification if the clipboard is unavailable.
+   - **Run externally (copy command)** — copies `pi --model "provider/model:thinking" @/tmp/pi-handoff-<slug>.md` to the clipboard via `pbcopy`, falling back to a notification if the clipboard is unavailable. It then **takes the same checkpoint Run takes** and records an external run in progress; see Terminal fallback below.
    - **Cancel** — returns to idle; the `/tmp` file is left in place.
-3. **Run** — a git checkpoint (`git rev-parse HEAD` plus `git status --porcelain`) is taken before spawning, and the chosen model is re-checked against the live registry at the moment of the click. The worker is spawned as `pi --mode json -p --no-session --model <provider>/<model> --thinking <level> @/tmp/pi-handoff-<slug>.md` in the working directory, with no `--tools` and no `--append-system-prompt`. A live overlay shows elapsed time, turns, tokens, context, and cost, plus recent tool calls. Pressing Escape stops the worker (SIGTERM, then SIGKILL after a grace period). An aborted run or one that produced no report still reaches Gate B, marked _interrupted_, with the checkpoint retained.
+3. **Run** — a git checkpoint (`git rev-parse HEAD` plus `git status --porcelain`) is taken before spawning, and the chosen model is re-checked against the live registry at the moment of the click. The worker is spawned as `pi --mode json -p --no-session --model <provider>/<model> --thinking <level> @/tmp/pi-handoff-<slug>.md` in the working directory, with no `--tools` and no `--append-system-prompt`. A live overlay shows elapsed time, turns, tokens, context, and cost, plus recent tool calls. Pressing Escape stops the worker (SIGTERM, then SIGKILL after a grace period). An aborted run, a crashed one, or one that produced no report still reaches Gate B, marked _interrupted_, with the checkpoint retained.
+
+   A run only counts as completed when the worker **ended cleanly**. An abort, an error stop reason, a defined error message, or a non-zero exit is an interruption even when the worker had already streamed assistant text, because the adapter's report is the last text it saw rather than the worker's conclusion. That text is retained as pre-crash output and labelled as such at Gate B and in the review turn, alongside a bounded tail of the worker's stderr; it is never presented as a report.
+
 4. **Gate B** — shows the worker's report, `git diff --stat` against the checkpoint, usage, and, after **Review here**, the captured reviewer verdict and a bounded findings preview. Options (Review here is omitted for interrupted runs):
    - **Review here** — injects the report, diffstat, and review instructions into the reviewing session as a follow-up message; see Review and feedback below. After a review it becomes **Review again**.
    - **Send feedback to worker** — shown as blocked once the iteration bound is reached. After a review it becomes **Send review to worker**; a `fix` verdict puts it first, an `accept` verdict puts Accept first, and a `discard` verdict leaves Discard in place but relabels it to explain the recommendation.
    - **Discard changes** — asks for confirmation first (Keep is the default option), then reverts.
    - **Accept** (shown as "Accept (keep the tree as it is)" for an interrupted run)
+   - **Accept and hand off leftovers** — offered only after an `accept` verdict. Accepts exactly as Accept does, then drafts a follow-up handoff for the items the review still flagged. Its scope is built from **the accepted prompt and the captured review text alone**, and the drafting call for it sends no conversation history at all — the transcript source is not read on this path — so the result goes through the ordinary NEEDS INPUT and Gate A path without paying for the session twice. That holds for the whole flow, not just the first attempt: a retry after an unparseable envelope and a re-draft after answered NEEDS INPUT questions both re-send the same accepted prompt and review text, with the round's answers appended.
+   - **View full report** / **View full diffstat** — read-only, scrollable views of the whole report and the whole diffstat (plus the stderr tail, when a crash left one). Returning re-renders Gate B unchanged.
+
+   The read-only viewer these options open scrolls with the arrow keys, page up and page down, and home and end; Escape, Enter, or `q` closes it. Its window is measured in **rendered rows rather than source lines**, so a prompt written as unwrapped paragraphs — each of which occupies three or four rows on screen — fills the viewport instead of overflowing it and pushing the heading out of view. Paging follows the same measurement: a page down moves to the first line past the window on screen rather than by a row count, so no lines are skipped between two screens, and a page up returns to the window it came from.
    - **Leave this for later** — dismisses the gate without discarding or accepting; `/handoff` reopens it.
 
 ### Review and feedback
@@ -47,22 +61,29 @@ Drafting requires TUI mode and a selected model; `/handoff status` works in any 
 
 ## Safety properties
 
-- A checkpoint is taken before the worker is spawned, never after.
+- A checkpoint is taken before the worker is spawned, never after — including for a worker the user runs in another terminal.
+- A worker that dies is never reported as one that finished. An abort, an error stop reason, an error message, or a non-zero exit reaches Gate B as _interrupted_ even when assistant text had already arrived; that text is shown as pre-crash output, never as a report.
 - Discard reverts only paths that were clean at checkpoint time; paths already dirty at checkpoint are skipped and listed in an acknowledgement the user must dismiss, so a worker's edits to pre-existing dirty files survive Discard.
 - Discard is blocked if HEAD moved or the repository root changed since the checkpoint.
 - Nothing is ever committed, pushed, or opened as a pull request by the extension or, via the prompt, by the worker.
 - The worker is killed (SIGTERM, then SIGKILL after a grace period) on Escape during Run and again on `session_shutdown`, so it cannot outlive the reviewing session unnoticed.
 - The reviewing session's own model, thinking level, and tools are never changed by a handoff; only the child process runs on the chosen model.
+- A follow-up handoff never bypasses a gate: "Accept and hand off leftovers" routes through the same drafting, NEEDS INPUT, and Gate A path as `/handoff`.
 
 ## Recovery
 
 Every transition appends a `handoff-state` custom session entry. On `session_start`, the latest valid entry is rehydrated:
 
-- a bare legacy `drafting` state or `proposed` → `idle` (the `/tmp` prompt file may be stale); a `drafting` state with its persisted pending NEEDS INPUT draft reopens that gate on `/handoff`. Answered NEEDS INPUT scope replaces the drafting state's scope before each re-draft, so a later round and restart retain prior answers. If `/handoff <scope>` is used while resuming a pending round, the supplied scope is ignored with a warning; Cancel and re-run to start fresh with it.
+- a bare legacy `drafting` state or `proposed` → `idle` (the `/tmp` prompt file may be stale); a `drafting` state with its persisted pending NEEDS INPUT draft reopens that gate on `/handoff`. Answered NEEDS INPUT scope replaces the drafting state's scope before each re-draft, so a later round and restart retain prior answers, as does the NEEDS INPUT round counter. If `/handoff <scope>` is used while resuming a pending round, the supplied scope is ignored with a warning; Cancel and re-run to start fresh with it.
 - `running` → an _interrupted_ review, with the note "The worker was interrupted because this Pi session restarted.", keeping the checkpoint so Discard is still available.
+- `running` with `external` → unchanged. Its worker is in another terminal that this session's death did not touch, so `/handoff` still offers the review-now path.
 - `reviewing` → `reviewing`, with the review-turn flag cleared so a restart cannot resurrect an armed `agent_end`.
 
-`session_shutdown` kills any running worker and waits for it to exit before Pi tears the session down.
+`session_shutdown` kills any running child worker and waits for it to exit before Pi tears the session down. An external run has no child, so nothing is killed.
+
+Every field added for crashed workers (`partialReport`, `stderrTail`), external runs (`external`), Run and review (`autoReview`), and the NEEDS INPUT round (`needsInputRound`) is optional, and a completed review's `usage` is nullable rather than required, so session entries written by earlier versions still decode unchanged.
+
+`autoReview` is persisted for consistency with the rest of the run state rather than for recovery: a child-process run cannot survive a restart, so a rehydrated run is always an interrupted review, and an interrupted run never auto-reviews.
 
 ## Configuration
 
@@ -89,6 +110,17 @@ pi --model "provider/model:thinking" @/tmp/pi-handoff-<slug>.md
 
 This preserves the original manual workflow: the `/tmp` prompt file is written before Gate A opens, so it exists regardless of which option is chosen, and the command can always be run by hand in a separate terminal.
 
+Unlike earlier versions, choosing it does **not** return to idle. It takes the same git checkpoint Run takes and records an external run in progress, so the handoff keeps its safety boundary while the worker runs elsewhere. While that state is active:
+
+- `/handoff status` reports `<slug> running in another terminal` and how to bring the result back.
+- `/handoff` offers **I ran it — review now**, **Discard changes**, and **Leave this for later** instead of drafting a new handoff.
+- **I ran it — review now** computes the diffstat against the checkpoint exactly as an internal run does, optionally accepts a pasted report (submitting an empty editor is allowed), and opens the normal Gate B — including Discard, Accept, Send feedback to worker, and the view options. Usage is absent, because no child process was measured; the gate says so rather than printing zeroes.
+- **Send feedback to worker** at that Gate B starts an ordinary **internal** child-process iteration against the same checkpoint. Running the first pass by hand does not commit the follow-up passes to the same terminal, and the extension can only measure and abort a worker it spawned itself.
+- An empty pasted report reaches Gate B as _interrupted_ rather than as a completed run with an empty report, since the report lives in another terminal's scrollback and its absence is not a result.
+- `session_shutdown` does not try to kill anything: no child process was ever created for an external run.
+
+An external run is also the one state that survives a Pi restart as itself. A child-process run is downgraded to an interrupted review because the child cannot outlive its parent, but an external worker is unaffected by this session dying, so the run — and its review-now path — is kept intact.
+
 ## Package layout and layering
 
 ```text
@@ -98,10 +130,11 @@ src/ports/              interfaces for everything outside the process
 src/adapters/           child-process runner, exec-based git, pbcopy, filesystem
 src/persistence/        schemas for session entries and draft JSON
 src/app/                HandoffMachine, DraftService, RunService, ReviewService
-src/presentation/       gates, widget, model picker
+src/presentation/       gates, widget, model picker, read-only text viewer
 src/prompts/            drafting and review prompt text
 src/commands/           /handoff argument parsing and dispatch
-test/domain/            rubric, draft parsing, feedback append, porcelain status parsing
+test/domain/            rubric, draft parsing, leftovers scope, feedback append, porcelain status parsing
+test/commands/          drafting loop, Gate B loop, NEEDS INPUT gate, review turn (scripted UI)
 test/extension/         entry point loads and registers the expected surface
 ```
 

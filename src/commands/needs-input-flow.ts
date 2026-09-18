@@ -2,15 +2,23 @@
  * The NEEDS INPUT gate loop, kept separate from command dispatch so its answer
  * sequence can be exercised with a scripted UI. It never submits a partial
  * sequence: scope is assembled only after every dialog returns an answer.
+ *
+ * From the third round the gate also offers to end the questioning outright,
+ * folding in every recommendation at once. That exists because the questioning is
+ * not always convergent — one observed handoff spent four rounds and thirty-five
+ * minutes before reaching Gate A, one round of it taking twenty-two minutes — and
+ * past a couple of rounds the model's own recommendations are worth more than
+ * another dialog.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DraftNeedsInput, DraftOutcome, DraftReady, DraftService } from "../app/draft-service.ts";
-import { formatNeedsInputAnswers } from "../domain/draft/questions.ts";
+import { buildRecommendedAnswers, formatNeedsInputAnswers } from "../domain/draft/questions.ts";
 import { extractNeedsInput } from "../domain/draft/parse.ts";
 import { appendNeedsInputAnswers } from "../domain/draft/scope.ts";
 import type { DraftQuestion } from "../domain/types.ts";
 import { openNeedsInputGate } from "../presentation/needs-input-gate.ts";
+import { openTextViewer } from "../presentation/text-viewer.ts";
 import { NEEDS_INPUT_ANSWERS_HEADING } from "../prompts/drafting-prompt.ts";
 
 /** Outcome resolved once the gate loop cannot act on the current draft itself. */
@@ -82,10 +90,12 @@ export async function runNeedsInputFlow(
 
 	for (;;) {
 		const questions = questionsFor(current.draft);
+		const round = service.needsInputRound();
 		const selected = await openNeedsInputGate(ctx, {
 			slug: current.draft.slug,
 			promptPath: current.promptPath,
 			questions,
+			round,
 		});
 
 		if (selected === undefined || selected === "cancel") {
@@ -95,8 +105,21 @@ export async function runNeedsInputFlow(
 		}
 
 		if (selected === "view") {
-			await ctx.ui.editor("Full draft (read-only; edits are discarded)", current.draft.prompt);
+			// A real read-only surface, rather than an editor whose edits are silently dropped.
+			await openTextViewer(ctx, `Draft prompt — ${current.draft.slug} (read-only)`, current.draft.prompt);
 			continue;
+		}
+
+		if (selected === "proceed") {
+			// Every question is answered at once: recommendations where the model gave one,
+			// delegated judgement everywhere else. Both forms are ordinary answers by the time
+			// they reach scope, so the drafting prompt's "already decided" rule closes them.
+			const answered = formatNeedsInputAnswers(buildRecommendedAnswers(questions));
+			ctx.ui.notify(
+				`Proceeding with the recommended answers for round ${round}; the draft will not ask these again.`,
+				"info",
+			);
+			return { kind: "rescoped", scope: appendNeedsInputAnswers(scope, NEEDS_INPUT_ANSWERS_HEADING, answered) };
 		}
 
 		if (selected === "answer") {

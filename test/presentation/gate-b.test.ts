@@ -170,10 +170,10 @@ describe("formatGateBSummary", () => {
 		assert.ok(lines.includes("Changes:   none against the checkpoint"));
 	});
 
-	it("truncates a long report and says how much is hidden", () => {
+	it("truncates a long report and points at the option that shows the rest", () => {
 		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
 		const lines = formatGateBSummary({ ...COMPLETED_VIEW, report });
-		assert.ok(lines.includes("… 16 more lines"));
+		assert.ok(lines.includes('… 16 more lines — choose "View full report" to read all of it'));
 	});
 
 	it("is unchanged when no review was captured", () => {
@@ -225,13 +225,42 @@ describe("formatGateBTitle", () => {
 
 describe("gateBMenu", () => {
 	it("keeps the original order and labels when no review was captured", () => {
-		const options = gateBMenu({ interrupted: false });
+		const options = gateBMenu({ interrupted: false, hasReport: true });
 		assert.deepEqual(
 			options.map((option) => option.id),
-			["review", "feedback", "discard", "accept", "dismiss"],
+			["review", "feedback", "discard", "accept", "view_report", "view_diffstat", "dismiss"],
 		);
 		assert.equal(options[0]?.label, "Review here");
 		assert.equal(options[1]?.label, "Send feedback to worker");
+	});
+
+	it("omits the report viewer when there is no report text to show", () => {
+		const options = gateBMenu({ interrupted: true });
+		assert.equal(
+			options.some((option) => option.id === "view_report"),
+			false,
+		);
+		assert.equal(
+			options.some((option) => option.id === "view_diffstat"),
+			true,
+		);
+	});
+
+	it("offers the leftovers follow-up only on an accept verdict", () => {
+		assert.equal(
+			gateBMenu({ interrupted: false, review: { verdict: "accept" } }).some(
+				(option) => option.id === "accept_leftovers",
+			),
+			true,
+		);
+		assert.equal(
+			gateBMenu({ interrupted: false, review: { verdict: "fix" } }).some((option) => option.id === "accept_leftovers"),
+			false,
+		);
+		assert.equal(
+			gateBMenu({ interrupted: false }).some((option) => option.id === "accept_leftovers"),
+			false,
+		);
 	});
 
 	it("labels the live options plainly once they are implemented", () => {
@@ -269,12 +298,12 @@ describe("gateBMenu", () => {
 	});
 
 	it("relabels review actions after a review without a verdict", () => {
-		const options = gateBMenu({ interrupted: false, review: {} });
+		const options = gateBMenu({ interrupted: false, review: {}, hasReport: true });
 		assert.equal(options.find((option) => option.id === "review")?.label, "Review again");
 		assert.equal(options.find((option) => option.id === "feedback")?.label, "Send review to worker");
 		assert.deepEqual(
 			options.map((option) => option.id),
-			["review", "feedback", "discard", "accept", "dismiss"],
+			["review", "feedback", "discard", "accept", "view_report", "view_diffstat", "dismiss"],
 		);
 	});
 
@@ -530,5 +559,91 @@ describe("formatRunningLines", () => {
 		);
 		assert.ok(lines.includes("Stopping the worker…"));
 		assert.ok(!lines.includes("esc  stop the worker"));
+	});
+});
+
+/**
+ * Crash evidence at Gate B.
+ *
+ * The distinction these pin is the whole of Bug 1's presentation half: `report` is
+ * a claim the worker chose to make, `partialReport` is whatever it happened to be
+ * saying when it died, and rendering the second as the first is how a mid-task
+ * sentence about terminal width reached a reviewer as a finished result beside a
+ * 2,816-line diff.
+ */
+describe("formatGateBSummary crash evidence", () => {
+	const CRASHED_VIEW: GateBView = {
+		...INTERRUPTED_VIEW,
+		interruptionNote: "The worker ended on an error rather than finishing its turn.",
+		partialReport: "The pty defaulted to 80 columns… Let me set a larger window size.",
+		stderrTail: "pi: fatal: provider returned 503",
+	};
+
+	it("states that the worker did not finish", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.ok(lines.some((line) => line.includes("Report:    none — the worker did not finish")));
+	});
+
+	it("shows the interruption reason", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.ok(lines.some((line) => line.includes("ended on an error rather than finishing its turn")));
+	});
+
+	/** The heading is the warning: this text looks exactly like a report and is not one. */
+	it("labels the pre-crash text as not a report", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.ok(lines.includes("Partial output before the worker died (NOT a report — it never finished):"));
+	});
+
+	it("never introduces pre-crash text as the worker's report", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.equal(lines.includes("Worker report:"), false);
+	});
+
+	it("includes the pre-crash text so the user can see what it was doing", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.ok(lines.some((line) => line.includes("The pty defaulted to 80 columns")));
+	});
+
+	it("shows the stderr tail, which usually names the real failure", () => {
+		const lines = formatGateBSummary(CRASHED_VIEW);
+		assert.ok(lines.includes("Worker stderr (tail):"));
+		assert.ok(lines.some((line) => line.includes("provider returned 503")));
+	});
+
+	it("omits both sections when a run was interrupted with no evidence", () => {
+		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		assert.equal(
+			lines.some((line) => line.includes("Partial output")),
+			false,
+		);
+		assert.equal(lines.includes("Worker stderr (tail):"), false);
+	});
+
+	it("still titles the gate as an incomplete handoff", () => {
+		assert.equal(formatGateBTitle(CRASHED_VIEW), "Handoff did not complete");
+	});
+
+	it("offers the report viewer for pre-crash text, since there is something to read", () => {
+		const options = gateBMenu({ interrupted: true, hasReport: true });
+		assert.ok(options.some((option) => option.id === "view_report"));
+	});
+});
+
+describe("formatGateBSummary external runs", () => {
+	it("explains absent usage by naming the other terminal, not an unfinished run", () => {
+		const lines = formatGateBSummary({ ...COMPLETED_VIEW, usage: null, external: true });
+		assert.ok(lines.includes("Usage:     not available — the handoff ran in another terminal"));
+	});
+
+	it("still shows the report and diffstat for an external run", () => {
+		const lines = formatGateBSummary({ ...COMPLETED_VIEW, usage: null, external: true });
+		assert.ok(lines.includes("Worker report:"));
+		assert.ok(lines.includes("Changes:"));
+	});
+
+	it("distinguishes an unfinished run from an unmeasured one", () => {
+		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		assert.ok(lines.includes("Usage:     not available for an unfinished run"));
 	});
 });

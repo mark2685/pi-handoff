@@ -88,7 +88,13 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   ]
 }
 
-The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".`;
+The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".
+
+## Iteration numbering is not yours
+
+The extension owns iteration and round numbering, and it is the only thing that knows the real number. Never encode an iteration, round, attempt, or pass number in the "slug" or in the prompt's top heading: no "-iteration-2" suffix, no "(iteration 3)", no "round 2", no "attempt 4". Name the work, not the attempt.
+
+The conversation you are reading may already contain earlier handoffs and their review rounds, so a number you infer from it is almost always wrong: a draft named "iteration 1" has run as iteration 2, and a draft titled "(iteration 3)" has been a brand-new handoff at iteration 1. If a count belongs anywhere it is in the prompt body as verified context ("an earlier attempt did X"), never in the slug or the title.`;
 
 /** Builds the drafting call's user message from the serialized session and the user's scope. */
 export function buildDraftingUserMessage(conversationText: string, scope: string): string {
@@ -97,4 +103,33 @@ export function buildDraftingUserMessage(conversationText: string, scope: string
 		? trimmedScope
 		: "None supplied; use the latest recommendations and decisions in the conversation.";
 	return `## Conversation History\n\n${conversationText}\n\n## Additional Handoff Scope\n\n${scopeSection}`;
+}
+
+/** Heading under which a leftovers follow-up states its self-contained scope. */
+export const LEFTOVERS_SCOPE_HEADING = "Handoff Scope";
+
+/**
+ * Builds the drafting call's user message for a leftovers follow-up.
+ *
+ * Separate from `buildDraftingUserMessage` because this path has **no conversation
+ * history section at all**. The scope it receives already contains the two
+ * documents that define the work — the accepted prompt and the review that
+ * accepted it — so serializing the reviewing session alongside them would spend
+ * the call's context on history the accepted work has just superseded, and tempts
+ * the model into re-proposing work the review accepted.
+ *
+ * The note is what makes the absence legible: a drafting model that has been told
+ * it normally receives a transcript would otherwise treat the missing section as a
+ * defect and hedge, or ask for the history back as a NEEDS INPUT question.
+ */
+export function buildLeftoversUserMessage(scope: string): string {
+	return [
+		`## ${LEFTOVERS_SCOPE_HEADING}`,
+		"",
+		scope.trim(),
+		"",
+		"## A note on what you were given",
+		"",
+		"There is deliberately no conversation history in this request. The scope above is self-contained: it quotes the handoff that was accepted and the review that accepted it, which together define the remaining work. Draft from those two documents alone and do not ask for the conversation.",
+	].join("\n");
 }

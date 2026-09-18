@@ -260,3 +260,138 @@ describe("validateHandoffState", () => {
 		});
 	});
 });
+
+/**
+ * Every field added for crashed workers, external runs, Run and review, and the
+ * NEEDS INPUT round counter is optional, so a session recorded by an older build
+ * still decodes. These are the tests that keep that promise honest: each new shape
+ * is asserted alongside the old shape it has to coexist with.
+ */
+describe("validateHandoffState compatibility", () => {
+	it("accepts an old drafting entry with neither a pending draft nor a round", () => {
+		assert.equal(validateHandoffState({ kind: "drafting", scope: "old session" }).ok, true);
+	});
+
+	it("accepts a drafting entry carrying a NEEDS INPUT round counter", () => {
+		const state = {
+			kind: "drafting",
+			scope: "scope",
+			pendingDraft: { draft: validHandoffDraft, promptPath: "/tmp/pi-handoff-x.md" },
+			needsInputRound: 3,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts an old running entry with no external or auto-review flag", () => {
+		const state = {
+			kind: "running",
+			draft: validHandoffDraft,
+			choice: validChoice,
+			iteration: 1,
+			startedAt: "2026-03-16T12:00:00.000Z",
+			checkpoint: validCheckpoint,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts a running entry for an external run awaiting review", () => {
+		const state = {
+			kind: "running",
+			draft: validHandoffDraft,
+			choice: validChoice,
+			iteration: 1,
+			startedAt: "2026-03-16T12:00:00.000Z",
+			checkpoint: validCheckpoint,
+			external: true,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts a running entry that recorded Run and review's intent", () => {
+		const state = {
+			kind: "running",
+			draft: validHandoffDraft,
+			choice: validChoice,
+			iteration: 1,
+			startedAt: "2026-03-16T12:00:00.000Z",
+			checkpoint: validCheckpoint,
+			autoReview: true,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("still accepts a completed review whose usage was measured", () => {
+		assert.equal(validateHandoffState(validCompletedState).ok, true);
+	});
+
+	/** An external run has no child process to measure, so null is the honest value. */
+	it("accepts a completed review with null usage from an external run", () => {
+		const state = { ...validCompletedState, usage: null, external: true };
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("still rejects a completed review with no usage field at all", () => {
+		const { usage: _usage, ...withoutUsage } = validCompletedState;
+		assert.equal(validateHandoffState(withoutUsage).ok, false);
+	});
+
+	it("accepts an old interrupted review with no crash evidence", () => {
+		const state = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			usage: null,
+			interruptionNote: "The worker was interrupted because this Pi session restarted.",
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts an interrupted review carrying pre-crash text and a stderr tail", () => {
+		const state = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			usage: null,
+			interruptionNote: "The worker ended on an error rather than finishing its turn.",
+			partialReport: "The pty defaulted to 80 columns…",
+			stderrTail: "pi: fatal: provider returned 503",
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("round-trips an interrupted state with crash evidence through the machine", () => {
+		const machine = createHandoffMachine();
+		machine.beginDraft("crash test");
+		machine.propose(validHandoffDraft, validChoice);
+		machine.startRun({ iteration: 1, startedAt: "2026-03-16T12:00:00.000Z", checkpoint: validCheckpoint });
+		const interrupted = machine.interruptRun({
+			note: "The worker failed: context length exceeded",
+			partialReport: "Halfway through…",
+			stderrTail: "pi: fatal",
+		});
+		if (!interrupted.ok) throw new Error(interrupted.error.message);
+		assert.deepEqual(validateHandoffState(serializeHandoffState(interrupted.value)), {
+			ok: true,
+			value: interrupted.value,
+		});
+	});
+
+	it("round-trips an external run through the machine", () => {
+		const machine = createHandoffMachine();
+		machine.beginDraft("external test");
+		machine.propose(validHandoffDraft, validChoice);
+		const started = machine.startRun({
+			iteration: 1,
+			startedAt: "2026-03-16T12:00:00.000Z",
+			checkpoint: validCheckpoint,
+			external: true,
+		});
+		if (!started.ok) throw new Error(started.error.message);
+		assert.deepEqual(validateHandoffState(serializeHandoffState(started.value)), {
+			ok: true,
+			value: started.value,
+		});
+	});
+});

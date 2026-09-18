@@ -93,6 +93,25 @@ describe("formatHandoffStatus", () => {
 		);
 	});
 
+	/**
+	 * Reported as awaiting the user rather than as work in progress here: nothing in
+	 * this session is running, and the next move is theirs.
+	 */
+	it("reports an external run as waiting on the other terminal", () => {
+		const state: HandoffState = {
+			kind: "running",
+			draft: DRAFT,
+			choice: CHOICE,
+			iteration: 1,
+			startedAt: "2026-01-01T00:00:00.000Z",
+			checkpoint: CHECKPOINT,
+			external: true,
+		};
+		const status = formatHandoffStatus(state);
+		assert.match(status, /add-retry-logic running in another terminal/);
+		assert.match(status, /when it finishes to review it here/);
+	});
+
 	it("reports an interrupted review with its note", () => {
 		const state: HandoffState = {
 			kind: "reviewing",
@@ -138,10 +157,10 @@ describe("formatGateASummary", () => {
 		assert.ok(lines.includes("Line 2"));
 	});
 
-	it("truncates a long prompt and says how much is hidden", () => {
+	it("truncates a long prompt and points at the option that shows the rest", () => {
 		const long: Draft = { ...DRAFT, prompt: Array.from({ length: 20 }, (_, i) => `L${i}`).join("\n") };
 		const lines = formatGateASummary({ ...view, draft: long });
-		assert.ok(lines.includes("… 8 more lines"));
+		assert.ok(lines.includes('… 8 more lines — choose "View full prompt" to read all of it'));
 		assert.equal(lines.includes("L19"), false);
 	});
 
@@ -161,11 +180,15 @@ describe("formatGateASummary", () => {
 });
 
 describe("gateAMenu", () => {
-	it("offers exactly the five designed options in order", () => {
+	it("offers the designed options in order, with Run and review beside Run", () => {
 		assert.deepEqual(
 			gateAMenu(true).map((option) => option.id),
-			["run", "edit", "model", "external", "cancel"],
+			["run", "run_and_review", "view", "edit", "model", "external", "cancel"],
 		);
+	});
+
+	it("marks Run and review as blocked whenever Run is", () => {
+		assert.equal(gateAMenu(false)[1]?.label, "Run and review (blocked: choose an available model first)");
 	});
 
 	it("labels Run plainly when a model is available", () => {
@@ -179,7 +202,7 @@ describe("gateAMenu", () => {
 
 describe("selectOption", () => {
 	it("resolves a chosen label back to its stable id", async () => {
-		const chosen = await selectOption(async (_title, options) => options[3], "Gate A", gateAMenu(true));
+		const chosen = await selectOption(async (_title, options) => options[5], "Gate A", gateAMenu(true));
 		assert.equal(chosen, "external");
 	});
 

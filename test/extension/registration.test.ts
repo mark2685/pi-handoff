@@ -489,3 +489,114 @@ describe("agent_end reopen", () => {
 		assert.deepEqual(recorder.messages, []);
 	});
 });
+
+/**
+ * The external-run state, driven through the real entry point.
+ *
+ * This is the path that had no state at all: "Run externally" returned to idle, so
+ * the extension forgot the handoff and the user's worker edited a tree with no
+ * checkpoint, no diffstat, and no Discard. These assert the recorded state is
+ * visible to `/handoff status`, that `/handoff` offers the review-now gate for it,
+ * and that shutdown does not try to kill a process that was never a child here.
+ */
+describe("external run recovery", () => {
+	let recorder: Recorder;
+
+	const EXTERNAL_BRANCH = [
+		{
+			type: "custom",
+			customType: "handoff-state",
+			data: {
+				kind: "running",
+				draft: { slug: "add-retries", prompt: "Do it.", tier: "standard", rationale: "Because." },
+				choice: { provider: "bifrost", model: "claude-sonnet-5", thinking: "high" },
+				iteration: 1,
+				startedAt: "2026-03-09T09:00:00.000Z",
+				checkpoint: { repositoryRoot: "/repo", head: "abc1234", statuses: [] },
+				external: true,
+			},
+		},
+	];
+
+	beforeEach(() => {
+		recorder = createRecorder();
+		handoff(recorder.api);
+	});
+
+	/**
+	 * The one state that survives a restart as itself. Its worker is in another
+	 * terminal that this session's death did not touch, so downgrading it to an
+	 * interrupted review would discard a run that may still be in flight.
+	 */
+	it("keeps an external run in progress across a restart", async () => {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const { ctx, notifications } = createCommandContext({ branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await command.handler("status", ctx);
+
+		assert.match(notifications[0]?.message ?? "", /running in another terminal/);
+	});
+
+	it("tells the user how to bring the result back", async () => {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const { ctx, notifications } = createCommandContext({ branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await command.handler("status", ctx);
+
+		assert.match(notifications[0]?.message ?? "", /when it finishes to review it here/);
+	});
+
+	it("offers the review-now gate when /handoff is run while it is in flight", async () => {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const { ctx, uiCalls } = createCommandContext({ mode: "tui", branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await command.handler("", ctx);
+
+		// A select, not a drafting call: the gate asks what to do with the run in flight.
+		assert.deepEqual(uiCalls, ["select"]);
+	});
+
+	it("leaves the run in place when the gate is dismissed", async () => {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const { ctx, notifications } = createCommandContext({ mode: "tui", branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await command.handler("", ctx);
+		await command.handler("status", ctx);
+
+		assert.match(notifications.at(-1)?.message ?? "", /running in another terminal/);
+	});
+
+	it("warns that a supplied scope was ignored rather than drafting over the run", async () => {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const { ctx, notifications } = createCommandContext({ mode: "tui", branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await command.handler("something else entirely", ctx);
+
+		assert.match(notifications[0]?.message ?? "", /already running in another terminal/);
+		assert.equal(notifications[0]?.level, "warning");
+	});
+
+	/** No child process was ever this session's, so there is nothing to kill. */
+	it("does not try to kill a worker for an external run on shutdown", async () => {
+		const { ctx, uiCalls, notifications } = createCommandContext({ branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await fireHook(recorder, "session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+
+		assert.deepEqual(uiCalls, []);
+		assert.deepEqual(notifications, []);
+		assert.deepEqual(recorder.entries, []);
+	});
+
+	it("opens no UI from agent_end while an external run is in flight", async () => {
+		const { ctx, uiCalls } = createCommandContext({ mode: "tui", branch: EXTERNAL_BRANCH });
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		assert.deepEqual(uiCalls, []);
+	});
+});

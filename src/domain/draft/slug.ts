@@ -12,6 +12,46 @@ export const MAX_SLUG_LENGTH = 64;
 /** Used when an input contains no characters safe for a prompt filename. */
 export const FALLBACK_SLUG = "handoff";
 
+/**
+ * Matches a trailing iteration or round counter on a slug.
+ *
+ * The drafting prompt forbids these outright; this is the belt to that braces.
+ * The drafting call is fed a transcript that may already contain earlier review
+ * rounds, so a model that keeps counting produces slugs like
+ * `tg-feedback-command-iteration-1` for what the extension is about to run as
+ * iteration 2. The extension owns the real number, so a model-supplied one is
+ * always removed rather than trusted — a wrong number on the prompt filename is
+ * worse than none, because the filename is what the reviewer greps for.
+ *
+ * Only a *trailing* counter is stripped, and only when a name survives it, so
+ * `iteration-cache-fix` and a slug that is nothing but `iteration-2` are left
+ * alone rather than mangled into a fallback.
+ *
+ * The words are deliberately restricted to the four that can only mean a counter.
+ * `v` and `pass` were tried and removed: they mangle real task names, turning
+ * `upgrade-next-v16` into `upgrade-next`, `migrate-api-v2` into `migrate-api`, and
+ * `first-pass-3` into `first`. A version number is part of what the work is, and
+ * silently deleting it is a worse failure than leaving a stray counter, which the
+ * prompt rule already prevents in the normal case.
+ */
+const TRAILING_ITERATION_SUFFIX = /-(?:iteration|iter|round|attempt)-?\d+$/;
+
+/**
+ * Removes a trailing iteration counter a drafting model added to a slug.
+ *
+ * Applied repeatedly, since a model that appends one counter sometimes appends
+ * two (`-round-2-iteration-1`).
+ */
+export function stripIterationSuffix(slug: string): string {
+	let stripped = slug;
+	for (;;) {
+		const next = stripped.replace(TRAILING_ITERATION_SUFFIX, "");
+		// Keeps a slug that is only a counter, rather than emptying it into the fallback.
+		if (next === stripped || next === "") return stripped;
+		stripped = next;
+	}
+}
+
 /** Directory where later adapters write prompts before Gate A. */
 export const HANDOFF_TEMP_DIR = "/tmp";
 
@@ -30,7 +70,7 @@ export function slugify(input: string): string {
 		.replace(/^-+|-+$/g, "")
 		.slice(0, MAX_SLUG_LENGTH)
 		.replace(/^-+|-+$/g, "");
-	return slug || FALLBACK_SLUG;
+	return stripIterationSuffix(slug) || FALLBACK_SLUG;
 }
 
 /** Builds the full temporary prompt path from an untrusted model-provided slug. */

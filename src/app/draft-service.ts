@@ -31,7 +31,11 @@ import type { AvailableModel, Draft, ModelChoice, Rubric } from "../domain/types
 import { type DecodeError, validateDraft } from "../persistence/schemas.ts";
 import type { DraftingFailure, DraftingModel, SessionTranscriptSource } from "../ports/drafting-model.ts";
 import type { PromptFileWriter, PromptWriteFailure } from "../ports/prompt-file-writer.ts";
-import { buildDraftingUserMessage, DRAFTING_SYSTEM_PROMPT } from "../prompts/drafting-prompt.ts";
+import {
+	buildDraftingUserMessage,
+	buildLeftoversUserMessage,
+	DRAFTING_SYSTEM_PROMPT,
+} from "../prompts/drafting-prompt.ts";
 import type { HandoffConflict, HandoffMachine } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
 
@@ -98,6 +102,27 @@ export interface DraftServiceDeps {
 export interface DraftService {
 	/** Runs or retries the drafting call for a scope and returns the Gate A outcome. */
 	draft(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>>;
+	/**
+	 * Drafts a follow-up handoff for the items an accepting review still flagged.
+	 *
+	 * Takes an already-built scope — `buildLeftoversScope`'s output — rather than the
+	 * raw documents, because this is called again for every retry and every answered
+	 * NEEDS INPUT round, and each of those must re-send the same accepted prompt and
+	 * review text with the round's answers appended. Building the scope here instead
+	 * would make the caller choose between rebuilding it (losing the answers) and
+	 * falling back to `draft` (which reads the transcript).
+	 *
+	 * The transcript source is not read at all on this path — not merely omitted from
+	 * the scope — because both documents that define the leftovers are already in hand
+	 * and the accepted work has just superseded the history. Enters `drafting` from
+	 * `idle`, where Accept has just left the machine, and replaces the scope on a
+	 * re-entry exactly as `draft` does. The result goes through the ordinary NEEDS
+	 * INPUT and Gate A path, so a follow-up is never launched without the same
+	 * approval as any other handoff.
+	 */
+	draftLeftovers(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>>;
+	/** The current NEEDS INPUT round, counted from 1, for the gate's escape hatch. */
+	needsInputRound(): number;
 	/** Records a user-selected model, overriding the tier's recommendation. */
 	chooseModel(choice: ModelChoice): Result<DraftReady, HandoffConflict>;
 	/** Rewrites the prompt file and the retained draft after Edit prompt. */
@@ -139,9 +164,22 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 		recorder.record(machine.current());
 	}
 
-	/** Returns to idle and records the reset, used by every terminal drafting outcome. */
+	/**
+	 * Returns to idle and records the reset, used by every terminal drafting outcome.
+	 *
+	 * Idempotent, and that is load-bearing rather than defensive. Abandonment is
+	 * genuinely racy: cancelling the drafting loader resolves the overlay at the
+	 * keypress, while the side-call it abandoned settles separately and reports
+	 * `aborted`, so both the command layer and `draft()` legitimately call this for
+	 * the same cancellation. Recording unconditionally appended two consecutive
+	 * `idle` entries within the same second, which reads in the session log as two
+	 * abandoned handoffs. Skipping an already-idle machine keeps one abandonment to
+	 * one record without making either caller responsible for guessing whether the
+	 * other already ran.
+	 */
 	function abandon(): void {
 		retainedDraft = undefined;
+		if (machine.current().kind === "idle") return;
 		machine.reset();
 		record();
 	}
@@ -179,6 +217,11 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	/** Persists the open round without making a draft with unanswered questions look proposed. */
 	function retainNeedsInputDraft(draft: Draft, promptPath: string): Result<void, HandoffConflict> {
 		retainedDraft = draft;
+		// Counted before the envelope is retained, because the machine infers an implicit
+		// round from a retained envelope when no counter exists (an older entry). Counting
+		// afterwards would make this round look like the second one.
+		const counted = machine.beginNeedsInputRound();
+		if (!counted.ok) return err(counted.error);
 		const retained = machine.setPendingDraft({ draft, promptPath });
 		if (!retained.ok) return err(retained.error);
 		record();
@@ -220,50 +263,99 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 		return ok({ kind: "ready", draft, choice: resolution.choice, promptPath: written.value });
 	}
 
+	/**
+	 * Enters `drafting` with a scope, or replaces the scope of a draft already running.
+	 *
+	 * Both drafting entry points re-enter: `draft` on a retry after an unparseable
+	 * envelope or an answered question round, `draftLeftovers` for the same two reasons.
+	 * Replacing rather than ignoring the scope is what makes answered NEEDS INPUT
+	 * decisions — and, for a leftovers follow-up, the accepted prompt and review text
+	 * the scope carries — survive another round and a session restart.
+	 */
+	function enterDrafting(scope: string): Result<void, HandoffConflict> {
+		const entered =
+			machine.current().kind === "drafting" ? machine.replaceDraftScope(scope) : machine.beginDraft(scope);
+		if (!entered.ok) return err(entered.error);
+		record();
+		return ok(undefined);
+	}
+
+	/**
+	 * Runs the drafting side-call for an already-`drafting` machine and finishes it.
+	 *
+	 * Shared by `draft` and `draftLeftovers` so the two entry points cannot drift on
+	 * the parts that matter: a parse failure stays in `drafting` for retry, and a
+	 * success clears any prior question round before the envelope is finalized.
+	 *
+	 * The user message is built by the caller rather than here, because the two
+	 * callers disagree about the one thing this function must not decide: an ordinary
+	 * draft is a transcript plus a scope, while a leftovers follow-up is a scope
+	 * alone. Passing the finished message in keeps the transcript read out of this
+	 * shared path entirely, so the leftovers promise — no transcript — is a property
+	 * of the code rather than of a comment.
+	 */
+	async function completeDraftingCall(
+		userMessage: string,
+		signal: AbortSignal | undefined,
+	): Promise<Result<DraftOutcome, HandoffConflict>> {
+		const response = await draftingModel.complete({
+			systemPrompt: DRAFTING_SYSTEM_PROMPT,
+			userMessage,
+			signal,
+		});
+		if (!response.ok) {
+			abandon();
+			return ok({ kind: "failed", failure: response.error });
+		}
+
+		const parsed = parseDraft(response.value, validateDraft);
+		if (!parsed.ok) {
+			// Deliberately stays in `drafting` so the caller can retry without re-entering.
+			return ok({ kind: "unparseable", rawResponse: response.value, error: parsed.error });
+		}
+
+		// A successful re-draft supersedes a persisted prior question round before it is finalized.
+		const drafting = machine.current();
+		if (drafting.kind === "drafting" && drafting.pendingDraft !== undefined) {
+			const cleared = machine.clearPendingDraft();
+			if (!cleared.ok) return err(cleared.error);
+			record();
+		}
+		return finishDraft(parsed.value);
+	}
+
 	return {
 		async draft(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>> {
-			// A retry re-enters while already drafting. Replace the scope so answered
-			// NEEDS INPUT decisions survive another round and session recovery.
-			if (machine.current().kind !== "drafting") {
-				const began = machine.beginDraft(scope);
-				if (!began.ok) return err(began.error);
-				record();
-			} else {
-				const replaced = machine.replaceDraftScope(scope);
-				if (!replaced.ok) return err(replaced.error);
-				record();
-			}
+			const entered = enterDrafting(scope);
+			if (!entered.ok) return err(entered.error);
 
+			// Read here rather than in the shared path: this is the only entry point that
+			// hands off a conversation, so it is the only one an empty session can refuse.
 			const session = transcript.read();
 			if (session.kind === "empty") {
 				abandon();
 				return ok({ kind: "empty_session" });
 			}
 
-			const response = await draftingModel.complete({
-				systemPrompt: DRAFTING_SYSTEM_PROMPT,
-				userMessage: buildDraftingUserMessage(session.text, scope),
-				signal,
-			});
-			if (!response.ok) {
-				abandon();
-				return ok({ kind: "failed", failure: response.error });
-			}
+			return completeDraftingCall(buildDraftingUserMessage(session.text, scope), signal);
+		},
 
-			const parsed = parseDraft(response.value, validateDraft);
-			if (!parsed.ok) {
-				// Deliberately stays in `drafting` so the caller can retry without re-entering.
-				return ok({ kind: "unparseable", rawResponse: response.value, error: parsed.error });
-			}
+		async draftLeftovers(
+			scope: string,
+			signal: AbortSignal | undefined,
+		): Promise<Result<DraftOutcome, HandoffConflict>> {
+			const entered = enterDrafting(scope);
+			if (!entered.ok) return err(entered.error);
+			// No transcript read, and so no `empty_session` outcome: the accepted prompt and
+			// the review text the scope carries are the entire input. Routing this through the
+			// transcript would have abandoned a leftovers draft as `empty_session` on an empty
+			// session, which is nonsense for a path whose source documents are both already in
+			// hand.
+			return completeDraftingCall(buildLeftoversUserMessage(scope), signal);
+		},
 
-			// A successful re-draft supersedes a persisted prior question round before it is finalized.
-			const drafting = machine.current();
-			if (drafting.kind === "drafting" && drafting.pendingDraft !== undefined) {
-				const cleared = machine.clearPendingDraft();
-				if (!cleared.ok) return err(cleared.error);
-				record();
-			}
-			return finishDraft(parsed.value);
+		needsInputRound(): number {
+			return machine.needsInputRound();
 		},
 
 		chooseModel(choice: ModelChoice): Result<DraftReady, HandoffConflict> {

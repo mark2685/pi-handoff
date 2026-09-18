@@ -69,6 +69,8 @@ interface Harness {
 	notifications: { message: string; level?: string }[];
 	messages: string[];
 	editorPrefills: string[];
+	/** Follow-up drafts requested by "Accept and hand off leftovers". */
+	leftovers: { slug: string; prompt: string; reviewText: string }[];
 }
 
 interface HarnessOptions {
@@ -85,6 +87,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const notifications: { message: string; level?: string }[] = [];
 	const messages: string[] = [];
 	const editorPrefills: string[] = [];
+	const leftovers: { slug: string; prompt: string; reviewText: string }[] = [];
 	const selections = [...(options.selections ?? [])];
 
 	const recorder: HandoffStateRecorder = { record: () => {} };
@@ -155,9 +158,12 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		sendUserMessage: (content) => {
 			messages.push(content);
 		},
+		draftLeftovers: async (_ctx, input) => {
+			leftovers.push(input);
+		},
 	});
 
-	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills };
+	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills, leftovers };
 }
 
 /** Drives the machine to a pending review, which is Gate B's precondition. */
@@ -452,5 +458,130 @@ describe("GateBFlow.handleAgentEnd", () => {
 
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
 		assert.equal(harness.overlays.length, 1);
+	});
+});
+
+/**
+ * "Run and review" reuses this seam rather than rebuilding the injection, so these
+ * assert it arms and injects exactly as the gate's own Review here does.
+ */
+describe("GateBFlow.startReviewTurn", () => {
+	it("arms the review turn and injects the review message", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+
+		assert.equal(harness.flow.startReviewTurn(harness.ctx), true);
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
+		assert.equal(harness.messages.length, 1);
+	});
+
+	it("opens no gate, since the point is to skip it", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		assert.deepEqual(harness.overlays, []);
+	});
+
+	it("injects the same message the gate's Review here would have", async () => {
+		const auto = createHarness();
+		await reachReview(auto);
+		auto.flow.startReviewTurn(auto.ctx);
+
+		const manual = createHarness({ selections: ["review"] });
+		await reachReview(manual);
+		const view = await manual.flow.viewFromPendingReview(manual.ctx);
+		assert.ok(view);
+		await manual.flow.run(manual.ctx, view);
+
+		assert.deepEqual(auto.messages, manual.messages);
+	});
+
+	it("reports failure when the machine refuses to arm, so the caller can fall back", () => {
+		const harness = createHarness();
+		assert.equal(harness.flow.startReviewTurn(harness.ctx), false);
+		assert.deepEqual(harness.messages, []);
+	});
+
+	/** An interrupted run has no report, so there is nothing to review automatically. */
+	it("refuses to arm an interrupted review", async () => {
+		const harness = createHarness({ interrupted: true });
+		await reachReview(harness);
+
+		assert.equal(harness.flow.startReviewTurn(harness.ctx), false);
+	});
+
+	it("reopens Gate B once when the injected turn ends", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		await harness.flow.handleAgentEnd(harness.ctx, "Looks right.\n\nVerdict: accept");
+
+		assert.equal(harness.overlays.length, 1);
+		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
+	});
+});
+
+describe("GateBFlow leftovers follow-up", () => {
+	/** Captured before Accept, which resets the machine and takes the review with it. */
+	it("accepts, then requests a follow-up draft from the prompt and review", async () => {
+		// The reopen from `agent_end` is what renders the gate here, and its single queued
+		// selection is the leftovers option.
+		const harness = createHarness({ selections: ["accept_leftovers"] });
+		await reachReview(harness);
+		// Armed first: `agent_end` only captures a review for a turn Review here started.
+		harness.flow.startReviewTurn(harness.ctx);
+		await harness.flow.handleAgentEnd(harness.ctx, "Correct. Minor nits: stale comment on line 12.\n\nVerdict: accept");
+
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.equal(harness.leftovers.length, 1);
+		assert.equal(harness.leftovers[0]?.slug, "add-retry-logic");
+		assert.equal(harness.leftovers[0]?.prompt, DRAFT.prompt);
+		assert.match(harness.leftovers[0]?.reviewText ?? "", /stale comment on line 12/);
+	});
+
+	it("accepts the handoff even when the review captured no text", async () => {
+		const harness = createHarness({ selections: ["accept_leftovers"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.equal(harness.leftovers.length, 1);
+		assert.equal(harness.leftovers[0]?.reviewText, "");
+	});
+});
+
+describe("GateBFlow read-only viewers", () => {
+	it("returns to the gate after viewing the full report", async () => {
+		const harness = createHarness({ selections: ["view_report", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		// Gate, viewer, gate again: the viewer decides nothing and hands control back.
+		assert.equal(harness.overlays.length, 3);
+	});
+
+	it("returns to the gate after viewing the full diffstat", async () => {
+		const harness = createHarness({ selections: ["view_diffstat", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.overlays.length, 3);
+	});
+
+	it("leaves the review pending after a viewer, changing no state", async () => {
+		const harness = createHarness({ selections: ["view_report", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.current().kind, "reviewing");
 	});
 });

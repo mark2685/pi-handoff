@@ -26,12 +26,14 @@ import { normalizeReviewFeedback } from "../domain/draft/feedback.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
+import type { LeftoversScopeInput } from "../domain/draft/leftovers.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import { openAcknowledgement, openGateB, type GateBView } from "../presentation/gate-b.ts";
 import { describeGitFailure, describeGitOrConflict } from "../presentation/git-failure.ts";
 import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
+import { openTextViewer } from "../presentation/text-viewer.ts";
 import { HANDOFF_COMMAND } from "./parse.ts";
 
 export interface GateBFlowDeps {
@@ -48,6 +50,14 @@ export interface GateBFlowDeps {
 	 * adapter and extension-API imports, and so tests can observe the injection.
 	 */
 	sendUserMessage: (content: string) => void;
+	/**
+	 * Starts the follow-up handoff for an accepting review's leftover items.
+	 *
+	 * Injected as a callback because drafting needs a service built from the live
+	 * context, which this session-scoped flow has no way to construct — the same
+	 * reason `createService` is passed into the command handler.
+	 */
+	draftLeftovers?: (ctx: ExtensionContext, input: LeftoversScopeInput) => Promise<void>;
 }
 
 export interface GateBFlow {
@@ -60,13 +70,21 @@ export interface GateBFlow {
 	viewFromPendingReview(ctx: ExtensionContext): Promise<GateBView | undefined>;
 	/** Keeps Gate B open until the user accepts, discards, reviews, or defers. */
 	run(ctx: ExtensionContext, view: GateBView): Promise<void>;
+	/**
+	 * Injects the review turn directly, as Review here does, without opening Gate B.
+	 *
+	 * This is "Run and review": the same arming, the same message, and the same
+	 * `agent_end` reopen, reached without the intervening click. Returns false when
+	 * the machine refused to arm, so the caller can fall back to the gate.
+	 */
+	startReviewTurn(ctx: ExtensionContext): boolean;
 	/** The `agent_end` body: captures the review and reopens Gate B exactly once. */
 	handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void>;
 }
 
 /** Wires Gate B's surfaces to the machine and the two session-scoped services. */
 export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
-	const { machine, runService, reviewService, clock, isChoiceRunnable, sendUserMessage } = deps;
+	const { machine, runService, reviewService, clock, isChoiceRunnable, sendUserMessage, draftLeftovers } = deps;
 
 	/** Discards the worker's changes, always reporting which paths were left alone. */
 	async function discardChanges(ctx: ExtensionContext): Promise<boolean> {
@@ -115,6 +133,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 						outcome.diffstatFailure === undefined ? undefined : describeGitFailure(outcome.diffstatFailure),
 					usage: outcome.state.usage,
 					interruptionNote: undefined,
+					...(outcome.state.external === true ? { external: true } : {}),
 				};
 			}
 
@@ -129,6 +148,9 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 						outcome.diffstatFailure === undefined ? undefined : describeGitFailure(outcome.diffstatFailure),
 					usage: null,
 					interruptionNote: outcome.state.interruptionNote,
+					// Carried so the gate can label a crash's leftovers rather than hide them.
+					...(outcome.state.partialReport === undefined ? {} : { partialReport: outcome.state.partialReport }),
+					...(outcome.state.stderrTail === undefined ? {} : { stderrTail: outcome.state.stderrTail }),
 				};
 			}
 
@@ -158,6 +180,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					diffstatFailure: undefined,
 					usage: reviewing.usage,
 					interruptionNote: undefined,
+					...(reviewing.external === true ? { external: true } : {}),
 				};
 			}
 
@@ -170,6 +193,8 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 				diffstatFailure: diffstat.ok ? undefined : describeGitOrConflict(diffstat.error),
 				usage: null,
 				interruptionNote: reviewing.interruptionNote,
+				...(reviewing.partialReport === undefined ? {} : { partialReport: reviewing.partialReport }),
+				...(reviewing.stderrTail === undefined ? {} : { stderrTail: reviewing.stderrTail }),
 			};
 		},
 
@@ -195,6 +220,65 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					}
 					ctx.ui.notify("Handoff accepted. The working tree is unchanged and nothing was committed.", "info");
 					return;
+				}
+
+				if (selected === "accept_leftovers") {
+					// Captured before Accept, which resets the machine and takes the review with it.
+					const reviewing = machine.reviewing();
+					const leftovers =
+						reviewing === undefined
+							? undefined
+							: {
+									slug: reviewing.draft.slug,
+									prompt: reviewing.draft.prompt,
+									reviewText: current.review?.text ?? reviewing.review?.text ?? "",
+								};
+
+					const accepted = reviewService.accept();
+					if (!accepted.ok) {
+						ctx.ui.notify(accepted.error.message, "warning");
+						return;
+					}
+					ctx.ui.notify("Handoff accepted. Drafting a follow-up for the items the review flagged…", "info");
+
+					if (leftovers === undefined || draftLeftovers === undefined) {
+						ctx.ui.notify(
+							`The handoff was accepted, but the follow-up draft could not be started. Run \`${HANDOFF_COMMAND}\` to draft it.`,
+							"warning",
+						);
+						return;
+					}
+
+					// The accept has already landed, so a failure here costs the follow-up draft and
+					// nothing else; the drafting flow reports its own outcome.
+					await draftLeftovers(ctx, leftovers);
+					return;
+				}
+
+				if (selected === "view_report") {
+					const report = current.report ?? current.partialReport ?? "";
+					const title =
+						current.report === null
+							? `Partial output before the worker died — ${current.slug} (NOT a report)`
+							: `Worker report — ${current.slug}`;
+					await openTextViewer(ctx, title, report);
+					continue;
+				}
+
+				if (selected === "view_diffstat") {
+					const body =
+						current.diffstat.trim() === ""
+							? current.diffstatFailure === undefined
+								? "No changes against the checkpoint."
+								: `The diffstat could not be read.\n\n${current.diffstatFailure}`
+							: current.diffstat;
+					const stderr = current.stderrTail?.trim();
+					// Appended here so the crash evidence is reachable even though it is not a diff:
+					// an interrupted run has no report viewer worth opening for stderr alone.
+					const withStderr =
+						stderr === undefined || stderr === "" ? body : `${body}\n\n--- Worker stderr (tail) ---\n\n${stderr}`;
+					await openTextViewer(ctx, `Changes against the checkpoint — ${current.slug}`, withStderr);
+					continue;
 				}
 
 				if (selected === "discard") {
@@ -300,6 +384,18 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 				current = next;
 			}
+		},
+
+		startReviewTurn(ctx: ExtensionContext): boolean {
+			const armed = reviewService.beginReview();
+			if (!armed.ok) return false;
+
+			// Deliberately not awaited, exactly as the gate's own Review here is not: the
+			// message starts an agent turn, the caller has to return for that turn to run, and
+			// the turn's `agent_end` is what reopens the gate.
+			sendUserMessage(reviewService.buildReviewMessage(armed.value));
+			ctx.ui.notify("The worker finished. Reviewing its work in this session now.", "info");
+			return true;
 		},
 
 		async handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void> {

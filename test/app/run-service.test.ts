@@ -16,7 +16,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createHandoffMachine, type HandoffMachine, type HandoffState } from "../../src/app/handoff-machine.ts";
-import { createRunService, type RunOutcome, type RunProgress, type RunService } from "../../src/app/run-service.ts";
+import {
+	classifyOutcome,
+	createRunService,
+	stderrTail,
+	type RunOutcome,
+	type RunProgress,
+	type RunService,
+} from "../../src/app/run-service.ts";
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
 import { err, ok, type Result } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
@@ -431,12 +438,89 @@ describe("RunService.start interruptions", () => {
 		);
 	});
 
-	it("keeps a report the worker produced before exiting non-zero", async () => {
+	/**
+	 * Inverted deliberately. This case used to assert that a non-zero exit with earlier
+	 * text reached Gate B as a *completed* review carrying that text as its report, and
+	 * that is the bug: the adapter's report is the last assistant text it saw, not the
+	 * worker's conclusion. A 2h19m run whose final message was an error reached a
+	 * reviewer as a completed handoff whose whole report was a mid-task sentence about
+	 * terminal width, beside a 2,816-line diff.
+	 */
+	it("interrupts a non-zero exit even when the worker had produced text", async () => {
 		const harness = createHarness({ outcome: workerOutcome({ exitCode: 1, report: "## Summary\nPartial work." }) });
 		const outcome = await start(harness);
 
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.report, null);
+	});
+
+	it("keeps a crashed worker's text as pre-crash output rather than dropping it", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ exitCode: 1, report: "## Summary\nPartial work." }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.partialReport, "## Summary\nPartial work.");
+	});
+
+	it("interrupts an error stop reason even when the worker had produced text", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({
+				exitCode: 0,
+				stopReason: "error",
+				report: "The pty defaulted to 80 columns… Let me set a larger window size.",
+			}),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.report, null);
+		assert.match(outcome.state.interruptionNote, /ended on an error/);
+	});
+
+	it("interrupts an error message even when the worker had produced text", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ exitCode: 0, errorMessage: "context length exceeded", report: "Halfway through…" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.match(outcome.state.interruptionNote, /context length exceeded/);
+	});
+
+	it("says the pre-crash text is not a report, since the user watched it stream in", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ exitCode: 0, stopReason: "error", report: "Mid-task sentence." }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.match(outcome.state.interruptionNote, /pre-crash output, not as a report/);
+	});
+
+	it("retains a bounded tail of a failed worker's stderr", async () => {
+		const harness = createHarness({
+			outcome: workerOutcome({ exitCode: 1, report: "", stderr: "pi: fatal: provider returned 503\n" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.stderrTail, "pi: fatal: provider returned 503");
+	});
+
+	it("leaves a clean run's completion untouched", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ exitCode: 0, stopReason: "endTurn" }) });
+		const outcome = await start(harness);
+
 		assert.ok(outcome.kind === "completed");
-		assert.equal(outcome.state.report, "## Summary\nPartial work.");
+		assert.equal(outcome.state.report, "## Summary\nAdded retry logic.");
+	});
+
+	/** A worker that never reports usage is still a clean run; only death is not. */
+	it("completes a clean run whose exit code was not reported", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ exitCode: undefined, stopReason: "endTurn" }) });
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "completed");
 	});
 
 	it("surfaces a diffstat failure instead of failing the whole run", async () => {
@@ -797,5 +881,214 @@ describe("RunService.diffstat", () => {
 
 		assert.ok(!result.ok);
 		assert.equal(result.error.kind, "conflict");
+	});
+});
+
+/**
+ * The external-run path exists because "Run externally" used to return to idle:
+ * the extension forgot the handoff, so the user's own worker edited a tree with no
+ * checkpoint, and its result came back as a pasted message with no diffstat and no
+ * Discard. These assert the two halves that fix it — a checkpoint taken with no
+ * spawn, and a review that reaches Gate B the same way an internal run does.
+ */
+describe("RunService.startExternal", () => {
+	it("takes a checkpoint, exactly as a spawned run does", async () => {
+		const harness = createHarness();
+		await harness.service.startExternal({ cwd: CWD });
+
+		assert.ok(harness.events.includes("checkpoint"));
+	});
+
+	it("spawns no worker, because the user runs it themselves", async () => {
+		const harness = createHarness();
+		await harness.service.startExternal({ cwd: CWD });
+
+		assert.deepEqual(harness.requests, []);
+	});
+
+	it("records a running state marked external", async () => {
+		const harness = createHarness();
+		const outcome = await harness.service.startExternal({ cwd: CWD });
+
+		assert.ok(outcome.kind === "external_started");
+		assert.equal(outcome.state.external, true);
+		assert.equal(harness.recorded.at(-1)?.kind, "running");
+	});
+
+	/** No child process was ever created, so there is nothing for shutdown to kill. */
+	it("reports no active run, so shutdown does not try to kill a process", async () => {
+		const harness = createHarness();
+		await harness.service.startExternal({ cwd: CWD });
+
+		assert.equal(harness.service.isRunning(), false);
+		assert.equal(harness.service.abortActiveRun(), false);
+	});
+
+	it("refuses when no checkpoint can be taken", async () => {
+		const harness = createHarness({ checkpoint: err({ kind: "no_head", detail: "no HEAD" }) });
+		const outcome = await harness.service.startExternal({ cwd: CWD });
+
+		assert.equal(outcome.kind, "checkpoint_failed");
+	});
+
+	it("refuses from a state with no approved proposal", async () => {
+		const harness = createHarness({ startIdle: true });
+		const outcome = await harness.service.startExternal({ cwd: CWD });
+
+		assert.ok(outcome.kind === "refused");
+		assert.equal(outcome.conflict.current, "idle");
+	});
+
+	it("keeps the checkpoint reachable for Discard", async () => {
+		const harness = createHarness();
+		await harness.service.startExternal({ cwd: CWD });
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(discarded.ok);
+		assert.ok(harness.events.includes("discard"));
+	});
+});
+
+describe("RunService.completeExternal", () => {
+	/** Started separately in each case, since an external run is its own precondition. */
+	async function startExternal(harness: Harness): Promise<void> {
+		await harness.service.startExternal({ cwd: CWD });
+	}
+
+	it("reaches a completed review carrying the pasted report", async () => {
+		const harness = createHarness();
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "## Summary\nDid the work." });
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.report, "## Summary\nDid the work.");
+	});
+
+	it("computes the diffstat against the checkpoint, as an internal run does", async () => {
+		const harness = createHarness();
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "done" });
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.diffstat, DIFFSTAT);
+	});
+
+	/** Null, never zeroes: no child process was measured, and zeroes would claim it was free. */
+	it("reports null usage rather than zeroed metrics", async () => {
+		const harness = createHarness();
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "done" });
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.state.usage, null);
+		assert.equal(outcome.state.external, true);
+	});
+
+	/**
+	 * An empty paste is allowed but is not a report: Gate B's completed branch promises
+	 * one, and an empty string there renders as a worker that reported nothing.
+	 */
+	it("treats an empty report as interrupted rather than as an empty result", async () => {
+		const harness = createHarness();
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "   " });
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.state.report, null);
+		assert.match(outcome.state.interruptionNote, /ran in another terminal and no report was supplied/);
+	});
+
+	it("still reads a diffstat when no report was supplied", async () => {
+		const harness = createHarness();
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "" });
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.equal(outcome.diffstat, DIFFSTAT);
+	});
+
+	it("refuses when no external run is in progress", async () => {
+		const harness = createHarness();
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "done" });
+
+		assert.ok(outcome.kind === "refused");
+		assert.equal(outcome.conflict.attempted, "completeExternal");
+	});
+
+	/** A child-process run settles through its own spawn path, not this one. */
+	it("refuses to complete an internal run through the external path", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "done" });
+
+		assert.equal(outcome.kind, "refused");
+	});
+
+	it("surfaces a diffstat failure instead of failing the review", async () => {
+		const harness = createHarness({
+			diffstat: err({ kind: "command_failed", command: "git diff --stat", detail: "index locked" }),
+		});
+		await startExternal(harness);
+		const outcome = await harness.service.completeExternal({ cwd: CWD, report: "done" });
+
+		assert.ok(outcome.kind === "completed");
+		assert.equal(outcome.diffstatFailure?.kind, "command_failed");
+	});
+});
+
+describe("stderrTail", () => {
+	it("keeps a short stderr whole", () => {
+		assert.equal(stderrTail("pi: fatal: boom\n"), "pi: fatal: boom");
+	});
+
+	it("keeps the end, which is where the failure is", () => {
+		const tail = stderrTail(`${"x".repeat(100)}THE REAL ERROR`, 20);
+		assert.match(tail, /THE REAL ERROR$/);
+	});
+
+	it("marks a clipped log so it is not mistaken for the whole one", () => {
+		assert.match(stderrTail("y".repeat(100), 20), /^…/);
+	});
+
+	it("bounds the retained text", () => {
+		assert.equal(stderrTail("z".repeat(5_000), 100).length, 101);
+	});
+
+	it("returns empty for a worker that wrote nothing to stderr", () => {
+		assert.equal(stderrTail("   \n  "), "");
+	});
+});
+
+describe("classifyOutcome", () => {
+	const clean = { report: "## Summary", aborted: false, exitCode: 0, stopReason: "endTurn", errorMessage: undefined };
+
+	it("completes a clean run with a report", () => {
+		assert.deepEqual(classifyOutcome(clean), { kind: "completed" });
+	});
+
+	it("interrupts an abort even with text", () => {
+		assert.equal(classifyOutcome({ ...clean, aborted: true }).kind, "interrupted");
+	});
+
+	it("interrupts an error stop reason even with text", () => {
+		assert.equal(classifyOutcome({ ...clean, stopReason: "error" }).kind, "interrupted");
+	});
+
+	it("interrupts a defined error message even with text", () => {
+		assert.equal(classifyOutcome({ ...clean, errorMessage: "overloaded" }).kind, "interrupted");
+	});
+
+	it("interrupts a non-zero exit even with text", () => {
+		assert.equal(classifyOutcome({ ...clean, exitCode: 3 }).kind, "interrupted");
+	});
+
+	it("interrupts an empty report from an otherwise clean run", () => {
+		assert.equal(classifyOutcome({ ...clean, report: "  " }).kind, "interrupted");
+	});
+
+	it("carries the pre-crash text through for retention", () => {
+		const classified = classifyOutcome({ ...clean, stopReason: "error" });
+		assert.ok(classified.kind === "interrupted");
+		assert.equal(classified.partialReport, "## Summary");
 	});
 });

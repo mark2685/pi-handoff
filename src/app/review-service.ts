@@ -168,6 +168,7 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 		},
 
 		buildReviewMessage(state: HandoffReviewingState): string {
+			const interrupted = state.completion === "interrupted" ? state : undefined;
 			return buildReviewMessage({
 				slug: state.draft.slug,
 				promptPath: buildPromptPath(state.draft.slug),
@@ -176,7 +177,11 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 				model: formatModelChoice(state.choice),
 				report: state.report,
 				diffstat: state.diffstat ?? "",
-				interruptionNote: state.completion === "interrupted" ? state.interruptionNote : undefined,
+				interruptionNote: interrupted?.interruptionNote,
+				// Passed through so a crashed run's evidence reaches the reviewer instead of
+				// being replaced by a bare "no report" sentence.
+				...(interrupted?.partialReport === undefined ? {} : { partialReport: interrupted.partialReport }),
+				...(interrupted?.stderrTail === undefined ? {} : { stderrTail: interrupted.stderrTail }),
 			});
 		},
 

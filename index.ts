@@ -47,7 +47,7 @@ import { createHandoffMachine, rehydrateLatestHandoffState } from "./src/app/han
 import { createReviewService } from "./src/app/review-service.ts";
 import { createRunService } from "./src/app/run-service.ts";
 import { createGateBFlow } from "./src/commands/gate-b-flow.ts";
-import { createHandoffCommandHandler } from "./src/commands/handoff-command.ts";
+import { createHandoffCommandHandler, type HandoffCommand } from "./src/commands/handoff-command.ts";
 import { finalAssistantText } from "./src/commands/review-turn.ts";
 import { HANDOFF_COMMAND_NAME } from "./src/commands/parse.ts";
 import { DEFAULT_RUBRIC } from "./src/domain/rubric/defaults.ts";
@@ -90,23 +90,6 @@ export default function handoff(pi: ExtensionAPI) {
 		return isModelAvailable(`${choice.provider}/${choice.model}`, available);
 	}
 
-	const gateBFlow = createGateBFlow({
-		machine,
-		runService,
-		reviewService,
-		clock,
-		isChoiceRunnable,
-		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
-		// handler, so this is fire-and-forget by construction: the injected message
-		// starts an agent turn that the calling handler must return from, and that turn's
-		// `agent_end` is what reopens the gate. `deliverAs: "followUp"` is required because
-		// Gate B can reopen from `agent_end`, while the agent is still streaming and an
-		// un-queued message is refused; when the agent is idle, the option is ignored.
-		sendUserMessage: (content) => {
-			pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs: "followUp" });
-		},
-	});
-
 	/** Builds the drafting service for one invocation, or nothing if no model is selected. */
 	function createService(ctx: ExtensionContext): DraftService | undefined {
 		const model = ctx.model;
@@ -124,17 +107,47 @@ export default function handoff(pi: ExtensionAPI) {
 		});
 	}
 
+	/**
+	 * Assigned after both are built, because the two genuinely need each other:
+	 * Gate B's "Accept and hand off leftovers" starts a draft, and the drafting flow
+	 * ends at a run whose result Gate B renders. The command is built second and
+	 * patched in here rather than duplicating the drafting flow inside Gate B.
+	 */
+	let command: HandoffCommand | undefined;
+
+	const gateBFlow = createGateBFlow({
+		machine,
+		runService,
+		reviewService,
+		clock,
+		isChoiceRunnable,
+		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
+		// handler, so this is fire-and-forget by construction: the injected message
+		// starts an agent turn that the calling handler must return from, and that turn's
+		// `agent_end` is what reopens the gate. `deliverAs: "followUp"` is required because
+		// Gate B can reopen from `agent_end`, while the agent is still streaming and an
+		// un-queued message is refused; when the agent is idle, the option is ignored.
+		sendUserMessage: (content) => {
+			pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs: "followUp" });
+		},
+		draftLeftovers: async (ctx, input) => {
+			await command?.draftLeftovers(ctx, input);
+		},
+	});
+
+	command = createHandoffCommandHandler({
+		machine,
+		createService,
+		runService,
+		gateBFlow,
+		isChoiceRunnable,
+		clipboard,
+		clock,
+	});
+
 	pi.registerCommand(HANDOFF_COMMAND_NAME, {
 		description: "Draft and run a review-preserving implementation handoff.",
-		handler: createHandoffCommandHandler({
-			machine,
-			createService,
-			runService,
-			gateBFlow,
-			isChoiceRunnable,
-			clipboard,
-			clock,
-		}),
+		handler: command.handle,
 	});
 
 	/**
@@ -161,6 +174,10 @@ export default function handoff(pi: ExtensionAPI) {
 	 * §7 forbids. State is deliberately untouched: the already-recorded `running`
 	 * entry is what lets the next `session_start` downgrade it to an interrupted
 	 * review, so overwriting it here would erase the evidence.
+	 *
+	 * An external run needs no special case. It never created an `AbortController`, so
+	 * `abortActiveRun` reports nothing to stop and this returns immediately — the
+	 * hook cannot try to kill a process that was never this session's to begin with.
 	 */
 	pi.on("session_shutdown", async () => {
 		if (!runService.abortActiveRun()) return;
