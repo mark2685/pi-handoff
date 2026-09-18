@@ -200,6 +200,19 @@ describe("handoff machine", () => {
 		});
 	});
 
+	it("latches Run and review onto the restarted running state", () => {
+		machine.beginDraft("state persistence");
+		machine.propose(draft, choice);
+		machine.startRun({ ...startInput(), autoReview: true });
+		machine.completeRun({ report: "Implemented it.", diffstat: " 2 files changed", usage });
+
+		const restarted = machine.restartRun({ ...startInput(1), draft, choice });
+		assert.deepEqual(restarted, {
+			ok: true,
+			value: { kind: "running", draft, choice, ...startInput(1), autoReview: true },
+		});
+	});
+
 	/**
 	 * An interrupted review has no report, so Review here is refused there. Feedback is
 	 * not: re-running after a crash is exactly what a user wants from that state, and

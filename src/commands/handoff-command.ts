@@ -170,8 +170,15 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		let scope = leftovers ? buildLeftoversScope(initial.leftovers) : initial.scope;
 
 		while (view === undefined) {
-			const drafted = await withLoader(ctx, "Drafting handoff…", (signal) =>
-				leftovers ? service.draftLeftovers(scope, signal) : service.draft(scope, signal, modelOverride),
+			// Drafting is bound to the reviewing session's current model, not Gate A's
+			// worker choice. It is available here at the loader call site, so name it while
+			// the potentially long side-call is in progress.
+			const draftingModel = ctx.model === undefined ? undefined : `${ctx.model.provider}/${ctx.model.id}`;
+			const drafted = await withLoader(
+				ctx,
+				"Drafting handoff…",
+				(signal) => (leftovers ? service.draftLeftovers(scope, signal) : service.draft(scope, signal, modelOverride)),
+				draftingModel,
 			);
 
 			if (drafted.kind === "aborted") {

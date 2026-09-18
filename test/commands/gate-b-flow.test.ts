@@ -33,7 +33,7 @@ import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
 import type { Clock } from "../../src/ports/clock.ts";
 import type { Git } from "../../src/ports/git.ts";
 import type { PromptFileWriter } from "../../src/ports/prompt-file-writer.ts";
-import type { WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
+import type { WorkerRunOutcome, WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
 
 const DRAFT: Draft = {
 	slug: "add-retry-logic",
@@ -78,6 +78,8 @@ interface HarnessOptions {
 	/** Option ids resolved by successive Gate B renders, in order. */
 	selections?: (string | undefined)[];
 	interrupted?: boolean;
+	/** Worker outcomes consumed in order: iteration 1, then feedback iterations. */
+	outcomes?: WorkerRunOutcome[];
 	maxIterations?: number;
 	editorResult?: string | undefined;
 }
@@ -95,17 +97,23 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const reportRecorder: HandoffReportRecorder = { record: () => {} };
 	const promptWriter: PromptFileWriter = { write: async () => ok(undefined) };
 
+	let workerRun = 0;
 	const runner: WorkerRunner = {
-		run: async () => ({
-			exitCode: options.interrupted === true ? 1 : 0,
-			report: options.interrupted === true ? "" : REPORT,
-			usage: USAGE,
-			toolResults: [],
-			stopReason: "endTurn",
-			errorMessage: undefined,
-			stderr: "",
-			aborted: false,
-		}),
+		run: async () => {
+			const fallback: WorkerRunOutcome = {
+				exitCode: options.interrupted === true ? 1 : 0,
+				report: options.interrupted === true ? "" : REPORT,
+				usage: USAGE,
+				toolResults: [],
+				stopReason: "endTurn",
+				errorMessage: undefined,
+				stderr: "",
+				aborted: false,
+			};
+			const configured = options.outcomes?.[Math.min(workerRun, options.outcomes.length - 1)];
+			workerRun += 1;
+			return configured ?? fallback;
+		},
 	};
 
 	const git: Git = {
@@ -136,9 +144,30 @@ function createHarness(options: HarnessOptions = {}): Harness {
 			notify: (message: string, level?: string) => {
 				notifications.push({ message, ...(level === undefined ? {} : { level }) });
 			},
-			// The factory is never invoked: these tests assert which option the flow acted
-			// on, not how the overlay draws. Counting calls is what exposes a second gate.
-			custom: async () => {
+			// Run widgets resolve their custom surface from their operation; gates wait for
+			// a choice. Invoking the factory lets feedback exercise its real restart path
+			// while counting only Gate B renders, which exposes an unwanted second gate.
+			custom: async (factory: unknown) => {
+				let resolved: { value: unknown } | undefined;
+				const build = factory as (
+					tui: unknown,
+					theme: unknown,
+					keybindings: unknown,
+					done: (value: unknown) => void,
+				) => { dispose?: () => void };
+				const component = build(
+					{ requestRender: () => {}, terminal: { rows: 24, columns: 80 } },
+					{ fg: (_role: string, text: string) => text, bold: (text: string) => text },
+					{},
+					(value: unknown) => {
+						resolved = { value };
+					},
+				);
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				if (resolved !== undefined) {
+					component.dispose?.();
+					return resolved.value;
+				}
 				overlays.push(overlays.length);
 				return selections.shift();
 			},
@@ -168,10 +197,15 @@ function createHarness(options: HarnessOptions = {}): Harness {
 }
 
 /** Drives the machine to a pending review, which is Gate B's precondition. */
-async function reachReview(harness: Harness): Promise<void> {
+async function reachReview(harness: Harness, options: { autoReview?: boolean } = {}): Promise<void> {
 	harness.machine.beginDraft("add retries");
 	harness.machine.propose(DRAFT, CHOICE);
-	await harness.runService.start({ promptPath: PROMPT_PATH, cwd: CWD, isChoiceRunnable: () => true });
+	await harness.runService.start({
+		promptPath: PROMPT_PATH,
+		cwd: CWD,
+		isChoiceRunnable: () => true,
+		...(options.autoReview === true ? { autoReview: true } : {}),
+	});
 }
 
 describe("GateBFlow.viewFromPendingReview", () => {
@@ -352,6 +386,70 @@ describe("GateBFlow.run", () => {
 		await harness.flow.run(harness.ctx, view);
 
 		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+
+	it("auto-reviews a completed feedback iteration after Run and review", async () => {
+		const harness = createHarness({ selections: ["feedback"], editorResult: "Fix the timeout edge case." });
+		await reachReview(harness, { autoReview: true });
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.iteration, 2);
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
+		assert.equal(harness.messages.length, 1);
+		assert.equal(harness.overlays.length, 1, "the completed retry must not render Gate B before review");
+	});
+
+	it("opens Gate B when an auto-review feedback iteration is interrupted", async () => {
+		const harness = createHarness({
+			selections: ["feedback", "dismiss"],
+			editorResult: "Fix the timeout edge case.",
+			outcomes: [
+				{
+					exitCode: 0,
+					report: REPORT,
+					usage: USAGE,
+					toolResults: [],
+					stopReason: "endTurn",
+					errorMessage: undefined,
+					stderr: "",
+					aborted: false,
+				},
+				{
+					exitCode: 1,
+					report: "partial",
+					usage: USAGE,
+					toolResults: [],
+					stopReason: "error",
+					errorMessage: undefined,
+					stderr: "failed",
+					aborted: false,
+				},
+			],
+		});
+		await reachReview(harness, { autoReview: true });
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.completion, "interrupted");
+		assert.equal(harness.machine.reviewing()?.autoReview, true);
+		assert.equal(harness.messages.length, 0);
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	it("opens Gate B after a completed feedback iteration from plain Run", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "Fix the timeout edge case." });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.completion, "completed");
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+		assert.equal(harness.messages.length, 0);
+		assert.equal(harness.overlays.length, 2);
 	});
 });
 

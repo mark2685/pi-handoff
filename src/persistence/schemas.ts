@@ -261,9 +261,10 @@ const InterruptedReviewingHandoffStateSchema = Type.Object(
 		diffstat: Type.Null(),
 		usage: Type.Null(),
 		interruptionNote: Type.String({ minLength: 1 }),
-		// Optional so entries recorded before crash evidence was retained still decode.
+		// Optional so entries recorded before crash evidence and the feedback-loop latch still decode.
 		partialReport: Type.Optional(Type.String({ minLength: 1 })),
 		stderrTail: Type.Optional(Type.String({ minLength: 1 })),
+		autoReview: Type.Optional(Type.Boolean()),
 		review: Type.Optional(CapturedReviewSchema),
 		awaitingReviewTurn: Type.Boolean(),
 	},

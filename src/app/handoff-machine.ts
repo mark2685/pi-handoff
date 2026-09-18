@@ -134,6 +134,11 @@ export interface HandoffInterruptedReviewingState {
 	readonly partialReport?: string;
 	/** Bounded tail of the worker's stderr, which usually names the real failure. */
 	readonly stderrTail?: string;
+	/**
+	 * Carried from the interrupted run so a feedback retry preserves Run and review's
+	 * whole-loop intent, while this interrupted iteration still stops at Gate B.
+	 */
+	readonly autoReview?: boolean;
 	/** Present only if a reviewer response was captured before the interrupted review was reopened. */
 	readonly review?: CapturedReview;
 	readonly awaitingReviewTurn: boolean;
@@ -411,6 +416,8 @@ export function createHandoffMachine(): HandoffMachine {
 				iteration: input.iteration,
 				startedAt: input.startedAt,
 				checkpoint: input.checkpoint,
+				// `external` is per-run, but Run and review applies to the whole feedback loop.
+				...(state.autoReview === true ? { autoReview: true } : {}),
 			};
 			state = running;
 			return ok(running);
@@ -459,6 +466,9 @@ export function createHandoffMachine(): HandoffMachine {
 				// Omitted rather than stored empty, so "absent" and "the worker said nothing" stay distinct.
 				...(partialReport === undefined || partialReport === "" ? {} : { partialReport }),
 				...(stderrTail === undefined || stderrTail === "" ? {} : { stderrTail }),
+				// An interrupted iteration still opens Gate B, but a later feedback retry keeps
+				// the original Run and review intent.
+				...(state.autoReview === true ? { autoReview: true } : {}),
 				awaitingReviewTurn: false,
 			};
 			state = reviewing;
@@ -559,6 +569,7 @@ export function rehydrateHandoffState(state: HandoffState): HandoffState {
 				diffstat: null,
 				usage: null,
 				interruptionNote: INTERRUPTED_WORKER_NOTE,
+				...(state.autoReview === true ? { autoReview: true } : {}),
 				awaitingReviewTurn: false,
 			};
 		case "reviewing":

@@ -392,7 +392,7 @@ describe("validateHandoffState compatibility", () => {
 		assert.equal(validateHandoffState(withoutUsage).ok, false);
 	});
 
-	it("accepts an old interrupted review with no crash evidence", () => {
+	it("accepts an old interrupted review with no crash evidence or auto-review latch", () => {
 		const state = {
 			...validCompletedState,
 			completion: "interrupted",
@@ -400,6 +400,19 @@ describe("validateHandoffState compatibility", () => {
 			diffstat: null,
 			usage: null,
 			interruptionNote: "The worker was interrupted because this Pi session restarted.",
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts an interrupted review that retains the auto-review latch", () => {
+		const state = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			usage: null,
+			interruptionNote: "The worker ended on an error rather than finishing its turn.",
+			autoReview: true,
 		};
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});
@@ -422,13 +435,19 @@ describe("validateHandoffState compatibility", () => {
 		const machine = createHandoffMachine();
 		machine.beginDraft("crash test");
 		machine.propose(validHandoffDraft, validChoice);
-		machine.startRun({ iteration: 1, startedAt: "2026-03-16T12:00:00.000Z", checkpoint: validCheckpoint });
+		machine.startRun({
+			iteration: 1,
+			startedAt: "2026-03-16T12:00:00.000Z",
+			checkpoint: validCheckpoint,
+			autoReview: true,
+		});
 		const interrupted = machine.interruptRun({
 			note: "The worker failed: context length exceeded",
 			partialReport: "Halfway through…",
 			stderrTail: "pi: fatal",
 		});
 		if (!interrupted.ok) throw new Error(interrupted.error.message);
+		assert.equal(interrupted.value.autoReview, true);
 		assert.deepEqual(validateHandoffState(serializeHandoffState(interrupted.value)), {
 			ok: true,
 			value: interrupted.value,

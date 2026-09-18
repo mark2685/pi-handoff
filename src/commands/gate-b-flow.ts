@@ -368,6 +368,13 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					}
 				}
 
+				// Run and review is latched when feedback restarts a worker. A completed retry
+				// therefore arms the same review turn as iteration 1 and returns so Pi can run
+				// it; an interrupted retry still falls through to Gate B below.
+				if (sent.value.kind === "completed" && sent.value.state.autoReview === true && flow.startReviewTurn(ctx)) {
+					return;
+				}
+
 				const next = flow.viewFromOutcome(
 					{ slug: current.slug, choice: current.choice, promptPath: current.promptPath },
 					sent.value,
