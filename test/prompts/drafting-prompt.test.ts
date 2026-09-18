@@ -62,8 +62,10 @@ describe("DRAFTING_SYSTEM_PROMPT contract", () => {
 		assert.match(DRAFTING_SYSTEM_PROMPT, /compatibility fallback only/);
 	});
 
-	it("requires one-line BLUF and bounded checkable definition of done metadata", () => {
-		assert.match(DRAFTING_SYSTEM_PROMPT, /"bluf": one sentence on one line/);
+	it("requires a tweet-sized goal BLUF and bounded checkable definition of done metadata", () => {
+		assert.match(DRAFTING_SYSTEM_PROMPT, /"bluf": the goal of the handoff, tweet-sized/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /at most 140 characters/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /never as a description of the process or the agent/);
 		assert.match(
 			DRAFTING_SYSTEM_PROMPT,
 			/"definitionOfDone": at most five short, concrete, checkable completion conditions/,

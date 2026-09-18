@@ -551,12 +551,12 @@ describe("formatRunningHeaderLines", () => {
 		definitionOfDone: ["Retries are bounded", "Focused tests pass", "Docs explain the behavior"],
 	};
 
-	it("shows bounded static BLUF and definition-of-done lines", () => {
+	it("shows bounded static goal and definition-of-done lines", () => {
 		assert.deepEqual(formatRunningHeaderLines(view), [
 			"Handoff:   add-retry-logic",
 			"Model:     bifrost-openai/gpt-5.6-terra:high",
 			"Prompt:    /tmp/pi-handoff-add-retry-logic.md",
-			"BLUF: Add bounded retries so transient failures recover.",
+			"Goal: Add bounded retries so transient failures recover.",
 			"Definition of done: (first conditions)",
 			"  - Retries are bounded",
 			"  - Focused tests pass",

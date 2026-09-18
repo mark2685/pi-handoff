@@ -189,17 +189,17 @@ describe("formatGateASummary", () => {
 		assert.ok(lines.includes("Line 2"));
 	});
 
-	it("puts the BLUF and definition of done above the unchanged preview", () => {
+	it("puts the goal and definition of done above the unchanged preview", () => {
 		const draft: Draft = {
 			...DRAFT,
 			bluf: "Add retries so transient failures recover.",
 			definitionOfDone: ["Retries are bounded", "Focused tests pass"],
 		};
 		const lines = formatGateASummary({ ...view, draft });
-		const blufIndex = lines.indexOf("BLUF: Add retries so transient failures recover.");
+		const blufIndex = lines.indexOf("Goal: Add retries so transient failures recover.");
 		const previewIndex = lines.indexOf("Prompt preview:");
 		assert.deepEqual(lines.slice(blufIndex, previewIndex), [
-			"BLUF: Add retries so transient failures recover.",
+			"Goal: Add retries so transient failures recover.",
 			"Definition of done:",
 			"  - Retries are bounded",
 			"  - Focused tests pass",
@@ -210,7 +210,7 @@ describe("formatGateASummary", () => {
 
 	it("renders stable fallbacks when an older draft has no metadata", () => {
 		const lines = formatGateASummary(view);
-		assert.ok(lines.includes("BLUF: (not provided by the drafting model)"));
+		assert.ok(lines.includes("Goal: (not provided by the drafting model)"));
 		assert.ok(lines.includes("Definition of done: (not provided by the drafting model)"));
 	});
 
@@ -277,7 +277,7 @@ describe("formatGateASummary", () => {
 		const draft: Draft = { ...DRAFT, bluf: "Fix the remaining nits.", definitionOfDone: ["Nits are fixed"] };
 		const lines = formatGateASummary({ ...view, draft, leftovers: { acceptedSlug: "add-retry-logic" } });
 		assert.ok(lines.includes("Follow-up: leftovers of `add-retry-logic`"));
-		assert.ok(lines.indexOf("Rationale: Two files, fully specified.") < lines.indexOf("BLUF: Fix the remaining nits."));
+		assert.ok(lines.indexOf("Rationale: Two files, fully specified.") < lines.indexOf("Goal: Fix the remaining nits."));
 	});
 });
 

@@ -38,7 +38,7 @@ const MIN_WIDGET_DEFINITION_OF_DONE_ITEMS = 2;
 const MAX_WIDGET_DEFINITION_OF_DONE_ITEMS = 5;
 
 /**
- * Rows occupied with BLUF, the definition heading, two completion bullets, five recent
+ * Rows occupied with the goal line, the definition heading, two completion bullets, five recent
  * calls, metrics, title, spacer, and the abort hint. Keep this conservative budget so
  * the hint stays visible at the 24-row minimum target.
  */
@@ -80,7 +80,7 @@ export function definitionOfDoneLimit(terminalRows: number): number {
  * Formats fixed header metadata without displacing live status in a 24-row terminal.
  *
  * `width` is the Text content width, excluding its horizontal padding. The full
- * definition remains at Gate A; the running overlay shows the BLUF and a row-aware
+ * definition remains at Gate A; the running overlay shows the goal and a row-aware
  * subset of conditions.
  */
 export function formatRunningHeaderLines(
@@ -93,7 +93,7 @@ export function formatRunningHeaderLines(
 		`Model:     ${formatModelChoice(view.choice)}`,
 		`Prompt:    ${view.promptPath}`,
 	];
-	if (view.bluf !== undefined) lines.push(`BLUF: ${view.bluf}`);
+	if (view.bluf !== undefined) lines.push(`Goal: ${view.bluf}`);
 
 	const conditions = view.definitionOfDone?.slice(0, definitionOfDoneItems) ?? [];
 	if (conditions.length > 0) {

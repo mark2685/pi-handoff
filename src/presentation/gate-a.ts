@@ -102,7 +102,7 @@ export function formatGateASummary(view: GateAView, terminalRows?: number): stri
 			: `Command:   ${buildLaunchCommand(view.choice, view.promptPath)}`;
 
 	const blufLines =
-		view.draft.bluf === undefined ? ["BLUF: (not provided by the drafting model)"] : [`BLUF: ${view.draft.bluf}`];
+		view.draft.bluf === undefined ? ["Goal: (not provided by the drafting model)"] : [`Goal: ${view.draft.bluf}`];
 	const definitionOfDoneLines =
 		view.draft.definitionOfDone === undefined
 			? ["Definition of done: (not provided by the drafting model)"]

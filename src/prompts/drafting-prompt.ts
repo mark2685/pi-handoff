@@ -71,7 +71,7 @@ Choose only the tier. Never name a concrete model: the tier is resolved against 
 
 ## Gate metadata
 
-Alongside the worker prompt, provide a "bluf": one sentence on one line stating what the worker will change and why. Also provide "definitionOfDone": at most five short, concrete, checkable completion conditions distilled from the prompt's acceptance criteria. These are review metadata only: do not repeat the whole prompt or invent requirements in them.
+Alongside the worker prompt, provide a "bluf": the goal of the handoff, tweet-sized. One sentence on one line, at most 140 characters, stating the outcome that will be true when the work is done, for example "Gate previews fit a 24-row terminal so Run and Accept stay on screen." Write it as the objective, never as a description of the process or the agent: no "A fresh agent will…", "A worker will…", or "This handoff…". Also provide "definitionOfDone": at most five short, concrete, checkable completion conditions distilled from the prompt's acceptance criteria. These are review metadata only: do not repeat the whole prompt or invent requirements in them.
 
 ## Output format
 
@@ -82,7 +82,7 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   "prompt": "the full self-contained implementation prompt",
   "tier": "routine" | "standard" | "hard" | "frontier",
   "rationale": "one or two sentences explaining the tier choice",
-  "bluf": "One-sentence bottom line on what will change and why.",
+  "bluf": "The goal as one tweet-sized sentence: the outcome that will be true when done.",
   "definitionOfDone": ["A concrete, checkable completion condition"],
   "questions": [
     {
@@ -94,7 +94,7 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   ]
 }
 
-The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. "bluf" must be one sentence on one line. "definitionOfDone" must contain no more than five short checkable conditions. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".
+The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. "bluf" must be one sentence on one line of at most 140 characters, phrased as the goal rather than as what an agent will do. "definitionOfDone" must contain no more than five short checkable conditions. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".
 
 ## Iteration numbering is not yours
 
