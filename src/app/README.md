@@ -1,1 +1,1 @@
-The app layer will coordinate handoff services and state. It may import Pi types and ports but no concrete adapters, following `domain <- app <- adapters <- index.ts`.
+The app layer coordinates handoff services and state. `DraftService` accepts the leftovers-only `noLeftovers` envelope only on its transcript-free leftovers path, abandons the drafting state for it, and treats the same envelope as unparseable for ordinary drafts. It may import Pi types and ports but no concrete adapters, following `domain <- app <- adapters <- index.ts`.

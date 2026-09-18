@@ -46,8 +46,10 @@ export type GateAOptionId = "run" | "run_and_review" | "view" | "edit" | "model"
  * preview twelve lines of a prompt that is routinely over a hundred, and
  * approving unseen text is the one thing this gate exists to prevent.
  */
-export function gateAMenu(runnable: boolean): MenuOption<GateAOptionId>[] {
+export function gateAMenu(runnable: boolean, options: { cancelFirst?: boolean } = {}): MenuOption<GateAOptionId>[] {
+	const cancel = { id: "cancel" as const, label: "Cancel" };
 	return [
+		...(options.cancelFirst === true ? [cancel] : []),
 		{
 			id: "run",
 			label: runnable ? "Run" : "Run (blocked: choose an available model first)",
@@ -61,7 +63,7 @@ export function gateAMenu(runnable: boolean): MenuOption<GateAOptionId>[] {
 		{ id: "edit", label: "Edit prompt" },
 		{ id: "model", label: "Change model" },
 		{ id: "external", label: "Run externally (copy command)" },
-		{ id: "cancel", label: "Cancel" },
+		...(options.cancelFirst === true ? [] : [cancel]),
 	];
 }
 
@@ -135,7 +137,7 @@ export type GateBOptionId =
 export function gateBMenu(options: {
 	interrupted: boolean;
 	/** Present only when Review here captured a response for the current iteration. */
-	review?: { verdict?: "accept" | "fix" | "discard" };
+	review?: { verdict?: "accept" | "fix" | "discard"; leftovers?: "none" | "items" | "missing" };
 	/** Present when a review is pending, describing whether another iteration is allowed. */
 	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
 	/** Whether there is any report text to open in the full viewer. */
@@ -162,19 +164,21 @@ export function gateBMenu(options: {
 				options.review?.verdict === "discard" ? "Discard changes (reviewer recommends discard)" : "Discard changes",
 		},
 		{ id: "accept", label: options.interrupted ? "Accept (keep the tree as it is)" : "Accept" },
-		// Offered only on an accept verdict: it exists for the leftovers an accepting
-		// review listed, and there is no such list before a verdict says so.
-		...(options.review?.verdict === "accept"
+		...(options.hasReport === true ? [{ id: "view_report" as const, label: "View full report" }] : []),
+		{ id: "view_diffstat", label: "View full diffstat" },
+		// `none` is deliberately absent rather than disabled: there is nothing to hand
+		// off. Missing preserves the old full-review fallback for captured old reviews.
+		...(options.review?.verdict === "accept" &&
+		options.review.leftovers !== "none" &&
+		options.review.leftovers !== undefined
 			? [
 					{
 						id: "accept_leftovers" as const,
 						label: "Accept and hand off leftovers",
-						description: "Accepts, then drafts a follow-up handoff from the review's remaining items",
+						description: "Accepts, then drafts a follow-up from the review's `Leftovers:` list",
 					},
 				]
 			: []),
-		...(options.hasReport === true ? [{ id: "view_report" as const, label: "View full report" }] : []),
-		{ id: "view_diffstat", label: "View full diffstat" },
 		{ id: "dismiss", label: "Leave this for later" },
 	];
 	const preferred =

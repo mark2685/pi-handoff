@@ -21,7 +21,7 @@
  * also matches the design's decision that the reviewing session waits at a gate.
  */
 
-import { Container, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatCost, formatElapsed, formatTokenCount, formatTokenSummary } from "../domain/report/format.ts";
@@ -30,6 +30,22 @@ import type { RunProgress } from "../app/run-service.ts";
 
 /** How many recent tool calls the widget lists. */
 const RECENT_TOOL_CALLS = 5;
+
+/** The minimum completion checklist still useful on the 24-row minimum target. */
+const MIN_WIDGET_DEFINITION_OF_DONE_ITEMS = 2;
+
+/** Never duplicate the full Gate A checklist in the running overlay. */
+const MAX_WIDGET_DEFINITION_OF_DONE_ITEMS = 5;
+
+/**
+ * Rows occupied with BLUF, the definition heading, two completion bullets, five recent
+ * calls, metrics, title, spacer, and the abort hint. Keep this conservative budget so
+ * the hint stays visible at the 24-row minimum target.
+ */
+const WIDGET_FIXED_ROWS = 22;
+
+/** Horizontal padding Text adds on either side of the live body. */
+const WIDGET_BODY_PADDING_X = 1;
 
 /** How often the elapsed-time line is refreshed while the worker is quiet. */
 const TICK_INTERVAL_MS = 1_000;
@@ -41,11 +57,55 @@ export interface RunningWidgetView {
 	slug: string;
 	choice: ModelChoice;
 	promptPath: string;
+	bluf?: string;
+	definitionOfDone?: string[];
 }
 
-/** Formats the fixed header lines, which do not change while the worker runs. */
-function headerLines(view: RunningWidgetView): string[] {
-	return [`Handoff:   ${view.slug}`, `Model:     ${formatModelChoice(view.choice)}`, `Prompt:    ${view.promptPath}`];
+/** Returns the width available to a Text body after its left and right margins. */
+function bodyContentWidth(terminalWidth: number): number {
+	return Math.max(1, Math.floor(terminalWidth) - WIDGET_BODY_PADDING_X * 2);
+}
+
+/**
+ * Chooses a row-aware checklist cap while reserving the live status and abort hint.
+ *
+ * Two conditions fit at the 24-row minimum target; a taller terminal gets up to all
+ * five conditions without giving the fixed Gate A detail block a second full rendering.
+ */
+export function definitionOfDoneLimit(terminalRows: number): number {
+	return Math.max(
+		MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
+		Math.min(MAX_WIDGET_DEFINITION_OF_DONE_ITEMS, Math.floor(terminalRows) - WIDGET_FIXED_ROWS),
+	);
+}
+
+/**
+ * Formats fixed header metadata without displacing live status in a 24-row terminal.
+ *
+ * `width` is the Text content width, excluding its horizontal padding. The full
+ * definition remains at Gate A; the running overlay shows the BLUF and a row-aware
+ * subset of conditions.
+ */
+export function formatRunningHeaderLines(
+	view: RunningWidgetView,
+	width = Number.POSITIVE_INFINITY,
+	definitionOfDoneItems = MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
+): string[] {
+	const lines = [
+		`Handoff:   ${view.slug}`,
+		`Model:     ${formatModelChoice(view.choice)}`,
+		`Prompt:    ${view.promptPath}`,
+	];
+	if (view.bluf !== undefined) lines.push(`BLUF: ${view.bluf}`);
+
+	const conditions = view.definitionOfDone?.slice(0, definitionOfDoneItems) ?? [];
+	if (conditions.length > 0) {
+		const suffix = (view.definitionOfDone?.length ?? 0) > conditions.length ? " (first conditions)" : "";
+		lines.push(`Definition of done:${suffix}`, ...conditions.map((condition) => `  - ${condition}`));
+	}
+
+	const maximum = Math.max(1, Math.floor(width));
+	return lines.map((line) => truncateToWidth(line, maximum, "…"));
 }
 
 /** Formats one tool call for the recent-activity list. */
@@ -62,10 +122,12 @@ function toolCallLine(result: { toolName: string; isError: boolean }): string {
 export function formatRunningLines(
 	view: RunningWidgetView,
 	state: { elapsedMs: number; progress: RunProgress | undefined; stopping: boolean },
+	width = Number.POSITIVE_INFINITY,
+	definitionOfDoneItems = MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
 ): string[] {
 	const usage = state.progress?.usage;
 	const lines = [
-		...headerLines(view),
+		...formatRunningHeaderLines(view, width, definitionOfDoneItems),
 		"",
 		`Elapsed:   ${formatElapsed(state.elapsedMs)}`,
 		`Turns:     ${usage === undefined ? 0 : usage.turns}`,
@@ -111,7 +173,7 @@ export function createRunningWidget(
 ): RunningWidget {
 	const container = new Container() as RunningWidget;
 	const title = new Text(theme.fg("accent", theme.bold("Worker running")), 1, 0);
-	const body = new Text("", 1, 0);
+	const body = new Text("", WIDGET_BODY_PADDING_X, 0);
 	container.addChild(title);
 	container.addChild(new Spacer(1));
 	container.addChild(body);
@@ -121,11 +183,16 @@ export function createRunningWidget(
 
 	/** Repaints the body from current state and asks the TUI to draw it. */
 	const repaint = () => {
-		const lines = formatRunningLines(view, {
-			elapsedMs: options.nowMs() - options.startedAtMs,
-			progress,
-			stopping,
-		});
+		const lines = formatRunningLines(
+			view,
+			{
+				elapsedMs: options.nowMs() - options.startedAtMs,
+				progress,
+				stopping,
+			},
+			bodyContentWidth(tui.terminal.columns),
+			definitionOfDoneLimit(tui.terminal.rows),
+		);
 		body.setText(lines.map((line) => theme.fg(line.startsWith("  ") ? "dim" : "text", line)).join("\n"));
 		tui.requestRender();
 	};

@@ -22,7 +22,7 @@ import { Container, SelectList, Spacer, Text, type SelectItem } from "@earendil-
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatUsageLines, type UsageTotals } from "../domain/report/format.ts";
-import type { CapturedReview } from "../domain/review.ts";
+import { parseReviewLeftovers, type CapturedReview } from "../domain/review.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import { gateBMenu, type GateBOptionId } from "./menus.ts";
 
@@ -188,7 +188,14 @@ export async function openGateB(ctx: ExtensionContext, view: GateBView): Promise
 	const options = gateBMenu({
 		interrupted: view.report === null,
 		hasReport: (view.report ?? view.partialReport ?? "") !== "",
-		...(view.review === undefined ? {} : { review: view.review }),
+		...(view.review === undefined
+			? {}
+			: {
+					review: {
+						...(view.review.verdict === undefined ? {} : { verdict: view.review.verdict }),
+						leftovers: parseReviewLeftovers(view.review.text).kind,
+					},
+				}),
 		...(view.feedback === undefined ? {} : { feedback: view.feedback }),
 	});
 	const items: SelectItem[] = options.map((option) => ({

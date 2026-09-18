@@ -148,7 +148,9 @@ describe("extension registration", () => {
 	});
 
 	it("registers exactly one command named handoff", () => {
-		assert.deepEqual([...recorder.commands.keys()], [HANDOFF_COMMAND_NAME]);
+		assert.equal(HANDOFF_COMMAND_NAME, "handoff");
+		assert.equal(HANDOFF_COMMAND, "/handoff");
+		assert.deepEqual([...recorder.commands.keys()], ["handoff"]);
 	});
 
 	it("describes the command for the slash-command list", () => {

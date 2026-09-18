@@ -1,1 +1,1 @@
-The domain layer owns pure handoff rules and data. It has no IO and no Pi imports; dependencies point `domain <- app <- adapters <- index.ts`.
+The domain layer owns pure handoff rules and data. Its review helpers parse the final structured `Leftovers:` block without inferring work from free review prose, and its leftovers scope builder passes only those items except for an explicit legacy fallback. It has no IO and no Pi imports; dependencies point `domain <- app <- adapters <- index.ts`.

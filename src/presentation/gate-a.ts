@@ -30,6 +30,8 @@ export interface GateAView {
 	promptPath: string;
 	/** False when Run must be refused because no registry-backed model is selected. */
 	runnable: boolean;
+	/** Present only for the transient Gate B leftovers path. */
+	leftovers?: { acceptedSlug: string };
 }
 
 /** Truncates the prompt body to a bounded preview, noting how much was hidden. */
@@ -56,20 +58,31 @@ export function formatGateASummary(view: GateAView): string[] {
 	const modelLine =
 		view.choice === undefined
 			? `Model:     none available for tier "${view.draft.tier}" — choose one to enable Run`
-			: `Model:     ${formatModelChoice(view.choice)}`;
+			: `Model:     ${formatModelChoice(view.choice)}${view.choice.overrideSource === "command_line" ? " (from --model)" : ""} — change with \"Change model\" below`;
 
 	const launchLine =
 		view.choice === undefined
 			? "Command:   available once a model is chosen"
 			: `Command:   ${buildLaunchCommand(view.choice, view.promptPath)}`;
 
+	const blufLines =
+		view.draft.bluf === undefined ? ["BLUF: (not provided by the drafting model)"] : [`BLUF: ${view.draft.bluf}`];
+	const definitionOfDoneLines =
+		view.draft.definitionOfDone === undefined
+			? []
+			: ["Definition of done:", ...view.draft.definitionOfDone.map((condition) => `  - ${condition}`)];
+
 	return [
 		`Handoff:   ${view.draft.slug}`,
+		...(view.leftovers === undefined ? [] : [`Follow-up: leftovers of \`${view.leftovers.acceptedSlug}\``]),
 		`Tier:      ${view.draft.tier}`,
 		modelLine,
 		`Rationale: ${view.draft.rationale}`,
 		`Prompt:    ${view.promptPath}`,
 		launchLine,
+		"",
+		...blufLines,
+		...definitionOfDoneLines,
 		"",
 		"Prompt preview:",
 		...previewPrompt(view.draft.prompt),
@@ -83,7 +96,9 @@ export function formatGateASummary(view: GateAView): string[] {
  * same as Cancel.
  */
 export async function openGateA(ctx: ExtensionContext, view: GateAView): Promise<GateAOptionId | undefined> {
-	const options = gateAMenu(view.runnable);
+	const options = gateAMenu(view.runnable, {
+		cancelFirst: view.leftovers !== undefined && (view.draft.definitionOfDone?.length ?? 0) === 0,
+	});
 	const items: SelectItem[] = options.map((option) => ({
 		value: option.id,
 		label: option.label,

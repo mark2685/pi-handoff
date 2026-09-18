@@ -18,7 +18,7 @@ import {
 const INPUT = {
 	slug: "add-retry-logic",
 	prompt: "# Add retry logic\n\nImplement retries in src/client.ts.",
-	reviewText: "The work is correct. Minor nits: the comment on line 12 is stale, and the test name is misleading.",
+	items: ["Update the stale comment on line 12", "Rename the misleading test"],
 };
 
 describe("buildLeftoversScope", () => {
@@ -36,10 +36,15 @@ describe("buildLeftoversScope", () => {
 		assert.match(buildLeftoversScope(INPUT), /only the remaining items the review flagged/);
 	});
 
-	it("includes the review text under its own heading", () => {
-		const scope = buildLeftoversScope(INPUT);
+	it("includes only structured leftover items under their own heading", () => {
+		const scope = buildLeftoversScope({
+			...INPUT,
+			reviewText: "Note for you: schedule the rollout. This surrounding prose must not reach the follow-up.",
+		});
 		assert.ok(scope.includes(`## ${LEFTOVERS_REVIEW_HEADING}`));
-		assert.ok(scope.includes(INPUT.reviewText));
+		assert.ok(scope.includes("- Update the stale comment on line 12"));
+		assert.ok(scope.includes("- Rename the misleading test"));
+		assert.equal(scope.includes("Note for you: schedule the rollout"), false);
 	});
 
 	it("includes the accepted prompt under its own heading", () => {
@@ -61,13 +66,19 @@ describe("buildLeftoversScope", () => {
 		assert.match(buildLeftoversScope(INPUT), /working tree already contains the accepted changes/);
 	});
 
-	it("says so explicitly when the review captured no text, rather than inventing scope", () => {
-		const scope = buildLeftoversScope({ ...INPUT, reviewText: "   " });
-		assert.match(scope, /captured no text, so no leftover items are recorded/);
+	it("falls back to the complete review only when no structured list was found", () => {
+		const scope = buildLeftoversScope({
+			slug: INPUT.slug,
+			prompt: INPUT.prompt,
+			reviewText: "Note for you: schedule the rollout.\n\nThe timeout needs documentation.",
+		});
+		assert.match(scope, /No structured `Leftovers:` list was found/);
+		assert.match(scope, /Note for you: schedule the rollout/);
 	});
 
-	it("refuses to invent tasks when the review flagged nothing", () => {
-		assert.match(buildLeftoversScope(INPUT), /rather than inventing tasks/);
+	it("instructs the drafter to return the no-leftovers envelope rather than inventing tasks", () => {
+		assert.match(buildLeftoversScope(INPUT), /"noLeftovers": true/);
+		assert.match(buildLeftoversScope(INPUT), /do not include `slug`, `prompt`, or `tier`/);
 	});
 
 	it("reports an unavailable prompt instead of rendering an empty section", () => {

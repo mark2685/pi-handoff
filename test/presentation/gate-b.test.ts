@@ -25,8 +25,13 @@ import {
 } from "../../src/domain/report/format.ts";
 import type { ModelChoice } from "../../src/domain/types.ts";
 import { formatGateBSummary, formatGateBTitle, type GateBView } from "../../src/presentation/gate-b.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { confirmDiscardMenu, gateBMenu, selectOption } from "../../src/presentation/menus.ts";
-import { formatRunningLines } from "../../src/presentation/running-widget.ts";
+import {
+	definitionOfDoneLimit,
+	formatRunningHeaderLines,
+	formatRunningLines,
+} from "../../src/presentation/running-widget.ts";
 
 const CHOICE: ModelChoice = { provider: "bifrost-openai", model: "gpt-5.6-terra", thinking: "high" };
 
@@ -246,21 +251,36 @@ describe("gateBMenu", () => {
 		);
 	});
 
-	it("offers the leftovers follow-up only on an accept verdict", () => {
+	it("offers leftovers only for an accept review with items or a missing legacy block", () => {
+		for (const leftovers of ["items", "missing"] as const) {
+			assert.equal(
+				gateBMenu({ interrupted: false, review: { verdict: "accept", leftovers } }).some(
+					(option) => option.id === "accept_leftovers",
+				),
+				true,
+			);
+		}
 		assert.equal(
-			gateBMenu({ interrupted: false, review: { verdict: "accept" } }).some(
+			gateBMenu({ interrupted: false, review: { verdict: "accept", leftovers: "none" } }).some(
 				(option) => option.id === "accept_leftovers",
 			),
-			true,
-		);
-		assert.equal(
-			gateBMenu({ interrupted: false, review: { verdict: "fix" } }).some((option) => option.id === "accept_leftovers"),
 			false,
 		);
 		assert.equal(
-			gateBMenu({ interrupted: false }).some((option) => option.id === "accept_leftovers"),
+			gateBMenu({ interrupted: false, review: { verdict: "fix", leftovers: "items" } }).some(
+				(option) => option.id === "accept_leftovers",
+			),
 			false,
 		);
+	});
+
+	it("places leftovers after both view options and before leaving the gate", () => {
+		const ids = gateBMenu({
+			interrupted: false,
+			hasReport: true,
+			review: { verdict: "accept", leftovers: "items" },
+		}).map((option) => option.id);
+		assert.deepEqual(ids.slice(-4), ["view_report", "view_diffstat", "accept_leftovers", "dismiss"]);
 	});
 
 	it("labels the live options plainly once they are implemented", () => {
@@ -460,6 +480,48 @@ describe("formatDiscardHeadline", () => {
 	});
 });
 
+describe("formatRunningHeaderLines", () => {
+	const view = {
+		slug: "add-retry-logic",
+		choice: CHOICE,
+		promptPath: "/tmp/pi-handoff-add-retry-logic.md",
+		bluf: "Add bounded retries so transient failures recover.",
+		definitionOfDone: ["Retries are bounded", "Focused tests pass", "Docs explain the behavior"],
+	};
+
+	it("shows bounded static BLUF and definition-of-done lines", () => {
+		assert.deepEqual(formatRunningHeaderLines(view), [
+			"Handoff:   add-retry-logic",
+			"Model:     bifrost-openai/gpt-5.6-terra:high",
+			"Prompt:    /tmp/pi-handoff-add-retry-logic.md",
+			"BLUF: Add bounded retries so transient failures recover.",
+			"Definition of done: (first conditions)",
+			"  - Retries are bounded",
+			"  - Focused tests pass",
+		]);
+	});
+
+	it("omits the metadata block when the drafting model omitted it", () => {
+		const { bluf: _bluf, definitionOfDone: _definitionOfDone, ...withoutMetadata } = view;
+		assert.equal(formatRunningHeaderLines(withoutMetadata).length, 3);
+	});
+
+	it("truncates every header line to Text's content width, excluding its horizontal padding", () => {
+		// A 20-column terminal leaves 18 columns inside Text's one-cell left/right margins.
+		for (const line of formatRunningHeaderLines(view, 18)) assert.ok(visibleWidth(line) <= 18);
+	});
+
+	it("shows more completion conditions when the terminal has room", () => {
+		assert.equal(definitionOfDoneLimit(24), 2);
+		assert.equal(definitionOfDoneLimit(40), 5);
+		assert.deepEqual(formatRunningHeaderLines(view, Number.POSITIVE_INFINITY, definitionOfDoneLimit(40)).slice(-3), [
+			"  - Retries are bounded",
+			"  - Focused tests pass",
+			"  - Docs explain the behavior",
+		]);
+	});
+});
+
 describe("formatRunningLines", () => {
 	it("shows elapsed time", () => {
 		const lines = formatRunningLines(
@@ -523,6 +585,43 @@ describe("formatRunningLines", () => {
 		assert.ok(lines.includes("Recent tool calls (8 total):"));
 		assert.ok(lines.includes("  ✓ tool_7"));
 		assert.ok(!lines.includes("  ✓ tool_2"));
+	});
+
+	it("keeps the abort hint on a 24-row terminal with metadata and five tool calls", () => {
+		const toolResults = Array.from({ length: 5 }, (_, index) => ({
+			toolCallId: `call-${index}`,
+			toolName: `tool_${index}`,
+			text: "",
+			isError: false,
+		}));
+		const lines = formatRunningLines(
+			{
+				slug: "add-retry-logic",
+				choice: CHOICE,
+				promptPath: "/tmp/pi-handoff-add-retry-logic.md",
+				bluf: "A deliberately long bottom line that must not wrap past the available widget body width.",
+				definitionOfDone: ["Retries are bounded", "Focused tests pass", "Docs explain the behavior"],
+			},
+			{
+				elapsedMs: 1_000,
+				progress: {
+					report: "",
+					usage: USAGE,
+					toolResults,
+					stopReason: undefined,
+					errorMessage: undefined,
+					elapsedMs: 1_000,
+				},
+				stopping: false,
+			},
+			78,
+			definitionOfDoneLimit(24),
+		);
+
+		// Title and spacer consume the other two rows in the overlay.
+		assert.equal(lines.length + 2, 24);
+		assert.equal(lines.at(-1), "esc  stop the worker");
+		for (const line of lines.slice(0, 7)) assert.ok(visibleWidth(line) <= 78);
 	});
 
 	it("marks a failed tool call", () => {

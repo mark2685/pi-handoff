@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseReviewVerdict } from "../../src/domain/review.ts";
+import { parseReviewLeftovers, parseReviewVerdict } from "../../src/domain/review.ts";
 
 describe("parseReviewVerdict", () => {
 	it("parses each supported verdict case-insensitively", () => {
@@ -37,5 +37,40 @@ describe("parseReviewVerdict", () => {
 		]) {
 			assert.equal(parseReviewVerdict(text), undefined, text);
 		}
+	});
+});
+
+describe("parseReviewLeftovers", () => {
+	it("parses an explicit none marker case-insensitively", () => {
+		assert.deepEqual(parseReviewLeftovers("Looks good.\nLeftovers: NONE\nVerdict: accept"), { kind: "none" });
+	});
+
+	it("parses a single inline item", () => {
+		assert.deepEqual(parseReviewLeftovers("Leftovers: Add a timeout regression test\nVerdict: accept"), {
+			kind: "items",
+			items: ["Add a timeout regression test"],
+		});
+	});
+
+	it("collects non-empty dash and star bullets through the verdict", () => {
+		assert.deepEqual(
+			parseReviewLeftovers("Leftovers:\n- Document the timeout\n* Rename the misleading test\n-   \nVerdict: accept"),
+			{ kind: "items", items: ["Document the timeout", "Rename the misleading test"] },
+		);
+	});
+
+	it("uses the final leftovers heading when a review quotes an earlier one", () => {
+		assert.deepEqual(
+			parseReviewLeftovers("Earlier draft said Leftovers: old item\nLeftovers:\n- Current item\nVerdict: accept"),
+			{ kind: "items", items: ["Current item"] },
+		);
+	});
+
+	it("treats an empty block as none and stops at a blank line", () => {
+		assert.deepEqual(parseReviewLeftovers("Leftovers:\n\n- Not part of the block\nVerdict: accept"), { kind: "none" });
+	});
+
+	it("reports missing rather than inferring work from arbitrary review prose", () => {
+		assert.deepEqual(parseReviewLeftovers("A stale comment remains.\nVerdict: accept"), { kind: "missing" });
 	});
 });

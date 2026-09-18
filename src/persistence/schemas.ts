@@ -16,7 +16,9 @@ import type {
 	Checkpoint,
 	CheckpointPathStatus,
 	Draft,
+	DraftEnvelope,
 	DraftQuestion,
+	NoLeftovers,
 	ModelCandidate,
 	ModelChoice,
 	Rubric,
@@ -81,6 +83,8 @@ export const RubricSchema = Type.Object(
 /** A compact question bound keeps a malformed model response from opening an unbounded dialog sequence. */
 export const MAX_DRAFT_QUESTIONS = 3;
 
+const DraftMetadataLineSchema = Type.String({ minLength: 1, pattern: "^[^\\r\\n]*$" });
+
 const DraftQuestionSchema = Type.Object(
 	{
 		question: Type.String({ minLength: 1 }),
@@ -100,9 +104,24 @@ export const DraftSchema = Type.Object(
 		tier: TierSchema,
 		rationale: Type.String({ minLength: 1 }),
 		questions: Type.Optional(Type.Array(DraftQuestionSchema, { maxItems: MAX_DRAFT_QUESTIONS })),
+		// Optional so envelopes and session entries written before Gate A metadata still decode.
+		bluf: Type.Optional(DraftMetadataLineSchema),
+		definitionOfDone: Type.Optional(Type.Array(DraftMetadataLineSchema, { maxItems: 5 })),
 	},
 	{ additionalProperties: false },
 );
+
+/** Distinct leftovers-only exit; ordinary drafts still require every Draft field above. */
+export const NoLeftoversSchema = Type.Object(
+	{
+		noLeftovers: Type.Literal(true),
+		rationale: Type.String({ minLength: 1 }),
+	},
+	{ additionalProperties: false },
+);
+
+/** All valid drafting-model envelopes, including the leftovers-only exit. */
+export const DraftEnvelopeSchema = Type.Union([DraftSchema, NoLeftoversSchema]);
 
 /** One checkpoint path's status, retaining the pre-worker staging boundary. */
 export const CheckpointPathStatusSchema = Type.Object(
@@ -130,6 +149,7 @@ const ModelChoiceSchema = Type.Object(
 		provider: Type.String(),
 		model: Type.String(),
 		thinking: ThinkingLevelSchema,
+		overrideSource: Type.Optional(Type.Literal("command_line")),
 	},
 	{ additionalProperties: false },
 );
@@ -177,6 +197,8 @@ const DraftingHandoffStateSchema = Type.Object(
 		pendingDraft: Type.Optional(PendingDraftSchema),
 		// Optional for the same reason; an absent counter reads as the first round.
 		needsInputRound: Type.Optional(Type.Number()),
+		// Optional so an unfinished command-line override survives a restart without rejecting older entries.
+		modelOverride: Type.Optional(ModelChoiceSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -284,14 +306,74 @@ export function validateRubric(value: unknown): Result<Rubric, DecodeError> {
 }
 
 /** Validates a drafting-model JSON envelope before it enters the domain. */
-export function validateDraft(value: unknown): Result<Draft, DecodeError> {
-	const decoded = decode(DraftSchema, value);
+export function validateDraft(value: unknown): Result<DraftEnvelope, DecodeError> {
+	if (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		(value as { noLeftovers?: unknown }).noLeftovers === true
+	) {
+		return decode(NoLeftoversSchema, value);
+	}
+
+	const normalized = normalizeDraftMetadata(value);
+	const decoded = decode(DraftSchema, normalized);
 	if (!decoded.ok) return decoded;
 	const questions = decoded.value.questions;
 	return ok({
 		...decoded.value,
 		...(questions === undefined ? {} : { questions: normalizeDraftQuestions(questions) }),
 	});
+}
+
+/** Rejects the leftovers-only exit where an ordinary runnable draft is required. */
+export function validateOrdinaryDraft(value: unknown): Result<Draft, DecodeError> {
+	const decoded = validateDraft(value);
+	if (!decoded.ok) return decoded;
+	if ("noLeftovers" in decoded.value) {
+		return err({ kind: "invalid", detail: "noLeftovers is valid only for a leftovers follow-up" });
+	}
+	return ok(decoded.value);
+}
+
+/**
+ * Keeps non-critical Gate A metadata lenient without weakening the core envelope.
+ *
+ * A usable prompt, tier, and rationale must still validate strictly. These fields
+ * are display-only, though, so a model that adds whitespace, a non-string list
+ * item, or too many completion conditions should not make an otherwise runnable
+ * handoff unparseable.
+ */
+function normalizeDraftMetadata(value: unknown): unknown {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+	const draft = { ...(value as Record<string, unknown>) };
+
+	const bluf = draft.bluf;
+	if (typeof bluf !== "string") delete draft.bluf;
+	else {
+		// Keep the first usable line from a model that ignored the one-line contract.
+		const firstLine = bluf
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.find((line) => line !== "");
+		if (firstLine === undefined) delete draft.bluf;
+		else draft.bluf = firstLine;
+	}
+
+	const definitionOfDone = draft.definitionOfDone;
+	if (!Array.isArray(definitionOfDone)) {
+		delete draft.definitionOfDone;
+	} else {
+		const conditions = definitionOfDone
+			.filter((condition): condition is string => typeof condition === "string")
+			.map((condition) => condition.trim())
+			.filter((condition) => condition !== "" && !/[\r\n]/.test(condition))
+			.slice(0, 5);
+		if (conditions.length === 0) delete draft.definitionOfDone;
+		else draft.definitionOfDone = conditions;
+	}
+
+	return draft;
 }
 
 /** Validates a custom session entry before the app layer attempts recovery. */
@@ -317,6 +399,8 @@ assertSchemaMatches<Static<typeof DraftQuestionSchema>, DraftQuestion>(true);
 assertSchemaMatches<Static<typeof ModelCandidateSchema>, ModelCandidate>(true);
 assertSchemaMatches<Static<typeof RubricSchema>, Rubric>(true);
 assertSchemaMatches<Static<typeof DraftSchema>, Draft>(true);
+assertSchemaMatches<Static<typeof NoLeftoversSchema>, NoLeftovers>(true);
+assertSchemaMatches<Static<typeof DraftEnvelopeSchema>, DraftEnvelope>(true);
 assertSchemaMatches<Static<typeof CheckpointPathStatusSchema>, CheckpointPathStatus>(true);
 assertSchemaMatches<Static<typeof CheckpointSchema>, Checkpoint>(true);
 assertSchemaMatches<Static<typeof ModelChoiceSchema>, ModelChoice>(true);

@@ -28,7 +28,7 @@ import { hasNeedsInputMarker, type DraftParseError, parseDraft } from "../domain
 import { err, ok, type Result } from "../domain/result.ts";
 import { isModelAvailable, resolveTier } from "../domain/rubric/resolve.ts";
 import type { AvailableModel, Draft, ModelChoice, Rubric } from "../domain/types.ts";
-import { type DecodeError, validateDraft } from "../persistence/schemas.ts";
+import { type DecodeError, validateDraft, validateOrdinaryDraft } from "../persistence/schemas.ts";
 import type { DraftingFailure, DraftingModel, SessionTranscriptSource } from "../ports/drafting-model.ts";
 import type { PromptFileWriter, PromptWriteFailure } from "../ports/prompt-file-writer.ts";
 import {
@@ -67,6 +67,12 @@ export interface DraftUnparseable {
 	error: DraftParseError<DecodeError>;
 }
 
+/** A leftovers review named no fresh worker work after all. */
+export interface DraftNoLeftovers {
+	kind: "no_leftovers";
+	rationale: string;
+}
+
 /** The reviewing session had no conversation to hand off. */
 export interface DraftEmptySession {
 	kind: "empty_session";
@@ -85,7 +91,13 @@ export interface DraftWriteFailed {
 }
 
 export type DraftOutcome =
-	DraftReady | DraftNeedsInput | DraftUnparseable | DraftEmptySession | DraftFailed | DraftWriteFailed;
+	| DraftReady
+	| DraftNeedsInput
+	| DraftUnparseable
+	| DraftNoLeftovers
+	| DraftEmptySession
+	| DraftFailed
+	| DraftWriteFailed;
 
 /** Construction-time dependencies, all of them ports or the pure machine. */
 export interface DraftServiceDeps {
@@ -101,14 +113,18 @@ export interface DraftServiceDeps {
 
 export interface DraftService {
 	/** Runs or retries the drafting call for a scope and returns the Gate A outcome. */
-	draft(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>>;
+	draft(
+		scope: string,
+		signal: AbortSignal | undefined,
+		modelOverride?: ModelChoice,
+	): Promise<Result<DraftOutcome, HandoffConflict>>;
 	/**
 	 * Drafts a follow-up handoff for the items an accepting review still flagged.
 	 *
 	 * Takes an already-built scope — `buildLeftoversScope`'s output — rather than the
 	 * raw documents, because this is called again for every retry and every answered
 	 * NEEDS INPUT round, and each of those must re-send the same accepted prompt and
-	 * review text with the round's answers appended. Building the scope here instead
+	 * parsed leftovers (or the explicit legacy full-review fallback) with the round's answers appended. Building the scope here instead
 	 * would make the caller choose between rebuilding it (losing the answers) and
 	 * falling back to `draft` (which reads the transcript).
 	 *
@@ -250,6 +266,15 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			return ok({ kind: "needs_input", draft, promptPath: written.value });
 		}
 
+		const draftingState = machine.current();
+		const modelOverride = draftingState.kind === "drafting" ? draftingState.modelOverride : undefined;
+		if (modelOverride !== undefined) {
+			const applied = applyChoice(draft, modelOverride);
+			if (!applied.ok) return err(applied.error);
+			retainedDraft = undefined;
+			return ok({ kind: "ready", draft, choice: modelOverride, promptPath: written.value });
+		}
+
 		const resolution = resolveTier(rubric, draft.tier, availableModels());
 		if (resolution.kind === "none_available") {
 			// No representable proposal exists without a model, so the machine stays drafting.
@@ -269,12 +294,14 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	 * Both drafting entry points re-enter: `draft` on a retry after an unparseable
 	 * envelope or an answered question round, `draftLeftovers` for the same two reasons.
 	 * Replacing rather than ignoring the scope is what makes answered NEEDS INPUT
-	 * decisions — and, for a leftovers follow-up, the accepted prompt and review text
+	 * decisions — and, for a leftovers follow-up, the accepted prompt and parsed leftovers
 	 * the scope carries — survive another round and a session restart.
 	 */
-	function enterDrafting(scope: string): Result<void, HandoffConflict> {
+	function enterDrafting(scope: string, modelOverride?: ModelChoice): Result<void, HandoffConflict> {
 		const entered =
-			machine.current().kind === "drafting" ? machine.replaceDraftScope(scope) : machine.beginDraft(scope);
+			machine.current().kind === "drafting"
+				? machine.replaceDraftScope(scope)
+				: machine.beginDraft(scope, modelOverride);
 		if (!entered.ok) return err(entered.error);
 		record();
 		return ok(undefined);
@@ -297,6 +324,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	async function completeDraftingCall(
 		userMessage: string,
 		signal: AbortSignal | undefined,
+		allowNoLeftovers: boolean,
 	): Promise<Result<DraftOutcome, HandoffConflict>> {
 		const response = await draftingModel.complete({
 			systemPrompt: DRAFTING_SYSTEM_PROMPT,
@@ -308,10 +336,17 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			return ok({ kind: "failed", failure: response.error });
 		}
 
-		const parsed = parseDraft(response.value, validateDraft);
+		const parsed = parseDraft(response.value, allowNoLeftovers ? validateDraft : validateOrdinaryDraft);
 		if (!parsed.ok) {
 			// Deliberately stays in `drafting` so the caller can retry without re-entering.
 			return ok({ kind: "unparseable", rawResponse: response.value, error: parsed.error });
+		}
+
+		if ("noLeftovers" in parsed.value) {
+			// This envelope is legal only on the transcript-free leftovers path. It has no
+			// prompt to write or approve, so abandon before returning to the command loop.
+			abandon();
+			return ok({ kind: "no_leftovers", rationale: parsed.value.rationale });
 		}
 
 		// A successful re-draft supersedes a persisted prior question round before it is finalized.
@@ -325,8 +360,12 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	}
 
 	return {
-		async draft(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>> {
-			const entered = enterDrafting(scope);
+		async draft(
+			scope: string,
+			signal: AbortSignal | undefined,
+			modelOverride?: ModelChoice,
+		): Promise<Result<DraftOutcome, HandoffConflict>> {
+			const entered = enterDrafting(scope, modelOverride);
 			if (!entered.ok) return err(entered.error);
 
 			// Read here rather than in the shared path: this is the only entry point that
@@ -337,7 +376,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				return ok({ kind: "empty_session" });
 			}
 
-			return completeDraftingCall(buildDraftingUserMessage(session.text, scope), signal);
+			return completeDraftingCall(buildDraftingUserMessage(session.text, scope), signal, false);
 		},
 
 		async draftLeftovers(
@@ -351,7 +390,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			// transcript would have abandoned a leftovers draft as `empty_session` on an empty
 			// session, which is nonsense for a path whose source documents are both already in
 			// hand.
-			return completeDraftingCall(buildLeftoversUserMessage(scope), signal);
+			return completeDraftingCall(buildLeftoversUserMessage(scope), signal, true);
 		},
 
 		needsInputRound(): number {
@@ -429,7 +468,14 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			}
 
 			// Edit is the manual escape hatch: its explicit Gate A intent resolves the retained questions.
-			const revised: Draft = { slug: existing.slug, prompt, tier: existing.tier, rationale: existing.rationale };
+			const revised: Draft = {
+				slug: existing.slug,
+				prompt,
+				tier: existing.tier,
+				rationale: existing.rationale,
+				...(existing.bluf === undefined ? {} : { bluf: existing.bluf }),
+				...(existing.definitionOfDone === undefined ? {} : { definitionOfDone: existing.definitionOfDone }),
+			};
 			return finishDraft(revised);
 		},
 

@@ -148,6 +148,21 @@ describe("DraftService.draft", () => {
 		assert.deepEqual(harness.machine.current(), { kind: "proposed", draft: DRAFT, choice: EXPECTED_CHOICE });
 	});
 
+	it("uses a resolved command-line override instead of the drafted tier choice", async () => {
+		const override: ModelChoice = {
+			provider: "bifrost-openai",
+			model: "gpt-5.6-terra",
+			thinking: "medium",
+			overrideSource: "command_line",
+		};
+		const result = await harness.service.draft("add retries", undefined, override);
+		assert.deepEqual(result, {
+			ok: true,
+			value: { kind: "ready", draft: DRAFT, choice: override, promptPath: PROMPT_PATH },
+		});
+		assert.deepEqual(harness.machine.current(), { kind: "proposed", draft: DRAFT, choice: override });
+	});
+
 	it("writes the prompt file to the slug-derived path", async () => {
 		await draftOutcome(harness);
 		assert.deepEqual(harness.writes, [{ path: PROMPT_PATH, contents: DRAFT.prompt }]);
@@ -201,6 +216,15 @@ describe("DraftService.draft when the response is malformed", () => {
 		const harness = createHarness({ response: ok("not json") });
 		await draftOutcome(harness);
 		assert.deepEqual(harness.writes, []);
+	});
+
+	it("treats a noLeftovers envelope as unparseable on the ordinary path", async () => {
+		const harness = createHarness({
+			response: ok(JSON.stringify({ noLeftovers: true, rationale: "This is not a leftovers draft." })),
+		});
+		const outcome = await draftOutcome(harness);
+		assert.equal(outcome.kind, "unparseable");
+		assert.equal(harness.machine.current().kind, "drafting");
 	});
 
 	it("stays drafting so the user can retry without re-entering", async () => {
@@ -554,6 +578,16 @@ describe("DraftService.draftLeftovers", () => {
 	it("never reads the transcript source", async () => {
 		const harness = createHarness();
 		await leftoversOutcome(harness);
+		assert.equal(harness.transcriptReads(), 0);
+	});
+
+	it("returns no_leftovers and abandons when the leftovers drafter names no work", async () => {
+		const harness = createHarness({
+			response: ok(JSON.stringify({ noLeftovers: true, rationale: "All listed work was already accepted." })),
+		});
+		const outcome = await leftoversOutcome(harness);
+		assert.deepEqual(outcome, { kind: "no_leftovers", rationale: "All listed work was already accepted." });
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 		assert.equal(harness.transcriptReads(), 0);
 	});
 

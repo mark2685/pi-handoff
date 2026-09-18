@@ -6,7 +6,7 @@
  * same availability check immediately before spawning a child process.
  */
 
-import type { AvailableModel, ModelChoice, Rubric, Tier } from "../types.ts";
+import type { AvailableModel, ModelChoice, Rubric, ThinkingLevel, Tier } from "../types.ts";
 
 /** A parsed canonical `provider/model-id` reference. */
 export interface ModelReference {
@@ -50,6 +50,37 @@ export function isModelAvailable(identifier: string, availableModels: readonly A
 		reference !== undefined &&
 		availableModels.some((available) => available.provider === reference.provider && available.id === reference.model)
 	);
+}
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const DEFAULT_OVERRIDE_THINKING: ThinkingLevel = "high";
+
+/**
+ * Resolves Pi's `provider/model-id[:thinking]` shorthand against the live registry.
+ *
+ * An omitted thinking suffix uses the same high default as Gate A's picker. The
+ * model portion may contain slashes; only the final colon is treated as the
+ * optional thinking separator.
+ */
+export function resolveModelOverride(
+	spec: string,
+	availableModels: readonly AvailableModel[],
+): ModelChoice | undefined {
+	const separator = spec.lastIndexOf(":");
+	const identifier = separator === -1 ? spec : spec.slice(0, separator);
+	const thinkingText = separator === -1 ? undefined : spec.slice(separator + 1);
+	const thinking = thinkingText === undefined ? DEFAULT_OVERRIDE_THINKING : (thinkingText as ThinkingLevel);
+	if (!THINKING_LEVELS.has(thinking)) return undefined;
+
+	const reference = parseModelReference(identifier);
+	if (
+		reference === undefined ||
+		!availableModels.some((available) => available.provider === reference.provider && available.id === reference.model)
+	) {
+		return undefined;
+	}
+
+	return { provider: reference.provider, model: reference.model, thinking, overrideSource: "command_line" };
 }
 
 /**

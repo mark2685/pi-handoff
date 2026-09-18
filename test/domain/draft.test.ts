@@ -19,7 +19,7 @@ import {
 	stripIterationSuffix,
 } from "../../src/domain/draft/slug.ts";
 import type { Draft } from "../../src/domain/types.ts";
-import { validateDraft } from "../../src/persistence/schemas.ts";
+import { validateDraft, validateOrdinaryDraft } from "../../src/persistence/schemas.ts";
 
 const DRAFT: Draft = {
 	slug: "add-retry-logic",
@@ -39,6 +39,15 @@ describe("parseDraft", () => {
 
 	it("accepts a fenced JSON envelope", () => {
 		assert.deepEqual(parseDraft(fencedJson(DRAFT), validateDraft), { ok: true, value: DRAFT });
+	});
+
+	it("carries BLUF and definition-of-done metadata through parsing", () => {
+		const draft: Draft = {
+			...DRAFT,
+			bluf: "Add retries so transient failures recover.",
+			definitionOfDone: ["Retries are bounded", "Focused tests pass"],
+		};
+		assert.deepEqual(parseDraft(fencedJson(draft), validateDraft), { ok: true, value: draft });
 	});
 
 	it("accepts a fenced envelope whose prompt contains a nested fence marker", () => {
@@ -86,6 +95,16 @@ describe("parseDraft", () => {
 
 	it("does not throw for malformed arbitrary text", () => {
 		assert.doesNotThrow(() => parseDraft('unclosed response { "prompt": [', validateDraft));
+	});
+
+	it("accepts the distinct noLeftovers envelope", () => {
+		const noLeftovers = { noLeftovers: true as const, rationale: "The structured list contains no worker work." };
+		assert.deepEqual(parseDraft(JSON.stringify(noLeftovers), validateDraft), { ok: true, value: noLeftovers });
+	});
+
+	it("treats noLeftovers as unparseable for an ordinary draft", () => {
+		const noLeftovers = { noLeftovers: true, rationale: "No worker work remains." };
+		assert.equal(parseDraft(JSON.stringify(noLeftovers), validateOrdinaryDraft).ok, false);
 	});
 });
 

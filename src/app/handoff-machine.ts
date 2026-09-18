@@ -39,6 +39,8 @@ export interface HandoffDraftingState {
 	 * once this reaches `PROCEED_WITH_RECOMMENDED_ROUND`.
 	 */
 	readonly needsInputRound?: number;
+	/** A resolved `--model` choice retained until a pending draft can reach Gate A. */
+	readonly modelOverride?: ModelChoice;
 }
 
 export interface HandoffProposedState {
@@ -206,8 +208,8 @@ export interface HandoffMachine {
 	running(): HandoffRunningState | undefined;
 	/** The pending Gate B state, or undefined outside review. */
 	reviewing(): HandoffReviewingState | undefined;
-	/** Begins drafting from an idle session. */
-	beginDraft(scope: string): Result<HandoffDraftingState, HandoffConflict>;
+	/** Begins drafting from an idle session, optionally retaining a command-line worker choice. */
+	beginDraft(scope: string, modelOverride?: ModelChoice): Result<HandoffDraftingState, HandoffConflict>;
 	/** Replaces the scope while a retry remains in the drafting phase. */
 	replaceDraftScope(scope: string): Result<HandoffDraftingState, HandoffConflict>;
 	/** Persists a NEEDS INPUT draft while the user decides how to resolve it. */
@@ -293,7 +295,7 @@ export function createHandoffMachine(): HandoffMachine {
 
 		reviewing: () => (state.kind === "reviewing" ? state : undefined),
 
-		beginDraft(scope: string): Result<HandoffDraftingState, HandoffConflict> {
+		beginDraft(scope: string, modelOverride?: ModelChoice): Result<HandoffDraftingState, HandoffConflict> {
 			if (state.kind !== "idle") {
 				const message =
 					state.kind === "reviewing"
@@ -301,7 +303,11 @@ export function createHandoffMachine(): HandoffMachine {
 						: `Cannot start a handoff while it is ${state.kind}`;
 				return conflict(state, "beginDraft", message);
 			}
-			const drafting: HandoffDraftingState = { kind: "drafting", scope };
+			const drafting: HandoffDraftingState = {
+				kind: "drafting",
+				scope,
+				...(modelOverride === undefined ? {} : { modelOverride }),
+			};
 			state = drafting;
 			return ok(drafting);
 		},
@@ -351,6 +357,7 @@ export function createHandoffMachine(): HandoffMachine {
 				kind: "drafting",
 				scope: state.scope,
 				...(state.needsInputRound === undefined ? {} : { needsInputRound: state.needsInputRound }),
+				...(state.modelOverride === undefined ? {} : { modelOverride: state.modelOverride }),
 			};
 			state = drafting;
 			return ok(drafting);

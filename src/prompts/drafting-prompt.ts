@@ -69,6 +69,10 @@ Tiers, cheapest first. Measure by cost per solved task rather than per token, so
 
 Choose only the tier. Never name a concrete model: the tier is resolved against the live model registry, and a model id you invent cannot be honored.
 
+## Gate metadata
+
+Alongside the worker prompt, provide a "bluf": one sentence on one line stating what the worker will change and why. Also provide "definitionOfDone": at most five short, concrete, checkable completion conditions distilled from the prompt's acceptance criteria. These are review metadata only: do not repeat the whole prompt or invent requirements in them.
+
 ## Output format
 
 Reply with a single JSON object and nothing else. No preamble, no commentary, no explanation after it.
@@ -78,6 +82,8 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   "prompt": "the full self-contained implementation prompt",
   "tier": "routine" | "standard" | "hard" | "frontier",
   "rationale": "one or two sentences explaining the tier choice",
+  "bluf": "One-sentence bottom line on what will change and why.",
+  "definitionOfDone": ["A concrete, checkable completion condition"],
   "questions": [
     {
       "question": "one unresolved decision",
@@ -88,7 +94,7 @@ Reply with a single JSON object and nothing else. No preamble, no commentary, no
   ]
 }
 
-The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".
+The "slug" is a short kebab-case name for the task, used as a filename. The "prompt" is the entire prompt text, including its Markdown headings. The "rationale" is shown to the user beside the recommended model, so explain the tier rather than restating the task. "bluf" must be one sentence on one line. "definitionOfDone" must contain no more than five short checkable conditions. Omit "questions" entirely when no decisions are open; otherwise include no more than three structured questions. "recommended" is optional and must be a 0-based index into "choices".
 
 ## Iteration numbering is not yours
 
@@ -130,6 +136,8 @@ export function buildLeftoversUserMessage(scope: string): string {
 		"",
 		"## A note on what you were given",
 		"",
-		"There is deliberately no conversation history in this request. The scope above is self-contained: it quotes the handoff that was accepted and the review that accepted it, which together define the remaining work. Draft from those two documents alone and do not ask for the conversation.",
+		"There is deliberately no conversation history in this request. The scope above is self-contained: it quotes the handoff that was accepted and the review's structured leftovers, which together define the remaining work. Draft from those documents alone and do not ask for the conversation.",
+		"",
+		'If the structured leftovers list contains no work for a fresh worker, reply with exactly `{ "noLeftovers": true, "rationale": "<one sentence>" }` and do not include `slug`, `prompt`, or `tier`. Otherwise use the ordinary drafting envelope contract.',
 	].join("\n");
 }

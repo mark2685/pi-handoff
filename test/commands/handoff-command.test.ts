@@ -68,6 +68,7 @@ interface HarnessOptions {
 
 interface Harness {
 	command: HandoffCommand;
+	machine: ReturnType<typeof createHandoffMachine>;
 	ctx: ExtensionContext;
 	requests: DraftingRequest[];
 	/** The machine's drafting scope as of each drafting call, which is what a restart resumes. */
@@ -164,6 +165,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		mode: "tui",
 		hasUI: true,
 		cwd: "/repo",
+		modelRegistry: { getAvailable: () => MODELS },
 		ui: {
 			custom,
 			select: async (title: string, choices: string[]) => {
@@ -203,6 +205,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 
 	return {
 		command,
+		machine,
 		ctx,
 		requests,
 		scopeAtCall,
@@ -244,6 +247,28 @@ describe("draftLeftovers", () => {
 	 * conversation and replaced the machine's scope with nothing, so the second attempt
 	 * was drafted from the transcript with no scope at all.
 	 */
+	it("returns to idle and never opens Gate A when the leftovers drafter reports no work", async () => {
+		const harness = createHarness({
+			responses: [ok(JSON.stringify({ noLeftovers: true, rationale: "Everything listed was already completed." }))],
+		});
+		await harness.command.draftLeftovers(harness.ctx, {
+			slug: LEFTOVERS.slug,
+			prompt: LEFTOVERS.prompt,
+			items: ["Already-completed item"],
+		});
+
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.equal(harness.transcriptReads(), 0);
+		assert.ok(
+			harness.notifications.some(
+				({ message, level }) =>
+					message.includes(
+						"The review flagged no remaining items — nothing to hand off. Everything listed was already completed.",
+					) && level === "info",
+			),
+		);
+	});
+
 	it("retries a leftovers draft without the transcript and without losing the scope", async () => {
 		const harness = createHarness({
 			responses: [ok("not an envelope"), ok(JSON.stringify(DRAFT))],
@@ -327,5 +352,52 @@ describe("handle", () => {
 		const [request] = harness.requests;
 		assert.ok(request !== undefined);
 		assert.match(request.userMessage, /only the retry path/);
+	});
+
+	it("uses a resolved command-line model override instead of the returned tier choice", async () => {
+		const harness = createHarness({ gateSelections: ["cancel"] });
+		await harness.command.handle("--model bifrost-openai/gpt-5.6-terra:medium only the retry path", harness.ctx);
+
+		assert.equal(harness.requests.length, 1);
+		assert.match(harness.requests[0]?.userMessage ?? "", /only the retry path/);
+	});
+
+	it("warns and makes no drafting call for an unresolvable command-line override", async () => {
+		const harness = createHarness();
+		await harness.command.handle("--model bifrost/not-available:high only the retry path", harness.ctx);
+
+		assert.equal(harness.requests.length, 0);
+		assert.deepEqual(harness.notifications, [
+			{
+				message:
+					'Model override "bifrost/not-available:high" is unavailable or invalid; choose a model from the live registry.',
+				level: "warning",
+			},
+		]);
+	});
+
+	it("warns when a pending NEEDS INPUT draft retains a different command-line override", async () => {
+		const harness = createHarness({ gateSelections: ["cancel"] });
+		const retained = harness.machine.beginDraft("existing scope", {
+			provider: "bifrost-openai",
+			model: "gpt-5.6-terra",
+			thinking: "high",
+			overrideSource: "command_line",
+		});
+		assert.equal(retained.ok, true);
+		const pending = harness.machine.setPendingDraft({
+			draft: { ...DRAFT, questions: [{ question: "Which timeout applies?" }] },
+			promptPath: "/tmp/pi-handoff-fix-the-nits.md",
+		});
+		assert.equal(pending.ok, true);
+
+		await harness.command.handle("--model bifrost-openai/gpt-5.6-terra:medium", harness.ctx);
+
+		assert.equal(harness.requests.length, 0);
+		assert.ok(
+			harness.notifications.some(({ message }) =>
+				message.includes('the --model override "bifrost-openai/gpt-5.6-terra:medium" was not used'),
+			),
+		);
 	});
 });

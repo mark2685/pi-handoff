@@ -13,7 +13,7 @@
 		"test": "node --test",
 		"format": "prettier --write .",
 		"format:check": "prettier --check .",
-		"smoke": "pi --no-extensions -e . -p --no-tools \"/handoff-v2 status\"",
+		"smoke": "pi --no-extensions -e . -p --no-tools \"/handoff status\"",
 		"check": "npm run typecheck && npm run test && npm run format:check && npm run smoke"
 	},
 	"pi": {

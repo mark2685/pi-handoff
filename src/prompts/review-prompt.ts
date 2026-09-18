@@ -20,9 +20,13 @@
  * boundary and quietly break Discard's guarantee.
  */
 
+/** The structured leftovers block required immediately before the review verdict. */
+export const REVIEW_LEFTOVERS_INSTRUCTION =
+	"Immediately before that final line, write a `Leftovers:` block in exactly one form: `Leftovers: none`, or `Leftovers:` followed by one `- <concrete worker item>` bullet per remaining item. Items marked no action needed, notes for the human operator, praise, and work already accepted as correct do not belong in `Leftovers:`; include only work a fresh worker should do.";
+
 /** The verdict line the review turn must end on, restated in the reopened gate. */
 export const REVIEW_VERDICT_INSTRUCTION =
-	"End your turn with a single line beginning `Verdict:` followed by exactly one of `accept`, `fix`, or `discard`, and nothing else on that line.";
+	"End your turn with a single line beginning `Verdict:` followed by exactly one of `accept`, `fix`, or `discard`, and nothing else on that line. `Verdict:` must be the last line.";
 
 export interface ReviewMessageInput {
 	/** The draft slug, so the reviewer can tell one handoff from another. */
@@ -142,6 +146,8 @@ export function buildReviewMessage(input: ReviewMessageInput): string {
 		"Do not edit, create, or delete any files, and do not commit anything. You are reviewing. If the work needs changes, they go back to the worker as feedback, which keeps them inside the checkpoint that Discard can undo.",
 		"",
 		"Report what you found: what is correct, what is wrong or missing, and anything the report overclaims.",
+		"",
+		REVIEW_LEFTOVERS_INSTRUCTION,
 		"",
 		REVIEW_VERDICT_INSTRUCTION,
 	].join("\n");

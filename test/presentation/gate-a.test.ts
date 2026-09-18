@@ -55,6 +55,33 @@ describe("parseHandoffCommand", () => {
 			scope: "config the retry policy",
 		});
 	});
+
+	it("parses a leading model override with optional scope", () => {
+		assert.deepEqual(parseHandoffCommand("--model bifrost/claude-opus-5:high fix the retry path"), {
+			kind: "draft",
+			modelOverride: "bifrost/claude-opus-5:high",
+			scope: "fix the retry path",
+		});
+		assert.deepEqual(parseHandoffCommand("--model=bifrost/claude-opus-5"), {
+			kind: "draft",
+			modelOverride: "bifrost/claude-opus-5",
+			scope: "",
+		});
+	});
+
+	it("warns about a missing model value without drafting", () => {
+		assert.deepEqual(parseHandoffCommand("--model"), {
+			kind: "usage",
+			message: "Usage: /handoff --model <provider/model-id[:thinking]> [scope…]",
+		});
+	});
+
+	it("leaves a --model mention in ordinary scope prose", () => {
+		assert.deepEqual(parseHandoffCommand("document why --model is useful"), {
+			kind: "draft",
+			scope: "document why --model is useful",
+		});
+	});
 });
 
 describe("formatHandoffStatus", () => {
@@ -136,9 +163,9 @@ describe("formatHandoffStatus", () => {
 describe("formatGateASummary", () => {
 	const view = { draft: DRAFT, choice: CHOICE, promptPath: "/tmp/pi-handoff-add-retry-logic.md", runnable: true };
 
-	it("shows the resolved model and the exact launch command", () => {
+	it("shows the resolved model, its change-model hint, and the exact launch command", () => {
 		const lines = formatGateASummary(view);
-		assert.ok(lines.includes("Model:     bifrost-openai/gpt-5.6-terra:high"));
+		assert.ok(lines.includes('Model:     bifrost-openai/gpt-5.6-terra:high — change with "Change model" below'));
 		assert.ok(
 			lines.includes('Command:   pi --model "bifrost-openai/gpt-5.6-terra:high" @/tmp/pi-handoff-add-retry-logic.md'),
 		);
@@ -155,6 +182,36 @@ describe("formatGateASummary", () => {
 		const lines = formatGateASummary(view);
 		assert.ok(lines.includes("Line 1"));
 		assert.ok(lines.includes("Line 2"));
+	});
+
+	it("puts the BLUF and definition of done above the unchanged preview", () => {
+		const draft: Draft = {
+			...DRAFT,
+			bluf: "Add retries so transient failures recover.",
+			definitionOfDone: ["Retries are bounded", "Focused tests pass"],
+		};
+		const lines = formatGateASummary({ ...view, draft });
+		const blufIndex = lines.indexOf("BLUF: Add retries so transient failures recover.");
+		const previewIndex = lines.indexOf("Prompt preview:");
+		assert.deepEqual(lines.slice(blufIndex, previewIndex), [
+			"BLUF: Add retries so transient failures recover.",
+			"Definition of done:",
+			"  - Retries are bounded",
+			"  - Focused tests pass",
+			"",
+		]);
+		assert.deepEqual(lines.slice(previewIndex + 1), ["Line 1", "Line 2"]);
+	});
+
+	it("renders a stable fallback when an older draft has no metadata", () => {
+		assert.ok(formatGateASummary(view).includes("BLUF: (not provided by the drafting model)"));
+	});
+
+	it("marks a command-line model override", () => {
+		const lines = formatGateASummary({ ...view, choice: { ...CHOICE, overrideSource: "command_line" } });
+		assert.ok(
+			lines.includes('Model:     bifrost-openai/gpt-5.6-terra:high (from --model) — change with "Change model" below'),
+		);
 	});
 
 	it("truncates a long prompt and points at the option that shows the rest", () => {
@@ -177,6 +234,13 @@ describe("formatGateASummary", () => {
 			false,
 		);
 	});
+
+	it("labels a leftovers-originated draft and keeps its rationale above metadata", () => {
+		const draft: Draft = { ...DRAFT, bluf: "Fix the remaining nits.", definitionOfDone: ["Nits are fixed"] };
+		const lines = formatGateASummary({ ...view, draft, leftovers: { acceptedSlug: "add-retry-logic" } });
+		assert.ok(lines.includes("Follow-up: leftovers of `add-retry-logic`"));
+		assert.ok(lines.indexOf("Rationale: Two files, fully specified.") < lines.indexOf("BLUF: Fix the remaining nits."));
+	});
 });
 
 describe("gateAMenu", () => {
@@ -197,6 +261,10 @@ describe("gateAMenu", () => {
 
 	it("marks Run as blocked when no model is available", () => {
 		assert.equal(gateAMenu(false)[0]?.label, "Run (blocked: choose an available model first)");
+	});
+
+	it("puts Cancel first for a leftovers draft with no definition of done", () => {
+		assert.equal(gateAMenu(true, { cancelFirst: true })[0]?.id, "cancel");
 	});
 });
 

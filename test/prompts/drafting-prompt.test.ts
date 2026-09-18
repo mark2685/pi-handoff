@@ -61,6 +61,15 @@ describe("DRAFTING_SYSTEM_PROMPT contract", () => {
 		assert.ok(DRAFTING_SYSTEM_PROMPT.includes(`## ${NEEDS_INPUT_MARKER}`));
 		assert.match(DRAFTING_SYSTEM_PROMPT, /compatibility fallback only/);
 	});
+
+	it("requires one-line BLUF and bounded checkable definition of done metadata", () => {
+		assert.match(DRAFTING_SYSTEM_PROMPT, /"bluf": one sentence on one line/);
+		assert.match(
+			DRAFTING_SYSTEM_PROMPT,
+			/"definitionOfDone": at most five short, concrete, checkable completion conditions/,
+		);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /must contain no more than five short checkable conditions/);
+	});
 });
 
 describe("buildDraftingUserMessage", () => {
@@ -101,5 +110,12 @@ describe("buildLeftoversUserMessage", () => {
 		const message = buildLeftoversUserMessage(SCOPE);
 		assert.match(message, /deliberately no conversation history/);
 		assert.match(message, /do not ask for the conversation/);
+	});
+
+	it("gives leftovers drafters a no-leftovers envelope exit without changing the ordinary contract", () => {
+		const message = buildLeftoversUserMessage(SCOPE);
+		assert.match(message, /"noLeftovers": true/);
+		assert.match(message, /do not include `slug`, `prompt`, or `tier`/);
+		assert.match(message, /Otherwise use the ordinary drafting envelope contract/);
 	});
 });

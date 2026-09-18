@@ -9,6 +9,7 @@ import {
 	MAX_RUBRIC_ITERATIONS,
 	validateDraft,
 	validateHandoffState,
+	validateOrdinaryDraft,
 	validateRubric,
 } from "../../src/persistence/schemas.ts";
 
@@ -121,6 +122,42 @@ describe("validateDraft", () => {
 		assert.deepEqual(validateDraft(validDraft), { ok: true, value: validDraft });
 	});
 
+	it("accepts BLUF and definition-of-done metadata", () => {
+		assert.deepEqual(
+			validateDraft({
+				...validDraft,
+				bluf: "Add retries so transient failures recover.",
+				definitionOfDone: ["Retries are bounded", "Focused tests pass"],
+			}),
+			{
+				ok: true,
+				value: {
+					...validDraft,
+					bluf: "Add retries so transient failures recover.",
+					definitionOfDone: ["Retries are bounded", "Focused tests pass"],
+				},
+			},
+		);
+	});
+
+	it("drops malformed display metadata while retaining a usable envelope", () => {
+		assert.deepEqual(
+			validateDraft({
+				...validDraft,
+				bluf: "\n  Add retries so transient failures recover.  \nDo not repeat this line.",
+				definitionOfDone: [" First condition ", 1, "", "Second condition", "Third", "Fourth", "Fifth", "Sixth"],
+			}),
+			{
+				ok: true,
+				value: {
+					...validDraft,
+					bluf: "Add retries so transient failures recover.",
+					definitionOfDone: ["First condition", "Second condition", "Third", "Fourth", "Fifth"],
+				},
+			},
+		);
+	});
+
 	it("accepts structured questions and normalizes unusable recommendations away", () => {
 		const result = validateDraft({
 			...validDraft,
@@ -180,6 +217,17 @@ describe("validateDraft", () => {
 
 	it("rejects wrong field types", () => {
 		assert.equal(validateDraft({ slug: 1, prompt: [], tier: true, rationale: {} }).ok, false);
+	});
+
+	it("accepts the noLeftovers envelope without weakening required ordinary Draft fields", () => {
+		const envelope = { noLeftovers: true as const, rationale: "The review listed no actionable worker work." };
+		assert.deepEqual(validateDraft(envelope), { ok: true, value: envelope });
+		assert.equal(validateOrdinaryDraft(envelope).ok, false);
+	});
+
+	it("rejects malformed noLeftovers envelopes", () => {
+		assert.equal(validateDraft({ noLeftovers: true }).ok, false);
+		assert.equal(validateDraft({ noLeftovers: true, rationale: "reason", slug: "not allowed" }).ok, false);
 	});
 });
 
@@ -278,6 +326,15 @@ describe("validateHandoffState compatibility", () => {
 			scope: "scope",
 			pendingDraft: { draft: validHandoffDraft, promptPath: "/tmp/pi-handoff-x.md" },
 			needsInputRound: 3,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts a drafting entry carrying a command-line model override", () => {
+		const state = {
+			kind: "drafting",
+			scope: "scope",
+			modelOverride: { ...validChoice, overrideSource: "command_line" as const },
 		};
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});

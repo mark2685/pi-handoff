@@ -8,16 +8,8 @@
  * subcommand.
  */
 
-/**
- * The slash-command name the extension registers.
- *
- * Temporarily `handoff-v2` rather than `handoff`, so the `~/.pi/agent/prompts/handoff.md`
- * template stays reachable as `/handoff` while the extension is tested side by side.
- * Extension commands shadow prompt templates of the same name, so the two cannot
- * coexist under one name. Every user-facing mention of the command goes through
- * `HANDOFF_COMMAND` so flipping this back is a one-line change.
- */
-export const HANDOFF_COMMAND_NAME = "handoff-v2";
+/** The slash-command name the extension registers. */
+export const HANDOFF_COMMAND_NAME = "handoff";
 
 /** The command as typed, with its leading slash, for messages shown to the user. */
 export const HANDOFF_COMMAND = `/${HANDOFF_COMMAND_NAME}`;
@@ -25,7 +17,9 @@ export const HANDOFF_COMMAND = `/${HANDOFF_COMMAND_NAME}`;
 /** A recognized `/handoff` invocation. */
 export type HandoffCommand =
 	/** Draft a handoff, optionally narrowed by user-supplied scope. */
-	| { kind: "draft"; scope: string }
+	| { kind: "draft"; scope: string; modelOverride?: string }
+	/** Report command usage without beginning a drafting call. */
+	| { kind: "usage"; message: string }
 	/** Show the current handoff state. */
 	| { kind: "status" }
 	/** Subcommands that are recognized but not implemented in this slice. */
@@ -39,5 +33,25 @@ export function parseHandoffCommand(args: string): HandoffCommand {
 	const trimmed = args.trim();
 	if (trimmed === "status") return { kind: "status" };
 	if (UNIMPLEMENTED_SUBCOMMANDS.has(trimmed)) return { kind: "unimplemented", name: trimmed };
+
+	// Flags are intentionally recognized only at the start. A task whose ordinary
+	// prose mentions `--model` remains scope text rather than silently changing the
+	// worker that will run it.
+	if (trimmed === "--model") return modelUsage();
+	if (trimmed.startsWith("--model=")) return parseModelAssignment(trimmed.slice("--model=".length));
+	if (trimmed.startsWith("--model ") || trimmed.startsWith("--model\t")) {
+		return parseModelAssignment(trimmed.slice("--model".length).trimStart());
+	}
+
 	return { kind: "draft", scope: trimmed };
+}
+
+function parseModelAssignment(value: string): HandoffCommand {
+	const [spec, ...scopeWords] = value.split(/\s+/);
+	if (spec === undefined || spec === "") return modelUsage();
+	return { kind: "draft", modelOverride: spec, scope: scopeWords.join(" ") };
+}
+
+function modelUsage(): HandoffCommand {
+	return { kind: "usage", message: "Usage: /handoff --model <provider/model-id[:thinking]> [scope…]" };
 }

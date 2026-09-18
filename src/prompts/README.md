@@ -1,1 +1,1 @@
-The prompts layer will hold drafting and review prompt text. It follows `domain <- app <- adapters <- index.ts` and contains no concrete IO adapters.
+The prompts layer holds drafting and review prompt text. Review prompts require a `Leftovers:` block immediately before the final `Verdict:` line; leftovers drafting prompts describe the distinct `noLeftovers` exit while ordinary drafting keeps its required draft envelope. It follows `domain <- app <- adapters <- index.ts` and contains no concrete IO adapters.

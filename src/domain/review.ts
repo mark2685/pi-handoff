@@ -21,6 +21,9 @@ export interface CapturedReview {
 	text: string;
 }
 
+/** The structured follow-up work, if any, named by a review. */
+export type ReviewLeftovers = { kind: "none" } | { kind: "items"; items: string[] } | { kind: "missing" };
+
 /**
  * Reads the final non-empty line as the review prompt's one-line verdict.
  *
@@ -40,4 +43,50 @@ export function parseReviewVerdict(text: string): ReviewVerdict | undefined {
 		return match[1].toLowerCase() as ReviewVerdict;
 	}
 	return undefined;
+}
+
+/** A case-insensitive structured-leftovers heading at the start of a review line. */
+const LEFTOVERS_LINE = /^\s*Leftovers:\s*(.*)$/i;
+
+/** A bullet under a structured leftovers heading. */
+const LEFTOVERS_ITEM_LINE = /^\s*[-*]\s*(.*)$/;
+
+/** A Verdict line closes a leftovers block even when it is not the final line. */
+const VERDICT_LINE = /^\s*Verdict:/i;
+
+/**
+ * Reads the last structured `Leftovers:` block from a captured review.
+ *
+ * The review prompt requires this block immediately before its final verdict, but
+ * captured reviews from older extension versions have no such contract. Those are
+ * deliberately `missing`, not guessed from arbitrary review prose. A bare heading
+ * or an explicit `none` both mean there is no worker work left to hand off.
+ */
+export function parseReviewLeftovers(text: string): ReviewLeftovers {
+	const lines = text.split(/\r?\n/);
+	let headingIndex = -1;
+	let remainder = "";
+
+	for (let index = 0; index < lines.length; index += 1) {
+		const match = LEFTOVERS_LINE.exec(lines[index] ?? "");
+		if (match === null) continue;
+		headingIndex = index;
+		remainder = (match[1] ?? "").trim();
+	}
+
+	if (headingIndex === -1) return { kind: "missing" };
+	if (remainder.toLowerCase() === "none") return { kind: "none" };
+	if (remainder !== "") return { kind: "items", items: [remainder] };
+
+	const items: string[] = [];
+	for (let index = headingIndex + 1; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		if (line.trim() === "" || VERDICT_LINE.test(line)) break;
+		const match = LEFTOVERS_ITEM_LINE.exec(line);
+		if (match === null) continue;
+		const item = (match[1] ?? "").trim();
+		if (item !== "") items.push(item);
+	}
+
+	return items.length === 0 ? { kind: "none" } : { kind: "items", items };
 }

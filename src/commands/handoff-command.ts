@@ -42,6 +42,7 @@ import type { RunOutcome, RunService } from "../app/run-service.ts";
 import { buildLaunchCommand, formatModelChoice } from "../domain/draft/launch.ts";
 import { buildLeftoversScope, type LeftoversScopeInput } from "../domain/draft/leftovers.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
+import { resolveModelOverride } from "../domain/rubric/resolve.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Clipboard } from "../ports/clipboard.ts";
@@ -109,6 +110,7 @@ function reportTerminalOutcome(ctx: ExtensionContext, outcome: DraftOutcome): vo
 				"error",
 			);
 			return;
+		case "no_leftovers":
 		case "needs_input":
 		case "ready":
 		case "unparseable":
@@ -158,17 +160,18 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 	async function runDraftingFlow(
 		ctx: ExtensionContext,
 		service: DraftService,
-		initial: { scope: string } | { leftovers: LeftoversScopeInput },
+		initial: { scope: string; modelOverride?: ModelChoice } | { leftovers: LeftoversScopeInput },
 	): Promise<void> {
 		let view: DraftReady | undefined;
 		const leftovers = "leftovers" in initial;
+		const modelOverride = leftovers ? undefined : initial.modelOverride;
 		// Seeded, not accumulated later: every re-draft below passes this scope back, so
 		// the leftovers documents have to be in it from the first pass onwards.
 		let scope = leftovers ? buildLeftoversScope(initial.leftovers) : initial.scope;
 
 		while (view === undefined) {
 			const drafted = await withLoader(ctx, "Drafting handoff…", (signal) =>
-				leftovers ? service.draftLeftovers(scope, signal) : service.draft(scope, signal),
+				leftovers ? service.draftLeftovers(scope, signal) : service.draft(scope, signal, modelOverride),
 			);
 
 			if (drafted.kind === "aborted") {
@@ -201,6 +204,14 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				continue;
 			}
 
+			if (outcome.value.kind === "no_leftovers") {
+				ctx.ui.notify(
+					`The review flagged no remaining items — nothing to hand off. ${outcome.value.rationale}`,
+					"info",
+				);
+				return;
+			}
+
 			if (outcome.value.kind === "needs_input") {
 				const flowResult = await runNeedsInputFlow(ctx, service, outcome.value, scope);
 				if (flowResult.kind === "cancelled") return;
@@ -220,7 +231,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			view = outcome.value;
 		}
 
-		await runGateA(ctx, service, view);
+		await runGateA(ctx, service, view, leftovers ? initial.leftovers.slug : undefined);
 	}
 
 	/**
@@ -229,12 +240,21 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 	 * A loop rather than a chain of returns because those three options change what
 	 * the gate shows without deciding anything, so each has to re-render it.
 	 */
-	async function runGateA(ctx: ExtensionContext, service: DraftService, ready: DraftReady): Promise<void> {
+	async function runGateA(
+		ctx: ExtensionContext,
+		service: DraftService,
+		ready: DraftReady,
+		leftoversOf?: string,
+	): Promise<void> {
 		let view = ready;
 
 		for (;;) {
 			const runnable = isChoiceRunnable(ctx, view.choice);
-			const selected = await openGateA(ctx, { ...view, runnable });
+			const selected = await openGateA(ctx, {
+				...view,
+				runnable,
+				...(leftoversOf === undefined ? {} : { leftovers: { acceptedSlug: leftoversOf } }),
+			});
 
 			if (selected === undefined || selected === "cancel") {
 				// Cancel leaves the /tmp prompt in place by design.
@@ -343,9 +363,15 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		choice: ModelChoice,
 		autoReview: boolean,
 	): Promise<RunOutcome | undefined> {
-		const rendered = await runWithWidget(
+		const rendered = await runWithWidget<RunOutcome>(
 			ctx,
-			{ slug: view.draft.slug, choice, promptPath: view.promptPath },
+			{
+				slug: view.draft.slug,
+				choice,
+				promptPath: view.promptPath,
+				...(view.draft.bluf === undefined ? {} : { bluf: view.draft.bluf }),
+				...(view.draft.definitionOfDone === undefined ? {} : { definitionOfDone: view.draft.definitionOfDone }),
+			},
 			{ nowMs: () => clock.nowMs(), onAbort: () => runService.abortActiveRun() },
 			(onProgress) =>
 				runService.start({
@@ -494,6 +520,11 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				return;
 			}
 
+			if (command.kind === "usage") {
+				ctx.ui.notify(command.message, "warning");
+				return;
+			}
+
 			if (command.kind === "unimplemented") {
 				ctx.ui.notify(`${HANDOFF_COMMAND} ${command.name} is not implemented yet`, "info");
 				return;
@@ -531,6 +562,21 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				}
 			}
 
+			const modelOverride =
+				command.modelOverride === undefined
+					? undefined
+					: resolveModelOverride(
+							command.modelOverride,
+							ctx.modelRegistry.getAvailable().map((model) => ({ provider: model.provider, id: model.id })),
+						);
+			if (command.modelOverride !== undefined && modelOverride === undefined) {
+				ctx.ui.notify(
+					`Model override \"${command.modelOverride}\" is unavailable or invalid; choose a model from the live registry.`,
+					"warning",
+				);
+				return;
+			}
+
 			const service = createService(ctx);
 			if (service === undefined) {
 				ctx.ui.notify("No model is selected, so a handoff cannot be drafted", "error");
@@ -543,9 +589,13 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			// its prompt and exact questions, while an old bare drafting state remains idle.
 			const drafting = machine.current();
 			if (drafting.kind === "drafting" && drafting.pendingDraft !== undefined) {
-				if (command.scope !== "") {
+				const ignored = [
+					...(command.scope === "" ? [] : ["the supplied scope"]),
+					...(command.modelOverride === undefined ? [] : [`the --model override \"${command.modelOverride}\"`]),
+				];
+				if (ignored.length > 0) {
 					ctx.ui.notify(
-						"Pending NEEDS INPUT questions are being reopened; the supplied scope was not used. Cancel on the gate, then re-run the command to start fresh with it.",
+						`Pending NEEDS INPUT questions are being reopened; ${ignored.join(" and ")} ${ignored.length === 1 ? "was" : "were"} not used. Cancel on the gate, then re-run the command to start fresh with it.`,
 						"warning",
 					);
 				}
@@ -563,7 +613,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				}
 			}
 
-			await runDraftingFlow(ctx, service, { scope });
+			await runDraftingFlow(ctx, service, modelOverride === undefined ? { scope } : { scope, modelOverride });
 		},
 
 		async draftLeftovers(ctx: ExtensionContext, input: LeftoversScopeInput): Promise<void> {

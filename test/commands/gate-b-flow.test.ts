@@ -27,6 +27,7 @@ import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService, type RunService } from "../../src/app/run-service.ts";
 import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
 import { createGateBFlow, type GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import type { LeftoversScopeInput } from "../../src/domain/draft/leftovers.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
 import type { Clock } from "../../src/ports/clock.ts";
@@ -70,7 +71,7 @@ interface Harness {
 	messages: string[];
 	editorPrefills: string[];
 	/** Follow-up drafts requested by "Accept and hand off leftovers". */
-	leftovers: { slug: string; prompt: string; reviewText: string }[];
+	leftovers: LeftoversScopeInput[];
 }
 
 interface HarnessOptions {
@@ -87,7 +88,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const notifications: { message: string; level?: string }[] = [];
 	const messages: string[] = [];
 	const editorPrefills: string[] = [];
-	const leftovers: { slug: string; prompt: string; reviewText: string }[] = [];
+	const leftovers: LeftoversScopeInput[] = [];
 	const selections = [...(options.selections ?? [])];
 
 	const recorder: HandoffStateRecorder = { record: () => {} };
@@ -237,7 +238,7 @@ describe("GateBFlow.run", () => {
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		assert.match(harness.notifications[0]?.message ?? "", /`\/handoff-v2` reopens this review/);
+		assert.match(harness.notifications[0]?.message ?? "", /`\/handoff` reopens this review/);
 	});
 
 	it("treats an escaped gate as leaving the review pending", async () => {
@@ -524,23 +525,30 @@ describe("GateBFlow.startReviewTurn", () => {
 
 describe("GateBFlow leftovers follow-up", () => {
 	/** Captured before Accept, which resets the machine and takes the review with it. */
-	it("accepts, then requests a follow-up draft from the prompt and review", async () => {
+	it("accepts, then requests a follow-up draft from the prompt and structured items only", async () => {
 		// The reopen from `agent_end` is what renders the gate here, and its single queued
 		// selection is the leftovers option.
 		const harness = createHarness({ selections: ["accept_leftovers"] });
 		await reachReview(harness);
 		// Armed first: `agent_end` only captures a review for a turn Review here started.
 		harness.flow.startReviewTurn(harness.ctx);
-		await harness.flow.handleAgentEnd(harness.ctx, "Correct. Minor nits: stale comment on line 12.\n\nVerdict: accept");
+		await harness.flow.handleAgentEnd(
+			harness.ctx,
+			"Correct.\n\nNote for you: schedule the rollout.\n\nLeftovers:\n- Update the stale comment on line 12\n- Rename the misleading test\nVerdict: accept",
+		);
 
 		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 		assert.equal(harness.leftovers.length, 1);
 		assert.equal(harness.leftovers[0]?.slug, "add-retry-logic");
 		assert.equal(harness.leftovers[0]?.prompt, DRAFT.prompt);
-		assert.match(harness.leftovers[0]?.reviewText ?? "", /stale comment on line 12/);
+		assert.deepEqual(harness.leftovers[0]?.items, [
+			"Update the stale comment on line 12",
+			"Rename the misleading test",
+		]);
+		assert.equal(harness.leftovers[0]?.reviewText, undefined);
 	});
 
-	it("accepts the handoff even when the review captured no text", async () => {
+	it("falls back to the full review only when the structured block is missing", async () => {
 		const harness = createHarness({ selections: ["accept_leftovers"] });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
@@ -550,6 +558,7 @@ describe("GateBFlow leftovers follow-up", () => {
 		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 		assert.equal(harness.leftovers.length, 1);
 		assert.equal(harness.leftovers[0]?.reviewText, "");
+		assert.equal(harness.leftovers[0]?.items, undefined);
 	});
 });
 

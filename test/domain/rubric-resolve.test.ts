@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DEFAULT_RUBRIC } from "../../src/domain/rubric/defaults.ts";
-import { isModelAvailable, parseModelReference, resolveTier } from "../../src/domain/rubric/resolve.ts";
+import {
+	isModelAvailable,
+	parseModelReference,
+	resolveModelOverride,
+	resolveTier,
+} from "../../src/domain/rubric/resolve.ts";
 import type { AvailableModel, ModelCandidate, Rubric, Tier } from "../../src/domain/types.ts";
 
 const AVAILABLE_MODELS: AvailableModel[] = [
@@ -106,5 +111,25 @@ describe("model registry helpers", () => {
 
 	it("rejects malformed model identifiers", () => {
 		assert.equal(parseModelReference("provider"), undefined);
+	});
+
+	it("resolves a command-line model override with explicit or default thinking", () => {
+		assert.deepEqual(resolveModelOverride("bifrost/claude-opus-5:xhigh", AVAILABLE_MODELS), {
+			provider: "bifrost",
+			model: "claude-opus-5",
+			thinking: "xhigh",
+			overrideSource: "command_line",
+		});
+		assert.deepEqual(resolveModelOverride("bifrost/claude-opus-5", AVAILABLE_MODELS), {
+			provider: "bifrost",
+			model: "claude-opus-5",
+			thinking: "high",
+			overrideSource: "command_line",
+		});
+	});
+
+	it("rejects unavailable or malformed command-line overrides", () => {
+		assert.equal(resolveModelOverride("bifrost/not-available:high", AVAILABLE_MODELS), undefined);
+		assert.equal(resolveModelOverride("bifrost/claude-opus-5:extreme", AVAILABLE_MODELS), undefined);
 	});
 });

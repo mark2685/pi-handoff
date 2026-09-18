@@ -57,7 +57,20 @@ export interface Draft {
 	rationale: string;
 	/** Open decisions kept out of prompt prose; absent for a ready draft. */
 	questions?: DraftQuestion[];
+	/** One-line bottom line shown at Gate A and while the worker runs. */
+	bluf?: string;
+	/** A bounded, checkable completion checklist shown separately from the full prompt. */
+	definitionOfDone?: string[];
 }
+
+/** A leftovers drafter's explicit exit when no fresh worker work remains. */
+export interface NoLeftovers {
+	noLeftovers: true;
+	rationale: string;
+}
+
+/** A drafting response is either a runnable draft or the leftovers-only exit. */
+export type DraftEnvelope = Draft | NoLeftovers;
 
 /** A concrete model candidate assigned to one rubric tier, in priority order. */
 export interface ModelCandidate {
@@ -89,4 +102,6 @@ export interface ModelChoice {
 	provider: string;
 	model: string;
 	thinking: ThinkingLevel;
+	/** Present only when the command line selected this choice instead of the tier resolver. */
+	overrideSource?: "command_line";
 }

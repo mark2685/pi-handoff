@@ -27,6 +27,7 @@ import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import type { LeftoversScopeInput } from "../domain/draft/leftovers.ts";
+import { parseReviewLeftovers } from "../domain/review.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import { openAcknowledgement, openGateB, type GateBView } from "../presentation/gate-b.ts";
@@ -225,21 +226,26 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 				if (selected === "accept_leftovers") {
 					// Captured before Accept, which resets the machine and takes the review with it.
 					const reviewing = machine.reviewing();
-					const leftovers =
-						reviewing === undefined
+					const reviewText = current.review?.text ?? reviewing?.review?.text ?? "";
+					const parsedLeftovers = parseReviewLeftovers(reviewText);
+					const leftovers: LeftoversScopeInput | undefined =
+						reviewing === undefined || parsedLeftovers.kind === "none"
 							? undefined
-							: {
-									slug: reviewing.draft.slug,
-									prompt: reviewing.draft.prompt,
-									reviewText: current.review?.text ?? reviewing.review?.text ?? "",
-								};
+							: parsedLeftovers.kind === "items"
+								? { slug: reviewing.draft.slug, prompt: reviewing.draft.prompt, items: parsedLeftovers.items }
+								: { slug: reviewing.draft.slug, prompt: reviewing.draft.prompt, reviewText };
 
 					const accepted = reviewService.accept();
 					if (!accepted.ok) {
 						ctx.ui.notify(accepted.error.message, "warning");
 						return;
 					}
-					ctx.ui.notify("Handoff accepted. Drafting a follow-up for the items the review flagged…", "info");
+
+					if (parsedLeftovers.kind === "none") {
+						ctx.ui.notify("Handoff accepted. The review listed no leftovers to hand off.", "info");
+						return;
+					}
+					ctx.ui.notify("Handoff accepted. Drafting a follow-up for the review's Leftovers: list…", "info");
 
 					if (leftovers === undefined || draftLeftovers === undefined) {
 						ctx.ui.notify(

@@ -11,7 +11,12 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildReviewMessage, extractPromptHeading } from "../../src/prompts/review-prompt.ts";
+import {
+	buildReviewMessage,
+	extractPromptHeading,
+	REVIEW_LEFTOVERS_INSTRUCTION,
+	REVIEW_VERDICT_INSTRUCTION,
+} from "../../src/prompts/review-prompt.ts";
 
 const INPUT = {
 	slug: "add-retry-logic",
@@ -85,10 +90,22 @@ describe("buildReviewMessage", () => {
 		assert.ok(buildReviewMessage(INPUT).includes("Do not edit"));
 	});
 
-	it("requires the one-line verdict the reopened gate sits under", () => {
+	it("requires the structured leftovers block immediately before the final verdict", () => {
+		const message = buildReviewMessage(INPUT);
+		assert.ok(message.includes(REVIEW_LEFTOVERS_INSTRUCTION));
+		assert.match(message, /`Leftovers: none`/);
+		assert.match(message, /`Leftovers:` followed by one `- <concrete worker item>` bullet/);
+		assert.match(
+			message,
+			/no action needed, notes for the human operator, praise, and work already accepted as correct/,
+		);
+		assert.ok(message.indexOf(REVIEW_LEFTOVERS_INSTRUCTION) < message.indexOf(REVIEW_VERDICT_INSTRUCTION));
+	});
+
+	it("requires the one-line verdict to be the last line", () => {
 		const message = buildReviewMessage(INPUT);
 		assert.ok(message.includes("Verdict:"));
-		assert.ok(message.trimEnd().endsWith("on that line."));
+		assert.ok(message.trimEnd().endsWith("`Verdict:` must be the last line."));
 	});
 
 	it("says there were no changes rather than rendering an empty block", () => {
@@ -153,8 +170,10 @@ describe("buildReviewMessage crash evidence", () => {
 		assert.ok(buildReviewMessage(CRASHED).includes("reason for scepticism"));
 	});
 
-	it("still requires the verdict line after a crash", () => {
-		assert.ok(buildReviewMessage(CRASHED).trimEnd().endsWith("on that line."));
+	it("still requires the leftovers block and final verdict after a crash", () => {
+		const message = buildReviewMessage(CRASHED);
+		assert.ok(message.includes(REVIEW_LEFTOVERS_INSTRUCTION));
+		assert.ok(message.trimEnd().endsWith("`Verdict:` must be the last line."));
 	});
 
 	it("omits both sections when a crash left no evidence", () => {
