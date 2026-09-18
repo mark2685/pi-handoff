@@ -114,7 +114,7 @@ describe("formatNeedsInputSummary", () => {
 		});
 		assert.deepEqual(lines.slice(3), [
 			"1. Choose a mode",
-			"   The worker uses this mode.",
+			"   Context: The worker uses this mode.",
 			"   A. Fast",
 			"   B. Safe (recommended)",
 		]);

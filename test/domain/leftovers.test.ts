@@ -77,8 +77,11 @@ describe("buildLeftoversScope", () => {
 	});
 
 	it("instructs the drafter to return the no-leftovers envelope rather than inventing tasks", () => {
-		assert.match(buildLeftoversScope(INPUT), /"noLeftovers": true/);
-		assert.match(buildLeftoversScope(INPUT), /do not include `slug`, `prompt`, or `tier`/);
+		const scope = buildLeftoversScope(INPUT);
+		assert.match(scope, /If the review lists no work for a fresh worker/);
+		assert.doesNotMatch(scope, /If the structured list contains no work/);
+		assert.match(scope, /"noLeftovers": true/);
+		assert.match(scope, /do not include `slug`, `prompt`, or `tier`/);
 	});
 
 	it("reports an unavailable prompt instead of rendering an empty section", () => {

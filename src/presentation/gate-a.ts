@@ -23,6 +23,24 @@ import { gateAMenu, type GateAOptionId } from "./menus.ts";
 /** Lines of the prompt body shown inside the gate before it is truncated. */
 const PROMPT_PREVIEW_LINES = 12;
 
+/** A shortened preview still needs enough context to identify the prompt. */
+const MIN_PROMPT_PREVIEW_ROWS = 3;
+
+/** Gate title, three spacers, and the footer below the select list. */
+const GATE_A_CHROME_ROWS = 5;
+
+/** Gate A always exposes all seven actions in its SelectList. */
+const GATE_A_MENU_ROWS = 7;
+
+/**
+ * Largest Gate A reservation: 18 non-preview summary rows (follow-up, override,
+ * and five definition-of-done items), seven menu rows, and five chrome rows.
+ */
+export const GATE_A_LARGEST_FIXED_ROWS = 30;
+
+/** Common Gate A reservation: 15 non-preview summary rows, seven menu rows, and chrome. */
+export const GATE_A_COMMON_FIXED_ROWS = 27;
+
 export interface GateAView {
 	draft: Draft;
 	/** Undefined when the tier resolved to no available model. */
@@ -34,15 +52,33 @@ export interface GateAView {
 	leftovers?: { acceptedSlug: string };
 }
 
+/**
+ * Chooses Gate A's preview footprint from the rows left after fixed content.
+ *
+ * A shortened preview reserves one of its rows for the `… N more lines` signpost;
+ * the three-row floor therefore shows two prompt lines plus that signpost. At the
+ * historical maximum the twelve prompt lines and its signpost are retained exactly
+ * as before, preserving the output for callers that omit `terminalRows`.
+ */
+export function promptPreviewLimit(terminalRows: number, fixedRows = GATE_A_LARGEST_FIXED_ROWS): number {
+	const available = Math.floor(terminalRows) - fixedRows;
+	if (available >= PROMPT_PREVIEW_LINES + 1) return PROMPT_PREVIEW_LINES;
+	return Math.max(MIN_PROMPT_PREVIEW_ROWS, Math.min(PROMPT_PREVIEW_LINES - 1, available));
+}
+
 /** Truncates the prompt body to a bounded preview, noting how much was hidden. */
-function previewPrompt(prompt: string): string[] {
+function previewPrompt(prompt: string, limit: number): string[] {
 	const lines = prompt.split("\n");
-	if (lines.length <= PROMPT_PREVIEW_LINES) return lines;
-	const hidden = lines.length - PROMPT_PREVIEW_LINES;
+	if (lines.length <= limit) return lines;
+	// At the historical maximum retain its twelve body lines plus the existing
+	// signpost. A constrained cap is a rendered-row budget, so reserve one row for
+	// the signpost itself rather than letting it push the final menu option away.
+	const bodyLines = limit === PROMPT_PREVIEW_LINES ? limit : Math.max(1, limit - 1);
+	const hidden = lines.length - bodyLines;
 	// Names the option that shows the rest, so the truncation is a signpost rather
 	// than a dead end the user has to guess their way out of.
 	return [
-		...lines.slice(0, PROMPT_PREVIEW_LINES),
+		...lines.slice(0, bodyLines),
 		`… ${hidden} more line${hidden === 1 ? "" : "s"} — choose "View full prompt" to read all of it`,
 	];
 }
@@ -54,7 +90,7 @@ function previewPrompt(prompt: string): string[] {
  * because an empty field reads as a rendering bug while an explicit sentence
  * tells the user what to do next.
  */
-export function formatGateASummary(view: GateAView): string[] {
+export function formatGateASummary(view: GateAView, terminalRows?: number): string[] {
 	const modelLine =
 		view.choice === undefined
 			? `Model:     none available for tier "${view.draft.tier}" — choose one to enable Run`
@@ -69,10 +105,10 @@ export function formatGateASummary(view: GateAView): string[] {
 		view.draft.bluf === undefined ? ["BLUF: (not provided by the drafting model)"] : [`BLUF: ${view.draft.bluf}`];
 	const definitionOfDoneLines =
 		view.draft.definitionOfDone === undefined
-			? []
+			? ["Definition of done: (not provided by the drafting model)"]
 			: ["Definition of done:", ...view.draft.definitionOfDone.map((condition) => `  - ${condition}`)];
 
-	return [
+	const fixedLines = [
 		`Handoff:   ${view.draft.slug}`,
 		...(view.leftovers === undefined ? [] : [`Follow-up: leftovers of \`${view.leftovers.acceptedSlug}\``]),
 		`Tier:      ${view.draft.tier}`,
@@ -85,8 +121,10 @@ export function formatGateASummary(view: GateAView): string[] {
 		...definitionOfDoneLines,
 		"",
 		"Prompt preview:",
-		...previewPrompt(view.draft.prompt),
 	];
+	const fixedRows = Math.max(GATE_A_COMMON_FIXED_ROWS, fixedLines.length + GATE_A_MENU_ROWS + GATE_A_CHROME_ROWS);
+	const limit = terminalRows === undefined ? PROMPT_PREVIEW_LINES : promptPreviewLimit(terminalRows, fixedRows);
+	return [...fixedLines, ...previewPrompt(view.draft.prompt, limit)];
 }
 
 /**
@@ -105,11 +143,11 @@ export async function openGateA(ctx: ExtensionContext, view: GateAView): Promise
 		...(option.description === undefined ? {} : { description: option.description }),
 	}));
 
-	return ctx.ui.custom<GateAOptionId | undefined>((_tui, theme, _keybindings, done) => {
+	return ctx.ui.custom<GateAOptionId | undefined>((tui, theme, _keybindings, done) => {
 		const container = new Container();
 		container.addChild(new Text(theme.fg("accent", theme.bold("Handoff ready for approval")), 1, 0));
 		container.addChild(new Spacer(1));
-		for (const line of formatGateASummary(view)) {
+		for (const line of formatGateASummary(view, tui.terminal.rows)) {
 			// An empty Text renders zero lines, so a blank separator must be a Spacer.
 			if (line === "") {
 				container.addChild(new Spacer(1));

@@ -21,7 +21,7 @@
  * also matches the design's decision that the reviewing session waits at a gate.
  */
 
-import { Container, Spacer, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import { Container, Key, matchesKey, Spacer, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatCost, formatElapsed, formatTokenCount, formatTokenSummary } from "../domain/report/format.ts";
@@ -49,9 +49,6 @@ const WIDGET_BODY_PADDING_X = 1;
 
 /** How often the elapsed-time line is refreshed while the worker is quiet. */
 const TICK_INTERVAL_MS = 1_000;
-
-/** Escape, which is the abort key throughout Pi's cancellable surfaces. */
-const ESCAPE = "\x1b";
 
 export interface RunningWidgetView {
 	slug: string;
@@ -144,10 +141,23 @@ export function formatRunningLines(
 
 	lines.push("");
 	lines.push(state.stopping ? "Stopping the worker…" : "esc  stop the worker");
-	return lines;
+
+	// Tool names originate outside the extension and can be arbitrarily long. Every
+	// body line therefore needs the same visible-width cap as the metadata header:
+	// otherwise one long name wraps, consumes the abort hint's reserved row, and
+	// defeats the widget's fixed-height budget.
+	const maximum = Math.max(1, Math.floor(width));
+	return lines.map((line) => truncateToWidth(line, maximum, "…"));
 }
 
 /** A running widget with the handles the run flow drives it through. */
+/** True when a key means "stop the running worker". */
+export function isAbortKey(data: string): boolean {
+	// Parsed matching recognizes both the legacy Escape byte and Kitty's `\x1b[27u`
+	// encoding, rather than leaving the advertised key inert in Kitty terminals.
+	return matchesKey(data, Key.escape);
+}
+
 export interface RunningWidget extends Container {
 	/** Applies a progress event and repaints. */
 	update(progress: RunProgress): void;
@@ -215,7 +225,7 @@ export function createRunningWidget(
 	};
 
 	container.handleInput = (data: string) => {
-		if (data !== ESCAPE || stopping) return;
+		if (!isAbortKey(data) || stopping) return;
 		// Requests the kill; the run's completion closes the overlay.
 		options.onAbort();
 		container.markStopping();

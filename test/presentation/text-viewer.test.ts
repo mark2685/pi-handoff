@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { closesViewer, windowLines } from "../../src/presentation/text-viewer.ts";
+import { createTextViewer, closesViewer, windowLines } from "../../src/presentation/text-viewer.ts";
 
 const LINES = Array.from({ length: 100 }, (_, index) => `line ${index + 1}`);
 
@@ -28,6 +28,10 @@ describe("windowLines", () => {
 	it("reports a short text as complete rather than as a position", () => {
 		assert.equal(windowLines(["a", "b", "c"], 0, 10).status, "3 lines");
 		assert.equal(windowLines(["only"], 0, 10).status, "1 line");
+	});
+
+	it("labels an empty viewer as having no text rather than one blank line", () => {
+		assert.equal(windowLines([""], 0, 10).status, "No text");
 	});
 
 	it("slices the requested window of a long text", () => {
@@ -232,6 +236,47 @@ describe("windowLines paging offsets", () => {
  * `\x1b`. The previous version compared raw bytes, so its Escape silently never
  * fired in those terminals while the footer still promised it would.
  */
+describe("createTextViewer sizing", () => {
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+
+	it("reserves wrapped title and footer rows at a 24x40 terminal", () => {
+		const tui = {
+			terminal: { columns: 40, rows: 24 },
+			requestRender: () => undefined,
+		};
+		const viewer = createTextViewer(
+			tui as never,
+			theme as never,
+			"A deliberately long viewer title that wraps at forty columns",
+			Array.from({ length: 100 }, (_, index) => `line ${index + 1}`),
+		);
+		const rows = viewer.render(40);
+
+		assert.ok(rows.length <= 24, `expected at most 24 rows, got ${rows.length}`);
+		assert.match(rows.join("\n"), /esc close/);
+	});
+
+	it("keeps the full viewer chrome within the 24x80 minimum terminal", () => {
+		const tui = {
+			terminal: { columns: 80, rows: 24 },
+			requestRender: () => undefined,
+		};
+		const viewer = createTextViewer(
+			tui as never,
+			theme as never,
+			"Worker report",
+			Array.from({ length: 100 }, (_, index) => `line ${index + 1}`),
+		);
+		const rows = viewer.render(80);
+
+		assert.ok(rows.length <= 24, `expected at most 24 rows, got ${rows.length}`);
+		assert.match(rows.join("\n"), /esc close/);
+	});
+});
+
 describe("closesViewer", () => {
 	it("closes on a legacy Escape", () => {
 		assert.equal(closesViewer("\x1b"), true);

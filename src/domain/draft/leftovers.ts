@@ -68,7 +68,7 @@ export function buildLeftoversScope(input: LeftoversScopeInput): string {
 		"Rules for this follow-up:",
 		"",
 		"- Do not restate or re-implement anything the review accepted as correct.",
-		'- If the structured list contains no work for a fresh worker, reply with exactly `{ "noLeftovers": true, "rationale": "<one sentence>" }` and do not include `slug`, `prompt`, or `tier`.',
+		'- If the review lists no work for a fresh worker, reply with exactly `{ "noLeftovers": true, "rationale": "<one sentence>" }` and do not include `slug`, `prompt`, or `tier`.',
 		"- Inherit the conventions, constraints, and validation commands from the accepted prompt below; the follow-up runs against the same repository.",
 		"- The working tree already contains the accepted changes. Tell the new agent that, so it does not expect a clean tree or try to recreate the prior work.",
 		...(usesStructuredItems

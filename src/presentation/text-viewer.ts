@@ -39,8 +39,8 @@
 import { type Component, Key, matchesKey, type TUI, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 
-/** Rows reserved for the title, its blank line, and the footer hint. */
-const CHROME_ROWS = 3;
+/** The blank row separating the title from the content. */
+const TITLE_SPACER_ROWS = 1;
 
 /** Viewport height assumed when the terminal reports an implausible size. */
 const FALLBACK_VIEWPORT_ROWS = 20;
@@ -161,7 +161,7 @@ export function windowLines(
 		return {
 			lines: [...lines],
 			offset: 0,
-			status: total === 1 ? "1 line" : `${total} lines`,
+			status: total === 0 || (total === 1 && lines[0] === "") ? "No text" : total === 1 ? "1 line" : `${total} lines`,
 			nextOffset: 0,
 			previousOffset: 0,
 		};
@@ -192,11 +192,11 @@ export function windowLines(
 	};
 }
 
-/** Reads a usable viewport height from the terminal, tolerating an unreported size. */
-function viewportRowsFor(tui: TUI): number {
+/** Reads a usable viewport height after reserving the title, spacer, and footer. */
+function viewportRowsFor(tui: TUI, chromeRows: number): number {
 	const rows = tui.terminal?.rows;
 	if (typeof rows !== "number" || !Number.isFinite(rows) || rows <= 0) return FALLBACK_VIEWPORT_ROWS;
-	return Math.max(MIN_VIEWPORT_ROWS, rows - CHROME_ROWS);
+	return Math.max(MIN_VIEWPORT_ROWS, rows - chromeRows);
 }
 
 /**
@@ -237,12 +237,25 @@ export function createTextViewer(tui: TUI, theme: Theme, title: string, lines: r
 			const paddingX = Math.min(PADDING_X, Math.max(0, Math.floor((usable - 1) / 2)));
 			const contentWidth = Math.max(1, usable - paddingX * 2);
 			const margin = " ".repeat(paddingX);
-
-			const window = windowLines(lines, offset, viewportRowsFor(tui), heightAt(contentWidth));
+			const footerHint = "   \u2191\u2193 pgup/pgdn home/end scroll   esc close";
+			// Reserve the widest status this text can produce. At narrow widths either
+			// the title or footer wraps; treating chrome as a fixed three rows would let
+			// the content window paint into those rows and hide the closing hint.
+			const widestStatus =
+				lines.length === 0
+					? "0 lines"
+					: lines.length === 1
+						? "1 line"
+						: `Lines ${lines.length}-${lines.length} of ${lines.length} (end)`;
+			const chromeRows =
+				wrapTextWithAnsi(title, contentWidth).length +
+				TITLE_SPACER_ROWS +
+				wrapTextWithAnsi(`${widestStatus}${footerHint}`, contentWidth).length;
+			const window = windowLines(lines, offset, viewportRowsFor(tui, chromeRows), heightAt(contentWidth));
 			offset = window.offset;
 			rendered = window;
 
-			const footer = `${window.status}   \u2191\u2193 pgup/pgdn home/end scroll   esc close`;
+			const footer = `${window.status}${footerHint}`;
 			const rows: string[] = [];
 
 			/** Pads a rendered row to the full width, as `Text` does, so the theme's background is even. */

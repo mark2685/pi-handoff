@@ -29,7 +29,7 @@ const MAX_QUESTION_LINES = 40;
 /** Renders a question independently so the same text can be capped without losing menu chrome. */
 function formatQuestion(question: DraftQuestion, index: number): string[] {
 	const lines = [`${index + 1}. ${question.question}`];
-	if (question.context !== undefined) lines.push(`   ${question.context}`);
+	if (question.context !== undefined) lines.push(`   Context: ${question.context}`);
 	for (const [choiceIndex, choice] of (question.choices ?? []).entries()) {
 		const recommendation = question.recommended === choiceIndex ? " (recommended)" : "";
 		lines.push(`   ${String.fromCharCode(65 + choiceIndex)}. ${choice}${recommendation}`);

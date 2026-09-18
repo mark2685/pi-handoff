@@ -24,13 +24,24 @@ import {
 	type UsageTotals,
 } from "../../src/domain/report/format.ts";
 import type { ModelChoice } from "../../src/domain/types.ts";
-import { formatGateBSummary, formatGateBTitle, type GateBView } from "../../src/presentation/gate-b.ts";
+import {
+	GATE_B_COMMON_COMPLETED_FIXED_ROWS,
+	GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS,
+	diffstatPreviewLimit,
+	formatGateBSummary,
+	formatGateBTitle,
+	partialReportPreviewLimit,
+	reportPreviewLimit,
+	stderrPreviewLimit,
+	type GateBView,
+} from "../../src/presentation/gate-b.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { confirmDiscardMenu, gateBMenu, selectOption } from "../../src/presentation/menus.ts";
 import {
 	definitionOfDoneLimit,
 	formatRunningHeaderLines,
 	formatRunningLines,
+	isAbortKey,
 } from "../../src/presentation/running-widget.ts";
 
 const CHOICE: ModelChoice = { provider: "bifrost-openai", model: "gpt-5.6-terra", thinking: "high" };
@@ -179,6 +190,57 @@ describe("formatGateBSummary", () => {
 		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
 		const lines = formatGateBSummary({ ...COMPLETED_VIEW, report });
 		assert.ok(lines.includes('… 16 more lines — choose "View full report" to read all of it'));
+	});
+
+	it("shares a 40-row completed-review budget between the report, diffstat, and findings", () => {
+		const report = Array.from({ length: 40 }, (_, index) => `report ${index}`).join("\n");
+		const diffstat = Array.from({ length: 30 }, (_, index) => `diff ${index}`).join("\n");
+		const review = Array.from({ length: 30 }, (_, index) => `finding ${index}`).join("\n");
+		const view: GateBView = {
+			...COMPLETED_VIEW,
+			report,
+			diffstat,
+			review: { iteration: 1, verdict: "fix", text: review },
+		};
+		const lines = formatGateBSummary(view, 40);
+		assert.equal(
+			lines.length +
+				gateBMenu({ interrupted: false, hasReport: true, review: { verdict: "fix", leftovers: "missing" } }).length +
+				5,
+			40,
+		);
+		assert.ok(lines.includes('… 34 more lines — choose "View full report" to read all of it'));
+		assert.ok(lines.includes("… 28 more lines"));
+	});
+
+	it("keeps the three-row preview floor and gives the report the spare rows first", () => {
+		const completed = ["report", "review", "diffstat"] as const;
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => reportPreviewLimit(rows, GATE_B_COMMON_COMPLETED_FIXED_ROWS, completed)),
+			[3, 3, 7],
+		);
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => diffstatPreviewLimit(rows, GATE_B_COMMON_COMPLETED_FIXED_ROWS, completed)),
+			[3, 3, 3],
+		);
+
+		const interrupted = ["diffstat", "partialReport", "stderr"] as const;
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => partialReportPreviewLimit(rows, GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS, interrupted)),
+			[3, 3, 3],
+		);
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => stderrPreviewLimit(rows, GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS, interrupted)),
+			[3, 3, 3],
+		);
+	});
+
+	it("preserves the historical formatter output when terminal rows are omitted", () => {
+		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
+		assert.deepEqual(
+			formatGateBSummary({ ...COMPLETED_VIEW, report }),
+			formatGateBSummary({ ...COMPLETED_VIEW, report }, undefined),
+		);
 	});
 
 	it("is unchanged when no review was captured", () => {
@@ -522,6 +584,18 @@ describe("formatRunningHeaderLines", () => {
 	});
 });
 
+describe("isAbortKey", () => {
+	it("accepts both legacy and Kitty Escape encodings", () => {
+		assert.equal(isAbortKey("\x1b"), true);
+		assert.equal(isAbortKey("\x1b[27u"), true);
+	});
+
+	it("does not mistake other keys for Escape", () => {
+		assert.equal(isAbortKey("q"), false);
+		assert.equal(isAbortKey("\x1b[A"), false);
+	});
+});
+
 describe("formatRunningLines", () => {
 	it("shows elapsed time", () => {
 		const lines = formatRunningLines(
@@ -621,7 +695,36 @@ describe("formatRunningLines", () => {
 		// Title and spacer consume the other two rows in the overlay.
 		assert.equal(lines.length + 2, 24);
 		assert.equal(lines.at(-1), "esc  stop the worker");
-		for (const line of lines.slice(0, 7)) assert.ok(visibleWidth(line) <= 78);
+		for (const line of lines) assert.ok(visibleWidth(line) <= 78);
+	});
+
+	it("truncates untrusted long tool names to the widget content width", () => {
+		const lines = formatRunningLines(
+			{ slug: "handoff", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{
+				elapsedMs: 0,
+				progress: {
+					report: "",
+					usage: USAGE,
+					toolResults: [
+						{
+							toolCallId: "c",
+							toolName: "工具-".repeat(20),
+							text: "",
+							isError: true,
+						},
+					],
+					stopReason: undefined,
+					errorMessage: undefined,
+					elapsedMs: 0,
+				},
+				stopping: false,
+			},
+			18,
+		);
+
+		for (const line of lines) assert.ok(visibleWidth(line) <= 18, line);
+		assert.ok(lines.some((line) => line.includes("…")));
 	});
 
 	it("marks a failed tool call", () => {
@@ -708,6 +811,21 @@ describe("formatGateBSummary crash evidence", () => {
 		const lines = formatGateBSummary(CRASHED_VIEW);
 		assert.ok(lines.includes("Worker stderr (tail):"));
 		assert.ok(lines.some((line) => line.includes("provider returned 503")));
+	});
+
+	it("keeps correctly counted signposts for every shortened crash-evidence preview", () => {
+		const lines = formatGateBSummary(
+			{
+				...CRASHED_VIEW,
+				diffstat: Array.from({ length: 12 }, (_, index) => `diff ${index}`).join("\n"),
+				partialReport: Array.from({ length: 10 }, (_, index) => `partial ${index}`).join("\n"),
+				stderrTail: Array.from({ length: 9 }, (_, index) => `stderr ${index}`).join("\n"),
+			},
+			24,
+		);
+		assert.ok(lines.includes('… 10 more lines — choose "View full diffstat" to read all of it'));
+		assert.ok(lines.includes("… 8 more lines"));
+		assert.ok(lines.includes("… 7 more lines"));
 	});
 
 	it("omits both sections when a run was interrupted with no evidence", () => {

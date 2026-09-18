@@ -13,7 +13,12 @@ import type { HandoffState } from "../../src/app/handoff-machine.ts";
 import { parseHandoffCommand } from "../../src/commands/parse.ts";
 import { formatHandoffStatus } from "../../src/commands/status.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
-import { formatGateASummary } from "../../src/presentation/gate-a.ts";
+import {
+	GATE_A_COMMON_FIXED_ROWS,
+	GATE_A_LARGEST_FIXED_ROWS,
+	formatGateASummary,
+	promptPreviewLimit,
+} from "../../src/presentation/gate-a.ts";
 import { gateAMenu, selectOption, unparseableMenu } from "../../src/presentation/menus.ts";
 
 const DRAFT: Draft = {
@@ -203,8 +208,10 @@ describe("formatGateASummary", () => {
 		assert.deepEqual(lines.slice(previewIndex + 1), ["Line 1", "Line 2"]);
 	});
 
-	it("renders a stable fallback when an older draft has no metadata", () => {
-		assert.ok(formatGateASummary(view).includes("BLUF: (not provided by the drafting model)"));
+	it("renders stable fallbacks when an older draft has no metadata", () => {
+		const lines = formatGateASummary(view);
+		assert.ok(lines.includes("BLUF: (not provided by the drafting model)"));
+		assert.ok(lines.includes("Definition of done: (not provided by the drafting model)"));
 	});
 
 	it("marks a command-line model override", () => {
@@ -219,6 +226,37 @@ describe("formatGateASummary", () => {
 		const lines = formatGateASummary({ ...view, draft: long });
 		assert.ok(lines.includes('… 8 more lines — choose "View full prompt" to read all of it'));
 		assert.equal(lines.includes("L19"), false);
+	});
+
+	it("uses the available rows for the prompt preview while retaining its signpost", () => {
+		const long: Draft = {
+			...DRAFT,
+			prompt: Array.from({ length: 100 }, (_, index) => `L${index}`).join("\n"),
+			bluf: "Keep the gate action visible.",
+			definitionOfDone: ["One", "Two", "Three"],
+		};
+		const lines = formatGateASummary({ ...view, draft: long }, 30);
+		assert.ok(lines.includes('… 98 more lines — choose "View full prompt" to read all of it'));
+		assert.ok(lines.length + gateAMenu(true).length + 5 <= 30);
+	});
+
+	it("uses the three-row floor at short heights and restores the historical cap when it fits", () => {
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => promptPreviewLimit(rows, GATE_A_COMMON_FIXED_ROWS)),
+			[3, 3, 12],
+		);
+		assert.deepEqual(
+			[24, 30, 40].map((rows) => promptPreviewLimit(rows, GATE_A_LARGEST_FIXED_ROWS)),
+			[3, 3, 10],
+		);
+	});
+
+	it("preserves the historical formatter output when terminal rows are omitted", () => {
+		const long: Draft = { ...DRAFT, prompt: Array.from({ length: 20 }, (_, index) => `L${index}`).join("\n") };
+		assert.deepEqual(
+			formatGateASummary({ ...view, draft: long }),
+			formatGateASummary({ ...view, draft: long }, undefined),
+		);
 	});
 
 	it("explains the missing model instead of leaving the field blank", () => {
