@@ -28,6 +28,7 @@ import {
 	GATE_B_COMMON_COMPLETED_FIXED_ROWS,
 	GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS,
 	diffstatPreviewLimit,
+	gateBOptions,
 	formatGateBSummary,
 	formatGateBTitle,
 	partialReportPreviewLimit,
@@ -189,8 +190,10 @@ describe("formatGateBSummary", () => {
 
 	it("truncates a long report and points at the option that shows the rest", () => {
 		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, report });
+		const view = { ...COMPLETED_VIEW, report };
+		const lines = formatGateBSummary(view);
 		assert.ok(lines.includes('… 16 more lines — choose "View full report" to read all of it'));
+		assert.equal(gateBOptions(view).find((option) => option.id === "view_report")?.label, "View full report");
 	});
 
 	it("shares a 40-row completed-review budget between the report, diffstat, and findings", () => {
@@ -311,6 +314,15 @@ describe("gateBMenu", () => {
 		assert.equal(
 			options.some((option) => option.id === "view_diffstat"),
 			true,
+		);
+	});
+
+	it("labels pre-crash output separately from a completed report", () => {
+		const options = gateBMenu({ interrupted: true, hasPartialReport: true });
+		assert.equal(options.find((option) => option.id === "view_report")?.label, "View partial output");
+		assert.equal(
+			options.some((option) => option.label === "View full report"),
+			false,
 		);
 	});
 
@@ -875,8 +887,8 @@ describe("formatGateBSummary crash evidence", () => {
 			24,
 		);
 		assert.ok(lines.includes('… 10 more lines — choose "View full diffstat" to read all of it'));
-		assert.ok(lines.includes("… 8 more lines"));
-		assert.ok(lines.includes("… 7 more lines"));
+		assert.ok(lines.includes('… 8 more lines — choose "View partial output" to read all of it'));
+		assert.ok(lines.includes('… 7 more lines — choose "View full diffstat" to read all of it'));
 	});
 
 	it("omits both sections when a run was interrupted with no evidence", () => {
@@ -892,9 +904,19 @@ describe("formatGateBSummary crash evidence", () => {
 		assert.equal(formatGateBTitle(CRASHED_VIEW), "Handoff did not complete");
 	});
 
-	it("offers the report viewer for pre-crash text, since there is something to read", () => {
-		const options = gateBMenu({ interrupted: true, hasReport: true });
-		assert.ok(options.some((option) => option.id === "view_report"));
+	it("offers a partial-output viewer only when the height-budgeted preview hides text", () => {
+		const truncated: GateBView = {
+			...CRASHED_VIEW,
+			partialReport: Array.from({ length: 10 }, (_, index) => `partial ${index}`).join("\n"),
+		};
+		assert.equal(
+			gateBOptions(truncated, 24).find((option) => option.id === "view_report")?.label,
+			"View partial output",
+		);
+		assert.equal(
+			gateBOptions(CRASHED_VIEW, 24).some((option) => option.id === "view_report"),
+			false,
+		);
 	});
 });
 

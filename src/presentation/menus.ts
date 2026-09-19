@@ -140,8 +140,12 @@ export function gateBMenu(options: {
 	review?: { verdict?: "accept" | "fix" | "discard"; leftovers?: "none" | "items" | "missing" };
 	/** Present when a review is pending, describing whether another iteration is allowed. */
 	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
-	/** Whether there is any report text to open in the full viewer. */
+	/** Whether a completed report preview hides text, so its full viewer is useful. */
 	hasReport?: boolean;
+	/** Whether pre-crash partial-output preview hides text, never a finished report. */
+	hasPartialReport?: boolean;
+	/** Whether the diffstat view reveals hidden diffstat or stderr-tail text. Defaults to true for legacy callers. */
+	hasDiffstat?: boolean;
 }): MenuOption<GateBOptionId>[] {
 	const reviewed = options.review !== undefined;
 	const reviewOptions: MenuOption<GateBOptionId>[] = options.interrupted
@@ -164,8 +168,14 @@ export function gateBMenu(options: {
 				options.review?.verdict === "discard" ? "Discard changes (reviewer recommends discard)" : "Discard changes",
 		},
 		{ id: "accept", label: options.interrupted ? "Accept (keep the tree as it is)" : "Accept" },
-		...(options.hasReport === true ? [{ id: "view_report" as const, label: "View full report" }] : []),
-		{ id: "view_diffstat", label: "View full diffstat" },
+		// The flow keeps one stable viewer id, but the labels cannot collapse: doing so
+		// is how a crash fragment was once presented as a finished report.
+		...(options.hasReport === true
+			? [{ id: "view_report" as const, label: "View full report" }]
+			: options.hasPartialReport === true
+				? [{ id: "view_report" as const, label: "View partial output" }]
+				: []),
+		...(options.hasDiffstat !== false ? [{ id: "view_diffstat" as const, label: "View full diffstat" }] : []),
 		// `none` is deliberately absent rather than disabled: there is nothing to hand
 		// off. Missing preserves the old full-review fallback for captured old reviews.
 		...(options.review?.verdict === "accept" &&

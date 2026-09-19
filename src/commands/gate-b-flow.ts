@@ -265,7 +265,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					const report = current.report ?? current.partialReport ?? "";
 					const title =
 						current.report === null
-							? `Partial output before the worker died — ${current.slug} (NOT a report)`
+							? `Partial output — ${current.slug} (NOT a report)`
 							: `Worker report — ${current.slug}`;
 					await openTextViewer(ctx, title, report);
 					continue;

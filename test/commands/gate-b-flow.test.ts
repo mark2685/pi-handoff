@@ -72,6 +72,8 @@ interface Harness {
 	editorPrefills: string[];
 	/** Follow-up drafts requested by "Accept and hand off leftovers". */
 	leftovers: LeftoversScopeInput[];
+	/** Titles rendered by read-only viewers, whose headings are part of the warning contract. */
+	viewerTitles: string[];
 }
 
 interface HarnessOptions {
@@ -91,6 +93,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const messages: string[] = [];
 	const editorPrefills: string[] = [];
 	const leftovers: LeftoversScopeInput[] = [];
+	const viewerTitles: string[] = [];
 	const selections = [...(options.selections ?? [])];
 
 	const recorder: HandoffStateRecorder = { record: () => {} };
@@ -168,6 +171,8 @@ function createHarness(options: HarnessOptions = {}): Harness {
 					component.dispose?.();
 					return resolved.value;
 				}
+				const viewer = component as { render?: (width: number) => string[]; scrollBy?: (delta: number) => void };
+				if (viewer.scrollBy !== undefined) viewerTitles.push(viewer.render?.(80)[0]?.trim() ?? "");
 				overlays.push(overlays.length);
 				return selections.shift();
 			},
@@ -193,7 +198,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 	});
 
-	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills, leftovers };
+	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills, leftovers, viewerTitles };
 }
 
 /** Drives the machine to a pending review, which is Gate B's precondition. */
@@ -670,6 +675,31 @@ describe("GateBFlow read-only viewers", () => {
 
 		// Gate, viewer, gate again: the viewer decides nothing and hands control back.
 		assert.equal(harness.overlays.length, 3);
+	});
+
+	it("titles the pre-crash viewer as partial output rather than correcting a report label", async () => {
+		const partial = Array.from({ length: 10 }, (_, index) => `partial ${index}`).join("\n");
+		const harness = createHarness({
+			selections: ["view_report", "dismiss"],
+			outcomes: [
+				{
+					exitCode: 1,
+					report: partial,
+					usage: USAGE,
+					toolResults: [],
+					stopReason: "error",
+					errorMessage: undefined,
+					stderr: "",
+					aborted: false,
+				},
+			],
+		});
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.viewerTitles, ["Partial output — add-retry-logic (NOT a report)"]);
 	});
 
 	it("returns to the gate after viewing the full diffstat", async () => {

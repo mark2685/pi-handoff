@@ -231,7 +231,7 @@ function partialReportLines(view: GateBView, limits: PreviewLimits): string[] {
 	return [
 		"",
 		"Partial output before the worker died (NOT a report — it never finished):",
-		...preview(partial, limits.partialReport ?? PARTIAL_REPORT_PREVIEW_LINES, "partialReport"),
+		...preview(partial, limits.partialReport ?? PARTIAL_REPORT_PREVIEW_LINES, "partialReport", "View partial output"),
 	];
 }
 
@@ -239,7 +239,11 @@ function partialReportLines(view: GateBView, limits: PreviewLimits): string[] {
 function stderrLines(view: GateBView, limits: PreviewLimits): string[] {
 	const tail = view.stderrTail?.trimEnd();
 	if (tail === undefined || tail === "") return [];
-	return ["", "Worker stderr (tail):", ...preview(tail, limits.stderr ?? STDERR_PREVIEW_LINES, "stderr")];
+	return [
+		"",
+		"Worker stderr (tail):",
+		...preview(tail, limits.stderr ?? STDERR_PREVIEW_LINES, "stderr", "View full diffstat"),
+	];
 }
 
 /** Renders the reviewer response that would otherwise be obscured behind this overlay. */
@@ -264,11 +268,39 @@ function presentPreviewKinds(view: GateBView): PreviewKind[] {
 	];
 }
 
-/** Builds Gate B's menu once so its count is shared by sizing and rendering. */
-function gateBOptions(view: GateBView) {
+type ViewerFlags = { report: boolean; partialReport: boolean; diffstat: boolean };
+
+/** Returns whether a preview omits source lines that only its viewer can reveal. */
+function isPreviewTruncated(text: string, limit: number): boolean {
+	return text.split("\n").length > limit;
+}
+
+/** Computes the viewer choices from the same limits that shorten the gate's previews. */
+function viewerFlags(view: GateBView, limits: PreviewLimits): ViewerFlags {
+	const report = view.report?.trimEnd();
+	const partialReport = view.partialReport?.trimEnd() ?? "";
+	const diffstat = view.diffstatFailure === undefined ? view.diffstat.trimEnd() : "";
+	const stderr = view.stderrTail?.trimEnd() ?? "";
+	return {
+		report:
+			report !== undefined && report !== "" ? isPreviewTruncated(report, limits.report ?? REPORT_PREVIEW_LINES) : false,
+		partialReport:
+			partialReport !== ""
+				? isPreviewTruncated(partialReport, limits.partialReport ?? PARTIAL_REPORT_PREVIEW_LINES)
+				: false,
+		diffstat:
+			(diffstat !== "" ? isPreviewTruncated(diffstat, limits.diffstat ?? DIFFSTAT_PREVIEW_LINES) : false) ||
+			(stderr !== "" ? isPreviewTruncated(stderr, limits.stderr ?? STDERR_PREVIEW_LINES) : false),
+	};
+}
+
+/** Builds a menu from viewer choices without ever making partial output a report. */
+function menuFor(view: GateBView, viewers: ViewerFlags) {
 	return gateBMenu({
 		interrupted: view.report === null,
-		hasReport: (view.report ?? view.partialReport ?? "") !== "",
+		hasReport: viewers.report,
+		hasPartialReport: viewers.partialReport,
+		hasDiffstat: viewers.diffstat,
 		...(view.review === undefined
 			? {}
 			: {
@@ -279,6 +311,41 @@ function gateBOptions(view: GateBView) {
 				}),
 		...(view.feedback === undefined ? {} : { feedback: view.feedback }),
 	});
+}
+
+function sameViewerFlags(left: ViewerFlags, right: ViewerFlags): boolean {
+	return left.report === right.report && left.partialReport === right.partialReport && left.diffstat === right.diffstat;
+}
+
+/**
+ * Builds Gate B's menu from the preview that will actually be rendered.
+ *
+ * A viewer itself consumes a menu row, which can make a marginal preview shorter.
+ * Start with every available viewer and only remove choices as the reclaimed rows
+ * reveal their full text; otherwise a one-line crash fragment can reopen the exact
+ * no-op viewer this gate is meant to prevent.
+ */
+export function gateBOptions(view: GateBView, terminalRows?: number) {
+	const candidates: ViewerFlags = {
+		report: view.report !== null && view.report.trimEnd() !== "",
+		partialReport: (view.partialReport?.trimEnd() ?? "") !== "",
+		diffstat:
+			(view.diffstatFailure === undefined && view.diffstat.trimEnd() !== "") ||
+			(view.stderrTail?.trimEnd() ?? "") !== "",
+	};
+	if (terminalRows === undefined) return menuFor(view, viewerFlags(view, {}));
+
+	let viewers = candidates;
+	for (;;) {
+		const limits = previewLimits(
+			terminalRows,
+			fixedRowsFor(view, menuFor(view, viewers).length),
+			presentPreviewKinds(view),
+		);
+		const next = viewerFlags(view, limits);
+		if (sameViewerFlags(viewers, next)) return menuFor(view, next);
+		viewers = next;
+	}
 }
 
 /** Counts the summary, menu, and chrome that cannot give way to a preview. */
@@ -313,7 +380,7 @@ export function formatGateBSummary(view: GateBView, terminalRows?: number): stri
 	const limits =
 		terminalRows === undefined
 			? {}
-			: previewLimits(terminalRows, fixedRowsFor(view, gateBOptions(view).length), present);
+			: previewLimits(terminalRows, fixedRowsFor(view, gateBOptions(view, terminalRows).length), present);
 
 	return [
 		`Handoff:   ${view.slug}`,
@@ -341,14 +408,13 @@ export function formatGateBTitle(view: GateBView): string {
  * leaving the review pending rather than as an implicit accept or discard.
  */
 export async function openGateB(ctx: ExtensionContext, view: GateBView): Promise<GateBOptionId | undefined> {
-	const options = gateBOptions(view);
-	const items: SelectItem[] = options.map((option) => ({
-		value: option.id,
-		label: option.label,
-		...(option.description === undefined ? {} : { description: option.description }),
-	}));
-
 	return ctx.ui.custom<GateBOptionId | undefined>((tui, theme, _keybindings, done) => {
+		const options = gateBOptions(view, tui.terminal.rows);
+		const items: SelectItem[] = options.map((option) => ({
+			value: option.id,
+			label: option.label,
+			...(option.description === undefined ? {} : { description: option.description }),
+		}));
 		const container = new Container();
 		const heading = formatGateBTitle(view);
 		container.addChild(new Text(theme.fg("accent", theme.bold(heading)), 1, 0));
