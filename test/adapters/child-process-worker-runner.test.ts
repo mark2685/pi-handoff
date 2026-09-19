@@ -7,6 +7,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,7 +15,12 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { createChildProcessWorkerRunner } from "../../src/adapters/child-process-worker-runner.ts";
 import { buildPromptPath } from "../../src/domain/draft/slug.ts";
 import type { ModelChoice } from "../../src/domain/types.ts";
-import type { WorkerRunProgress, WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
+import {
+	DEFAULT_NO_PROGRESS_THRESHOLD_MS,
+	type WorkerRunProgress,
+	type WorkerRunner,
+	type WorkerUsage,
+} from "../../src/ports/worker-runner.ts";
 
 const WORKER_CHOICE: ModelChoice = { provider: "test-provider", model: "test-model", thinking: "high" };
 
@@ -56,6 +62,7 @@ const NORMAL_USAGE: WorkerUsage = {
 };
 
 const FAKE_WORKER_SOURCE = `
+import { writeFileSync } from "node:fs";
 import path from "node:path";
 
 const args = process.argv.slice(2);
@@ -123,6 +130,13 @@ if (scenario.includes("capture-args")) {
 	});
 	send(assistant("Activity report.", firstUsage));
 	send({ type: "agent_end", messages: [] });
+} else if (scenario === "stalled") {
+	writeFileSync(path.join(process.cwd(), "stalled.pid"), String(process.pid), "utf8");
+	setTimeout(() => send(assistant("Worker eventually finished.", zeroUsage)), 500);
+} else if (scenario === "watchdog-reset") {
+	setTimeout(() => send({ type: "agent_start" }), 100);
+	setTimeout(() => send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Still working" } }), 400);
+	setTimeout(() => send(assistant("Frequent events prevented a stall.", zeroUsage)), 700);
 } else if (scenario === "failing") {
 	process.stderr.write("worker exploded\\n");
 	send(assistant("Partial report before failure.", firstUsage, "error", "provider failed"));
@@ -182,12 +196,14 @@ function request(
 	overrides: Partial<{
 		signal: AbortSignal | undefined;
 		onProgress: ((progress: WorkerRunProgress) => void) | undefined;
+		noProgressThresholdMs: number;
 	}> = {},
 ) {
 	return {
 		choice: WORKER_CHOICE,
 		promptPath,
 		cwd: tempDir,
+		noProgressThresholdMs: overrides.noProgressThresholdMs ?? DEFAULT_NO_PROGRESS_THRESHOLD_MS,
 		signal: overrides.signal ?? undefined,
 		onProgress: overrides.onProgress ?? undefined,
 	};
@@ -315,6 +331,44 @@ describe("child-process worker runner", () => {
 		]);
 		assert.equal(outcome.report.includes("--tools"), false);
 		assert.equal(outcome.report.includes("--append-system-prompt"), false);
+	});
+
+	it("reports a silent worker as stalled without terminating the child", async () => {
+		let childAliveWhenWatchdogFired = false;
+		let workerPid: number | undefined;
+		const outcome = await createTestRunner().run(
+			request(await createPrompt("stalled"), {
+				noProgressThresholdMs: 200,
+				onProgress: (progress) => {
+					if (progress.activity?.kind !== "stalled") return;
+					workerPid = Number(readFileSync(path.join(tempDir, "stalled.pid"), "utf8"));
+					spawnedPids.add(workerPid);
+					childAliveWhenWatchdogFired = processExists(workerPid);
+				},
+			}),
+		);
+
+		assert.equal(childAliveWhenWatchdogFired, true, "the watchdog must not end the worker");
+		assert.equal(outcome.aborted, false);
+		assert.equal(outcome.exitCode, 0);
+		assert.equal(outcome.report, "Worker eventually finished.");
+		if (workerPid !== undefined) spawnedPids.delete(workerPid);
+	});
+
+	it("resets the watchdog after each meaningful worker event", async () => {
+		const updates: WorkerRunProgress[] = [];
+		const outcome = await createTestRunner().run(
+			request(await createPrompt("watchdog-reset"), {
+				noProgressThresholdMs: 500,
+				onProgress: (progress) => updates.push(progress),
+			}),
+		);
+
+		assert.equal(outcome.report, "Frequent events prevented a stall.");
+		assert.equal(
+			updates.some((progress) => progress.activity?.kind === "stalled"),
+			false,
+		);
 	});
 
 	it("returns a non-zero worker exit and stderr as an outcome rather than throwing", async () => {

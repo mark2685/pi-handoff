@@ -8,6 +8,15 @@
 
 import type { ModelChoice } from "../domain/types.ts";
 
+/**
+ * The longest a worker may be quiet before the reviewing user is prompted.
+ *
+ * A quiet Pi can be waiting on a model request or a slow tool, so this is not a
+ * kill timeout. The child remains alive until the user presses Escape; the
+ * watchdog only reports the stall through the ordinary progress channel.
+ */
+export const DEFAULT_NO_PROGRESS_THRESHOLD_MS = 10 * 60 * 1_000;
+
 /** Aggregate usage reported by completed assistant messages from one worker run. */
 export interface WorkerUsage {
 	inputTokens: number;
@@ -36,7 +45,7 @@ export interface WorkerActiveTool {
 
 /** The worker phase inferred from Pi's live JSON event stream. */
 export type WorkerActivityKind =
-	"starting" | "thinking" | "writing" | "preparing_tool" | "running_tools" | "finalizing";
+	"starting" | "thinking" | "writing" | "preparing_tool" | "running_tools" | "finalizing" | "stalled";
 
 /**
  * A human-readable activity category, deliberately separate from the final report.
@@ -71,6 +80,13 @@ export interface WorkerRunRequest {
 	/** Full prompt-file path, constructed upstream with `buildPromptPath`. */
 	promptPath: string;
 	cwd: string;
+	/**
+	 * The quiet interval after which the adapter reports a stalled activity.
+	 *
+	 * Explicit rather than an adapter-hidden default so the run service and
+	 * running overlay describe the same policy, and tests can use a short interval.
+	 */
+	noProgressThresholdMs: number;
 	/** Optional because command-level Ctrl+C routing is owned by the later run service. */
 	signal: AbortSignal | undefined;
 	onProgress: ((progress: WorkerRunProgress) => void) | undefined;

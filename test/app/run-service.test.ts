@@ -98,6 +98,8 @@ interface HarnessOptions {
 	msReadings?: number[];
 	/** Skips Gate A's transitions, leaving the machine idle to test the refusal. */
 	startIdle?: boolean;
+	/** Replaces the production no-progress interval with a test-sized value. */
+	noProgressThresholdMs?: number;
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -156,6 +158,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		git,
 		clock,
 		recorder,
+		...(options.noProgressThresholdMs === undefined ? {} : { noProgressThresholdMs: options.noProgressThresholdMs }),
 	});
 
 	return { service, machine, recorded, requests, events, progress, runnable: () => options.runnable ?? true };
@@ -247,6 +250,14 @@ describe("RunService.start", () => {
 		await start(harness);
 
 		assert.ok(harness.requests[0]?.signal instanceof AbortSignal);
+	});
+
+	it("passes the configured no-progress interval to the worker and exposes it to the overlay", async () => {
+		const harness = createHarness({ noProgressThresholdMs: 25 });
+		await start(harness);
+
+		assert.equal(harness.requests[0]?.noProgressThresholdMs, 25);
+		assert.equal(harness.service.noProgressThresholdMs(), 25);
 	});
 
 	it("forwards worker progress with an elapsed reading for the widget", async () => {

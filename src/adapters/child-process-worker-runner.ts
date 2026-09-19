@@ -256,6 +256,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 				let settled = false;
 				let buffer = "";
 				let abortTimer: ReturnType<typeof setTimeout> | undefined;
+				let noProgressTimer: ReturnType<typeof setTimeout> | undefined;
 				let processHandle: ReturnType<typeof spawn> | undefined;
 
 				const makeOutcome = (exitCode: number | undefined): WorkerRunOutcome => ({
@@ -281,6 +282,10 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (settled) return;
 					settled = true;
 					if (abortTimer !== undefined) clearTimeout(abortTimer);
+					// This is especially important for short-lived workers: the watchdog is
+					// a prompt, not a process owner, and must not keep Node's event loop alive
+					// after the child has already exited.
+					if (noProgressTimer !== undefined) clearTimeout(noProgressTimer);
 					request.signal?.removeEventListener("abort", onAbort);
 					removeListeners();
 					resolve(makeOutcome(exitCode));
@@ -293,6 +298,23 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					abortTimer = setTimeout(() => {
 						if (!settled) processHandle?.kill("SIGKILL");
 					}, abortGracePeriodMs);
+				};
+
+				/**
+				 * Re-arms the human-facing no-progress watchdog after a real worker event.
+				 *
+				 * Pi legitimately goes quiet during model requests and slow tools, so expiry
+				 * deliberately emits a stalled activity and never calls `stopProcess`. Escape
+				 * remains the only route that terminates a child.
+				 */
+				const resetNoProgressTimer = () => {
+					if (noProgressTimer !== undefined) clearTimeout(noProgressTimer);
+					noProgressTimer = setTimeout(() => {
+						noProgressTimer = undefined;
+						if (settled) return;
+						setActivity({ kind: "stalled" });
+						emitProgress(true);
+					}, request.noProgressThresholdMs);
 				};
 
 				/** Updates activity and says whether its displayable state actually changed. */
@@ -345,17 +367,20 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (!isRecord(event) || typeof event.type !== "string") return;
 
 					if (event.type === "agent_start" || event.type === "turn_start") {
+						resetNoProgressTimer();
 						emitProgress(setActivity({ kind: "thinking" }));
 						return;
 					}
 
 					if (event.type === "agent_end") {
+						resetNoProgressTimer();
 						emitProgress(setActivity({ kind: "finalizing" }));
 						return;
 					}
 
 					if (event.type === "message_start") {
 						if (parseAssistantMessage(event.message) !== undefined) {
+							resetNoProgressTimer();
 							emitProgress(setActivity({ kind: "thinking" }));
 						}
 						return;
@@ -371,6 +396,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 						else if (kind === "thinking_delta") nextActivity = { kind: "thinking" };
 						else if (kind === "text_delta") nextActivity = { kind: "writing" };
 						else return;
+						resetNoProgressTimer();
 						emitProgress(setActivity(nextActivity));
 						return;
 					}
@@ -379,6 +405,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 						const tool = parseActiveTool(event);
 						if (tool === undefined) return;
 						activeTools.set(tool.toolCallId, tool);
+						resetNoProgressTimer();
 						setActivity({ kind: "running_tools", toolName: tool.toolName });
 						emitProgress(true);
 						return;
@@ -387,6 +414,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (event.type === "tool_execution_update") {
 						const tool = parseActiveTool(event);
 						if (tool === undefined) return;
+						resetNoProgressTimer();
 						emitProgress(setActivity({ kind: "running_tools", toolName: tool.toolName }));
 						return;
 					}
@@ -394,6 +422,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (event.type === "tool_execution_end") {
 						const tool = parseActiveTool(event);
 						if (tool === undefined) return;
+						resetNoProgressTimer();
 						activeTools.delete(tool.toolCallId);
 						setActivity({ kind: "thinking" });
 						emitProgress(true);
@@ -403,6 +432,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (event.type === "message_end") {
 						const message = parseAssistantMessage(event.message);
 						if (message !== undefined) {
+							resetNoProgressTimer();
 							assistantMessages.push(message);
 							usage.turns += 1;
 							if (message.usage) {
@@ -423,6 +453,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 
 						const toolResult = parseToolResult(event.message);
 						if (toolResult !== undefined && addToolResult(toolResult)) {
+							resetNoProgressTimer();
 							setActivity({ kind: "thinking" });
 							emitProgress(true);
 						}
@@ -434,6 +465,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					if (event.type === "tool_result_end") {
 						const toolResult = parseToolResult(event.message);
 						if (toolResult === undefined || !addToolResult(toolResult)) return;
+						resetNoProgressTimer();
 						setActivity({ kind: "thinking" });
 						emitProgress(true);
 					}
@@ -480,6 +512,9 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 				processHandle.stderr?.on("data", onStderr);
 				processHandle.on("close", onClose);
 				processHandle.on("error", onError);
+				// Arm only after the pipes are observed; an immediate child event is buffered
+				// by Node and will reset this timer when its lifecycle record is processed.
+				resetNoProgressTimer();
 				request.signal?.addEventListener("abort", onAbort, { once: true });
 				if (request.signal?.aborted) onAbort();
 			});

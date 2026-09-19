@@ -329,7 +329,12 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 				const rendered = await runWithWidget(
 					ctx,
-					{ slug: current.slug, choice: current.choice, promptPath: current.promptPath },
+					{
+						slug: current.slug,
+						choice: current.choice,
+						promptPath: current.promptPath,
+						noProgressThresholdMs: runService.noProgressThresholdMs(),
+					},
 					{ nowMs: () => clock.nowMs(), onAbort: () => runService.abortActiveRun() },
 					(onProgress) =>
 						reviewService.sendFeedback({

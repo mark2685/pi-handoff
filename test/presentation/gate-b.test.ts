@@ -560,6 +560,7 @@ describe("formatRunningHeaderLines", () => {
 		slug: "add-retry-logic",
 		choice: CHOICE,
 		promptPath: "/tmp/pi-handoff-add-retry-logic.md",
+		noProgressThresholdMs: 600_000,
 		bluf: "Add bounded retries so transient failures recover.",
 		definitionOfDone: ["Retries are bounded", "Focused tests pass", "Docs explain the behavior"],
 	};
@@ -612,7 +613,7 @@ describe("isAbortKey", () => {
 describe("formatRunningLines", () => {
 	it("shows elapsed time", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{ elapsedMs: 83_000, progress: undefined, stopping: false },
 		);
 		assert.ok(lines.includes("Elapsed:   1m 23s"));
@@ -620,7 +621,7 @@ describe("formatRunningLines", () => {
 
 	it("reports no metrics before the first worker event", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{ elapsedMs: 0, progress: undefined, stopping: false },
 		);
 		assert.ok(lines.includes("Tokens:    none yet"));
@@ -629,9 +630,46 @@ describe("formatRunningLines", () => {
 
 	it("makes a silent worker explicit instead of implying that it is progressing", () => {
 		assert.equal(
-			formatWorkerStatusLine({ elapsedMs: 83_000, progress: undefined, stopping: false }),
+			formatWorkerStatusLine({
+				elapsedMs: 83_000,
+				progress: undefined,
+				stopping: false,
+				noProgressThresholdMs: 600_000,
+			}),
 			"Status:    ◌ Starting worker — no events yet (1m 23s)",
 		);
+	});
+
+	it("makes a no-progress watchdog prompt explicit without claiming the worker stopped", () => {
+		const lines = formatRunningLines(
+			{
+				slug: "add-retry-logic",
+				choice: CHOICE,
+				promptPath: "/tmp/p.md",
+				noProgressThresholdMs: 600_000,
+			},
+			{
+				elapsedMs: 600_000,
+				progress: {
+					report: "",
+					usage: USAGE,
+					toolResults: [],
+					stopReason: undefined,
+					errorMessage: undefined,
+					activity: { kind: "stalled" },
+					activeTools: [{ toolCallId: "stalled-bash", toolName: "bash" }],
+					elapsedMs: 0,
+				},
+				stopping: false,
+			},
+		);
+
+		assert.ok(
+			lines.includes(
+				"Status:    ⚠ No worker event for 10m 00s while running 1 tool: bash · last event 10m 00s ago — it may still be working; press esc to stop or wait",
+			),
+		);
+		assert.ok(lines.includes("esc  stop the worker · or keep waiting"));
 	});
 
 	it("names active tools and the age of the last worker event", () => {
@@ -652,6 +690,7 @@ describe("formatRunningLines", () => {
 					elapsedMs: 5_000,
 				},
 				stopping: false,
+				noProgressThresholdMs: 600_000,
 			}),
 			"Status:    ↻ Running 2 tools: bash, read · last event 1m 02s ago",
 		);
@@ -672,6 +711,7 @@ describe("formatRunningLines", () => {
 					elapsedMs: 5_000,
 				},
 				stopping: false,
+				noProgressThresholdMs: 600_000,
 			}),
 			"Status:    ● Thinking · last event just now",
 		);
@@ -679,7 +719,7 @@ describe("formatRunningLines", () => {
 
 	it("shows turns, tokens, and cost once the worker reports them", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{
 				elapsedMs: 1_000,
 				progress: {
@@ -705,7 +745,7 @@ describe("formatRunningLines", () => {
 			isError: false,
 		}));
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{
 				elapsedMs: 1_000,
 				progress: {
@@ -736,6 +776,7 @@ describe("formatRunningLines", () => {
 				slug: "add-retry-logic",
 				choice: CHOICE,
 				promptPath: "/tmp/pi-handoff-add-retry-logic.md",
+				noProgressThresholdMs: 600_000,
 				bluf: "A deliberately long bottom line that must not wrap past the available widget body width.",
 				definitionOfDone: ["Retries are bounded", "Focused tests pass", "Docs explain the behavior"],
 			},
@@ -763,7 +804,7 @@ describe("formatRunningLines", () => {
 
 	it("truncates untrusted long tool names to the widget content width", () => {
 		const lines = formatRunningLines(
-			{ slug: "handoff", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "handoff", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{
 				elapsedMs: 0,
 				progress: {
@@ -792,7 +833,7 @@ describe("formatRunningLines", () => {
 
 	it("marks a failed tool call", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{
 				elapsedMs: 1_000,
 				progress: {
@@ -811,7 +852,7 @@ describe("formatRunningLines", () => {
 
 	it("offers the abort key while running", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{ elapsedMs: 0, progress: undefined, stopping: false },
 		);
 		assert.ok(lines.includes("esc  stop the worker"));
@@ -819,7 +860,7 @@ describe("formatRunningLines", () => {
 
 	it("reports that a stop is in progress rather than still offering it", () => {
 		const lines = formatRunningLines(
-			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md" },
+			{ slug: "add-retry-logic", choice: CHOICE, promptPath: "/tmp/p.md", noProgressThresholdMs: 600_000 },
 			{ elapsedMs: 0, progress: undefined, stopping: true },
 		);
 		assert.ok(lines.includes("Stopping the worker…"));

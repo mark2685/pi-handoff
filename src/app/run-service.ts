@@ -54,7 +54,7 @@ import { err, ok, type Result } from "../domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Git, GitFailure } from "../ports/git.ts";
-import type { WorkerRunProgress, WorkerRunner } from "../ports/worker-runner.ts";
+import { DEFAULT_NO_PROGRESS_THRESHOLD_MS, type WorkerRunProgress, type WorkerRunner } from "../ports/worker-runner.ts";
 import type {
 	HandoffCompletedReviewingState,
 	HandoffConflict,
@@ -190,6 +190,13 @@ export interface RunServiceDeps {
 	git: Git;
 	clock: Clock;
 	recorder: HandoffStateRecorder;
+	/**
+	 * Quiet interval passed to the child adapter and shown by the running overlay.
+	 *
+	 * This never kills a child. It only makes an otherwise silent worker actionable
+	 * for the reviewing user, who remains the sole authority to abort it.
+	 */
+	noProgressThresholdMs?: number;
 }
 
 export interface RunService {
@@ -222,6 +229,8 @@ export interface RunService {
 	 * period, so a caller that needs the child to be gone must await `whenSettled`.
 	 */
 	abortActiveRun(): boolean;
+	/** Returns the quiet interval used by the current run and its running overlay. */
+	noProgressThresholdMs(): number;
 	/** True while a child is running, so a shutdown hook can decide to wait. */
 	isRunning(): boolean;
 	/**
@@ -339,6 +348,7 @@ export function classifyOutcome(outcome: {
 /** Wires a worker run to the machine, Git, and the clock behind their ports. */
 export function createRunService(deps: RunServiceDeps): RunService {
 	const { machine, runner, git, clock, recorder } = deps;
+	const noProgressThresholdMs = deps.noProgressThresholdMs ?? DEFAULT_NO_PROGRESS_THRESHOLD_MS;
 
 	/** The controller for the run in flight, and the reason a caller can stop it. */
 	let activeController: AbortController | undefined;
@@ -395,6 +405,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 				choice: input.choice,
 				promptPath: input.promptPath,
 				cwd: input.cwd,
+				noProgressThresholdMs,
 				signal: controller.signal,
 				onProgress:
 					input.onProgress === undefined
@@ -619,6 +630,10 @@ export function createRunService(deps: RunServiceDeps): RunService {
 					onProgress: options.onProgress,
 				}),
 			);
+		},
+
+		noProgressThresholdMs(): number {
+			return noProgressThresholdMs;
 		},
 
 		abortActiveRun(): boolean {

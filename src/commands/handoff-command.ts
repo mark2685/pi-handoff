@@ -378,6 +378,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				promptPath: view.promptPath,
 				...(view.draft.bluf === undefined ? {} : { bluf: view.draft.bluf }),
 				...(view.draft.definitionOfDone === undefined ? {} : { definitionOfDone: view.draft.definitionOfDone }),
+				noProgressThresholdMs: runService.noProgressThresholdMs(),
 			},
 			{ nowMs: () => clock.nowMs(), onAbort: () => runService.abortActiveRun() },
 			(onProgress) =>

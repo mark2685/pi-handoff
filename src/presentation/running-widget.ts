@@ -59,6 +59,8 @@ export interface RunningWidgetView {
 	promptPath: string;
 	bluf?: string;
 	definitionOfDone?: string[];
+	/** The child adapter's quiet interval, repeated here so the prompt names the real policy. */
+	noProgressThresholdMs: number;
 }
 
 /** Returns the width available to a Text body after its left and right margins. */
@@ -123,6 +125,7 @@ export function formatWorkerStatusLine(state: {
 	elapsedMs: number;
 	progress: RunProgress | undefined;
 	stopping: boolean;
+	noProgressThresholdMs: number;
 }): string {
 	if (state.stopping) return "Status:    ⏳ Stopping worker — waiting for it to exit";
 
@@ -133,6 +136,14 @@ export function formatWorkerStatusLine(state: {
 
 	const updateAge = formatUpdateAge(Math.max(0, state.elapsedMs - progress.elapsedMs));
 	const activeTools = progress.activeTools ?? [];
+	if (progress.activity?.kind === "stalled") {
+		const activeToolContext =
+			activeTools.length === 0
+				? ""
+				: ` while running ${activeTools.length} ${activeTools.length === 1 ? "tool" : "tools"}: ${activeTools.map((tool) => tool.toolName).join(", ")}`;
+		return `Status:    ⚠ No worker event for ${formatElapsed(state.noProgressThresholdMs)}${activeToolContext} · last event ${updateAge} — it may still be working; press esc to stop or wait`;
+	}
+
 	if (activeTools.length > 0) {
 		const names = activeTools.map((tool) => tool.toolName).join(", ");
 		return `Status:    ↻ Running ${activeTools.length} ${activeTools.length === 1 ? "tool" : "tools"}: ${names} · last event ${updateAge}`;
@@ -180,7 +191,7 @@ export function formatRunningLines(
 	const usage = state.progress?.usage;
 	const lines = [
 		...formatRunningHeaderLines(view, width, definitionOfDoneItems),
-		formatWorkerStatusLine(state),
+		formatWorkerStatusLine({ ...state, noProgressThresholdMs: view.noProgressThresholdMs }),
 		`Elapsed:   ${formatElapsed(state.elapsedMs)}`,
 		`Turns:     ${usage === undefined ? 0 : usage.turns}`,
 		`Tokens:    ${usage === undefined ? "none yet" : formatTokenSummary(usage)}`,
@@ -195,7 +206,13 @@ export function formatRunningLines(
 	}
 
 	lines.push("");
-	lines.push(state.stopping ? "Stopping the worker…" : "esc  stop the worker");
+	lines.push(
+		state.stopping
+			? "Stopping the worker…"
+			: state.progress?.activity?.kind === "stalled"
+				? "esc  stop the worker · or keep waiting"
+				: "esc  stop the worker",
+	);
 
 	// Tool names originate outside the extension and can be arbitrarily long. Every
 	// body line therefore needs the same visible-width cap as the metadata header:
