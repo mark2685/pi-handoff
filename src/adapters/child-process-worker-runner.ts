@@ -11,6 +11,8 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type {
+	WorkerActiveTool,
+	WorkerActivity,
 	WorkerRunOutcome,
 	WorkerRunProgress,
 	WorkerRunRequest,
@@ -21,6 +23,9 @@ import type {
 
 /** Time given to a cooperative worker after SIGTERM before SIGKILL is sent. */
 export const DEFAULT_ABORT_GRACE_PERIOD_MS = 5_000;
+
+/** Cap redraw-producing updates from streaming text and tool output without hiding state changes. */
+const MIN_PROGRESS_UPDATE_INTERVAL_MS = 250;
 
 /** Command and argument vector used to launch Pi or an injected test worker. */
 export interface PiInvocation {
@@ -145,6 +150,18 @@ function parseAssistantMessage(value: unknown): AssistantMessage | undefined {
 	};
 }
 
+/** Reads the stable identity fields from a tool execution lifecycle event. */
+function parseActiveTool(value: unknown): WorkerActiveTool | undefined {
+	if (!isRecord(value) || typeof value.toolCallId !== "string" || typeof value.toolName !== "string") return undefined;
+	return { toolCallId: value.toolCallId, toolName: value.toolName };
+}
+
+/** Reads the tool name Pi includes in a streaming toolcall_start event. */
+function toolNameFromAssistantEvent(value: unknown): string | undefined {
+	if (!isRecord(value) || value.type !== "toolcall_start" || typeof value.toolName !== "string") return undefined;
+	return value.toolName;
+}
+
 /** Normalizes a completed tool result for the later running-widget adapter consumer. */
 function parseToolResult(value: unknown): WorkerToolResult | undefined {
 	if (!isRecord(value) || value.role !== "toolResult") return undefined;
@@ -226,6 +243,10 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 			const usage = emptyUsage();
 			const assistantMessages: AssistantMessage[] = [];
 			const toolResults: WorkerToolResult[] = [];
+			const completedToolCallIds = new Set<string>();
+			const activeTools = new Map<string, WorkerActiveTool>();
+			let activity: WorkerActivity = { kind: "starting" };
+			let lastProgressAtMs = Number.NEGATIVE_INFINITY;
 			let stopReason: string | undefined;
 			let errorMessage: string | undefined;
 			let stderr = "";
@@ -274,14 +295,27 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					}, abortGracePeriodMs);
 				};
 
-				const emitProgress = () => {
+				/** Updates activity and says whether its displayable state actually changed. */
+				const setActivity = (next: WorkerActivity): boolean => {
+					const changed = activity.kind !== next.kind || activity.toolName !== next.toolName;
+					activity = next;
+					return changed;
+				};
+
+				/** Sends phase changes immediately but coalesces high-frequency token and tool-output updates. */
+				const emitProgress = (force = false) => {
 					if (!request.onProgress || settled) return;
+					const nowMs = Date.now();
+					if (!force && nowMs - lastProgressAtMs < MIN_PROGRESS_UPDATE_INTERVAL_MS) return;
+					lastProgressAtMs = nowMs;
 					const progress: WorkerRunProgress = {
 						report: getFinalOutput(assistantMessages),
 						usage: copyUsage(usage),
 						toolResults: toolResults.map((result) => ({ ...result })),
 						stopReason,
 						errorMessage,
+						activity: { ...activity },
+						activeTools: Array.from(activeTools.values(), (tool) => ({ ...tool })),
 					};
 					try {
 						request.onProgress(progress);
@@ -289,6 +323,14 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 						errorMessage ??= `Worker progress callback failed: ${errorText(error)}`;
 						stopProcess(false);
 					}
+				};
+
+				/** Avoid duplicate tool rows when Pi emits both lifecycle and message-end records. */
+				const addToolResult = (toolResult: WorkerToolResult) => {
+					if (completedToolCallIds.has(toolResult.toolCallId)) return false;
+					completedToolCallIds.add(toolResult.toolCallId);
+					toolResults.push(toolResult);
+					return true;
 				};
 
 				const processLine = (line: string) => {
@@ -302,31 +344,98 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					}
 					if (!isRecord(event) || typeof event.type !== "string") return;
 
-					if (event.type === "message_end") {
-						const message = parseAssistantMessage(event.message);
-						if (!message) return;
-
-						assistantMessages.push(message);
-						usage.turns += 1;
-						if (message.usage) {
-							usage.inputTokens += message.usage.input;
-							usage.outputTokens += message.usage.output;
-							usage.cacheReadTokens += message.usage.cacheRead;
-							usage.cacheWriteTokens += message.usage.cacheWrite;
-							usage.cost += message.usage.cost;
-							usage.contextTokens = message.usage.contextTokens;
-						}
-						if (message.stopReason !== undefined) stopReason = message.stopReason;
-						if (message.errorMessage !== undefined) errorMessage = message.errorMessage;
-						emitProgress();
+					if (event.type === "agent_start" || event.type === "turn_start") {
+						emitProgress(setActivity({ kind: "thinking" }));
 						return;
 					}
 
+					if (event.type === "agent_end") {
+						emitProgress(setActivity({ kind: "finalizing" }));
+						return;
+					}
+
+					if (event.type === "message_start") {
+						if (parseAssistantMessage(event.message) !== undefined) {
+							emitProgress(setActivity({ kind: "thinking" }));
+						}
+						return;
+					}
+
+					if (event.type === "message_update") {
+						const assistantEvent = event.assistantMessageEvent;
+						const toolName = toolNameFromAssistantEvent(assistantEvent);
+						const kind =
+							isRecord(assistantEvent) && typeof assistantEvent.type === "string" ? assistantEvent.type : undefined;
+						let nextActivity: WorkerActivity | undefined;
+						if (toolName !== undefined) nextActivity = { kind: "preparing_tool", toolName };
+						else if (kind === "thinking_delta") nextActivity = { kind: "thinking" };
+						else if (kind === "text_delta") nextActivity = { kind: "writing" };
+						else return;
+						emitProgress(setActivity(nextActivity));
+						return;
+					}
+
+					if (event.type === "tool_execution_start") {
+						const tool = parseActiveTool(event);
+						if (tool === undefined) return;
+						activeTools.set(tool.toolCallId, tool);
+						setActivity({ kind: "running_tools", toolName: tool.toolName });
+						emitProgress(true);
+						return;
+					}
+
+					if (event.type === "tool_execution_update") {
+						const tool = parseActiveTool(event);
+						if (tool === undefined) return;
+						emitProgress(setActivity({ kind: "running_tools", toolName: tool.toolName }));
+						return;
+					}
+
+					if (event.type === "tool_execution_end") {
+						const tool = parseActiveTool(event);
+						if (tool === undefined) return;
+						activeTools.delete(tool.toolCallId);
+						setActivity({ kind: "thinking" });
+						emitProgress(true);
+						return;
+					}
+
+					if (event.type === "message_end") {
+						const message = parseAssistantMessage(event.message);
+						if (message !== undefined) {
+							assistantMessages.push(message);
+							usage.turns += 1;
+							if (message.usage) {
+								usage.inputTokens += message.usage.input;
+								usage.outputTokens += message.usage.output;
+								usage.cacheReadTokens += message.usage.cacheRead;
+								usage.cacheWriteTokens += message.usage.cacheWrite;
+								usage.cost += message.usage.cost;
+								usage.contextTokens = message.usage.contextTokens;
+							}
+							if (message.stopReason !== undefined) stopReason = message.stopReason;
+							if (message.errorMessage !== undefined) errorMessage = message.errorMessage;
+							emitProgress(
+								setActivity(message.stopReason === "toolUse" ? { kind: "preparing_tool" } : { kind: "writing" }),
+							);
+							return;
+						}
+
+						const toolResult = parseToolResult(event.message);
+						if (toolResult !== undefined && addToolResult(toolResult)) {
+							setActivity({ kind: "thinking" });
+							emitProgress(true);
+						}
+						return;
+					}
+
+					// pi 0.85 emitted a dedicated event, while current JSON mode emits the
+					// same tool-result message through message_end. Accept both shapes.
 					if (event.type === "tool_result_end") {
 						const toolResult = parseToolResult(event.message);
-						if (!toolResult) return;
-						toolResults.push(toolResult);
-						emitProgress();
+						if (toolResult === undefined || !addToolResult(toolResult)) return;
+						setActivity({ kind: "thinking" });
+						emitProgress(true);
 					}
 				};
 

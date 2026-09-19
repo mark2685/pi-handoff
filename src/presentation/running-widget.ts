@@ -47,8 +47,11 @@ const WIDGET_FIXED_ROWS = 22;
 /** Horizontal padding Text adds on either side of the live body. */
 const WIDGET_BODY_PADDING_X = 1;
 
-/** How often the elapsed-time line is refreshed while the worker is quiet. */
-const TICK_INTERVAL_MS = 1_000;
+/** How often the worker pulse and elapsed-time/status age are refreshed while the worker is quiet. */
+const TICK_INTERVAL_MS = 120;
+
+/** The same dim-to-accent-to-terminal-foreground pulse used by the Hadrian theme's working indicator. */
+const STATUS_INDICATOR_FRAMES = ["·", "•", "●", "●", "●", "•"] as const;
 
 export interface RunningWidgetView {
 	slug: string;
@@ -105,9 +108,61 @@ export function formatRunningHeaderLines(
 	return lines.map((line) => truncateToWidth(line, maximum, "…"));
 }
 
-/** Formats one tool call for the recent-activity list. */
+/** Formats one completed tool call for the recent-activity list. */
 function toolCallLine(result: { toolName: string; isError: boolean }): string {
 	return `  ${result.isError ? "✗" : "✓"} ${result.toolName}`;
+}
+
+/** Formats an elapsed age in language that does not imply a silent worker is progressing. */
+function formatUpdateAge(elapsedMs: number): string {
+	return elapsedMs < 1_000 ? "just now" : `${formatElapsed(elapsedMs)} ago`;
+}
+
+/** Produces the compact status row that replaces the old spacer below the run metadata. */
+export function formatWorkerStatusLine(state: {
+	elapsedMs: number;
+	progress: RunProgress | undefined;
+	stopping: boolean;
+}): string {
+	if (state.stopping) return "Status:    ⏳ Stopping worker — waiting for it to exit";
+
+	const progress = state.progress;
+	if (progress === undefined) {
+		return `Status:    ◌ Starting worker — no events yet (${formatElapsed(state.elapsedMs)})`;
+	}
+
+	const updateAge = formatUpdateAge(Math.max(0, state.elapsedMs - progress.elapsedMs));
+	const activeTools = progress.activeTools ?? [];
+	if (activeTools.length > 0) {
+		const names = activeTools.map((tool) => tool.toolName).join(", ");
+		return `Status:    ↻ Running ${activeTools.length} ${activeTools.length === 1 ? "tool" : "tools"}: ${names} · last event ${updateAge}`;
+	}
+
+	const activity = progress.activity;
+	let detail: string;
+	switch (activity?.kind) {
+		case "thinking":
+			detail = "Thinking";
+			break;
+		case "writing":
+			detail = "Writing a response";
+			break;
+		case "preparing_tool":
+			detail = activity.toolName === undefined ? "Preparing a tool" : `Preparing ${activity.toolName}`;
+			break;
+		case "finalizing":
+			detail = "Finalizing";
+			break;
+		case "running_tools":
+			detail = activity.toolName === undefined ? "Running a tool" : `Running ${activity.toolName}`;
+			break;
+		case "starting":
+			detail = "Starting worker";
+			break;
+		default:
+			detail = "Worker reported progress";
+	}
+	return `Status:    ● ${detail} · last event ${updateAge}`;
 }
 
 /**
@@ -125,7 +180,7 @@ export function formatRunningLines(
 	const usage = state.progress?.usage;
 	const lines = [
 		...formatRunningHeaderLines(view, width, definitionOfDoneItems),
-		"",
+		formatWorkerStatusLine(state),
 		`Elapsed:   ${formatElapsed(state.elapsedMs)}`,
 		`Turns:     ${usage === undefined ? 0 : usage.turns}`,
 		`Tokens:    ${usage === undefined ? "none yet" : formatTokenSummary(usage)}`,
@@ -182,7 +237,7 @@ export function createRunningWidget(
 	options: { nowMs: () => number; startedAtMs: number; onAbort: () => void },
 ): RunningWidget {
 	const container = new Container() as RunningWidget;
-	const title = new Text(theme.fg("accent", theme.bold("Worker running")), 1, 0);
+	const title = new Text("", 1, 0);
 	const body = new Text("", WIDGET_BODY_PADDING_X, 0);
 	container.addChild(title);
 	container.addChild(new Spacer(1));
@@ -190,25 +245,50 @@ export function createRunningWidget(
 
 	let progress: RunProgress | undefined;
 	let stopping = false;
+	let pulseIndex = 0;
+
+	/** Chooses a theme token for the pulse without using status colors for ordinary work. */
+	const indicator = () => {
+		const frame = STATUS_INDICATOR_FRAMES[pulseIndex % STATUS_INDICATOR_FRAMES.length] ?? "●";
+		if (frame === "·") return theme.fg("dim", frame);
+		if (frame === "•") return theme.fg("muted", frame);
+		if (pulseIndex % STATUS_INDICATOR_FRAMES.length === 3) return theme.bold(frame);
+		return theme.fg("accent", frame);
+	};
 
 	/** Repaints the body from current state and asks the TUI to draw it. */
 	const repaint = () => {
+		const state = {
+			elapsedMs: options.nowMs() - options.startedAtMs,
+			progress,
+			stopping,
+		};
 		const lines = formatRunningLines(
 			view,
-			{
-				elapsedMs: options.nowMs() - options.startedAtMs,
-				progress,
-				stopping,
-			},
+			state,
 			bodyContentWidth(tui.terminal.columns),
 			definitionOfDoneLimit(tui.terminal.rows),
 		);
-		body.setText(lines.map((line) => theme.fg(line.startsWith("  ") ? "dim" : "text", line)).join("\n"));
+		title.setText(`${indicator()} ${theme.fg("text", theme.bold("Worker running"))}`);
+		body.setText(
+			lines
+				.map((line) => {
+					if (!line.startsWith("Status:    ")) return theme.fg(line.startsWith("  ") ? "dim" : "text", line);
+					const detail = line.slice("Status:    ".length);
+					const token = stopping || detail.startsWith("◌") ? "warning" : "accent";
+					return `${theme.fg("muted", "Status:    ")}${theme.fg(token, detail.slice(0, 1))}${theme.fg("text", detail.slice(1))}`;
+				})
+				.join("\n"),
+		);
 		tui.requestRender();
 	};
 
-	// The timer keeps elapsed time moving while the worker produces no events.
-	const timer = setInterval(repaint, TICK_INTERVAL_MS);
+	// The pulse keeps the worker visibly alive even while it has no new JSON events;
+	// the status row separately says exactly how long it has been since the last one.
+	const timer = setInterval(() => {
+		pulseIndex += 1;
+		repaint();
+	}, TICK_INTERVAL_MS);
 
 	container.update = (next: RunProgress) => {
 		progress = next;

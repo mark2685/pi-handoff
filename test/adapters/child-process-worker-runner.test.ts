@@ -101,6 +101,28 @@ if (scenario.includes("capture-args")) {
 	const splitAt = Math.floor(line.length / 2);
 	process.stdout.write(line.slice(0, splitAt));
 	setTimeout(() => process.stdout.write(line.slice(splitAt)), 25);
+} else if (scenario === "activity") {
+	send({ type: "agent_start" });
+	send({ type: "turn_start" });
+	send({ type: "message_start", message: { role: "assistant", content: [] } });
+	send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Reasoning" } });
+	send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Working" } });
+	send({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", id: "tool-activity", toolName: "bash" } });
+	send({ type: "tool_execution_start", toolCallId: "tool-activity", toolName: "bash", args: {} });
+	send({ type: "tool_execution_update", toolCallId: "tool-activity", toolName: "bash", args: {}, partialResult: {} });
+	send({ type: "tool_execution_end", toolCallId: "tool-activity", toolName: "bash", result: {}, isError: false });
+	send({
+		type: "message_end",
+		message: {
+			role: "toolResult",
+			toolCallId: "tool-activity",
+			toolName: "bash",
+			content: [{ type: "text", text: "done" }],
+			isError: false,
+		},
+	});
+	send(assistant("Activity report.", firstUsage));
+	send({ type: "agent_end", messages: [] });
 } else if (scenario === "failing") {
 	process.stderr.write("worker exploded\\n");
 	send(assistant("Partial report before failure.", firstUsage, "error", "provider failed"));
@@ -219,7 +241,35 @@ describe("child-process worker runner", () => {
 			toolResults: [],
 			stopReason: "toolUse",
 			errorMessage: undefined,
+			activity: { kind: "preparing_tool" },
+			activeTools: [],
 		});
+	});
+
+	it("turns worker lifecycle events into live phases and active-tool status", async () => {
+		const updates: WorkerRunProgress[] = [];
+		const outcome = await createTestRunner().run(
+			request(await createPrompt("activity"), { onProgress: (progress) => updates.push(progress) }),
+		);
+
+		assert.equal(outcome.report, "Activity report.");
+		assert.ok(updates.some((progress) => progress.activity?.kind === "thinking"));
+		assert.ok(updates.some((progress) => progress.activity?.kind === "writing"));
+		assert.ok(
+			updates.some((progress) => progress.activity?.kind === "preparing_tool" && progress.activity.toolName === "bash"),
+		);
+		assert.ok(
+			updates.some(
+				(progress) =>
+					progress.activity?.kind === "running_tools" &&
+					progress.activeTools?.length === 1 &&
+					progress.activeTools[0]?.toolName === "bash",
+			),
+		);
+		assert.equal(updates.at(-1)?.activity?.kind, "finalizing");
+		assert.deepEqual(updates.at(-1)?.toolResults, [
+			{ toolCallId: "tool-activity", toolName: "bash", text: "done", isError: false },
+		]);
 	});
 
 	it("parses a JSON event whose stdout line is genuinely split across writes", async () => {

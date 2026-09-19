@@ -28,13 +28,41 @@ export interface WorkerToolResult {
 	isError: boolean;
 }
 
-/** Incremental state sent synchronously after a worker message or tool result is accumulated. */
+/** A tool Pi has begun but not yet reported as finished. */
+export interface WorkerActiveTool {
+	toolCallId: string;
+	toolName: string;
+}
+
+/** The worker phase inferred from Pi's live JSON event stream. */
+export type WorkerActivityKind =
+	"starting" | "thinking" | "writing" | "preparing_tool" | "running_tools" | "finalizing";
+
+/**
+ * A human-readable activity category, deliberately separate from the final report.
+ *
+ * Pi can be silent for a long time during a model request or tool call. The running
+ * overlay uses this value together with its last-update age to distinguish a known
+ * phase from an absent worker event, without claiming that a silent process is
+ * making progress.
+ */
+export interface WorkerActivity {
+	kind: WorkerActivityKind;
+	/** Present when Pi named a tool before its execution event arrived. */
+	toolName?: string;
+}
+
+/** Incremental state sent after a meaningful worker lifecycle event. */
 export interface WorkerRunProgress {
 	report: string;
 	usage: WorkerUsage;
 	toolResults: readonly WorkerToolResult[];
 	stopReason: string | undefined;
 	errorMessage: string | undefined;
+	/** Omitted by older runners; the process adapter always supplies it. */
+	activity?: WorkerActivity;
+	/** Omitted by older runners; populated from tool_execution_start/end events. */
+	activeTools?: readonly WorkerActiveTool[];
 }
 
 /** Input needed to run one already-approved handoff prompt. */

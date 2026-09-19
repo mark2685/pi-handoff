@@ -41,6 +41,7 @@ import {
 	definitionOfDoneLimit,
 	formatRunningHeaderLines,
 	formatRunningLines,
+	formatWorkerStatusLine,
 	isAbortKey,
 } from "../../src/presentation/running-widget.ts";
 
@@ -612,6 +613,56 @@ describe("formatRunningLines", () => {
 		);
 		assert.ok(lines.includes("Tokens:    none yet"));
 		assert.ok(lines.includes("Turns:     0"));
+	});
+
+	it("makes a silent worker explicit instead of implying that it is progressing", () => {
+		assert.equal(
+			formatWorkerStatusLine({ elapsedMs: 83_000, progress: undefined, stopping: false }),
+			"Status:    ◌ Starting worker — no events yet (1m 23s)",
+		);
+	});
+
+	it("names active tools and the age of the last worker event", () => {
+		assert.equal(
+			formatWorkerStatusLine({
+				elapsedMs: 67_000,
+				progress: {
+					report: "",
+					usage: USAGE,
+					toolResults: [],
+					stopReason: undefined,
+					errorMessage: undefined,
+					activity: { kind: "running_tools" },
+					activeTools: [
+						{ toolCallId: "one", toolName: "bash" },
+						{ toolCallId: "two", toolName: "read" },
+					],
+					elapsedMs: 5_000,
+				},
+				stopping: false,
+			}),
+			"Status:    ↻ Running 2 tools: bash, read · last event 1m 02s ago",
+		);
+	});
+
+	it("keeps the current phase and update age visible after a worker event", () => {
+		assert.equal(
+			formatWorkerStatusLine({
+				elapsedMs: 5_900,
+				progress: {
+					report: "",
+					usage: USAGE,
+					toolResults: [],
+					stopReason: undefined,
+					errorMessage: undefined,
+					activity: { kind: "thinking" },
+					activeTools: [],
+					elapsedMs: 5_000,
+				},
+				stopping: false,
+			}),
+			"Status:    ● Thinking · last event just now",
+		);
 	});
 
 	it("shows turns, tokens, and cost once the worker reports them", () => {
