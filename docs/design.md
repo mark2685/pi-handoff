@@ -348,4 +348,4 @@ Rehydration keeps an external run intact, which is the single exception to downg
 - [x] T9: Implement Review here injection, the `agent_end` reopen of Gate B, and the bounded feedback loop.
 - [x] T10: Implement `session_start` rehydration and `session_shutdown` cleanup.
 - [x] T11: Write README and extension load test; run `npm run check`.
-- [ ] T12: End-to-end test in a scratch repository, including the Discard safety check.
+- [x] T12: End-to-end test in a scratch repository, including the Discard safety check.
