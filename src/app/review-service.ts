@@ -23,8 +23,8 @@
  * `running` with a prompt the worker never received.
  */
 
-import { appendReviewFeedback, normalizeReviewFeedback } from "../domain/draft/feedback.ts";
-import { parseReviewVerdict } from "../domain/review.ts";
+import { appendReviewFeedback, normalizeReviewFeedback, type FeedbackSource } from "../domain/draft/feedback.ts";
+import { hasReviewEvidence, parseReviewVerdict } from "../domain/review.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import { err, ok, type Result } from "../domain/result.ts";
@@ -208,7 +208,18 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 			if (feedback === "") return err({ kind: "empty_feedback" });
 
 			const iteration = reviewing.iteration + 1;
-			const prompt = appendReviewFeedback(reviewing.draft.prompt, feedback, iteration, reviewing.checkpoint.head);
+			// What the prompt may claim about who inspected the tree. A reviewer is credited
+			// only when one actually reported on *this* iteration; otherwise the text is the
+			// user's own, and an unfinished run additionally leaves the task open.
+			const reviewed = reviewing.review?.iteration === reviewing.iteration && hasReviewEvidence(reviewing.review);
+			const source: FeedbackSource = reviewed ? "review" : reviewing.completion === "interrupted" ? "resume" : "user";
+			const prompt = appendReviewFeedback(
+				reviewing.draft.prompt,
+				feedback,
+				iteration,
+				reviewing.checkpoint.head,
+				source,
+			);
 			const promptPath = buildPromptPath(reviewing.draft.slug);
 
 			// The worker reads the file, so the file is the source of truth: it is rewritten

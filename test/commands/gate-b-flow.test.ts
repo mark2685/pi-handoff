@@ -70,10 +70,14 @@ interface Harness {
 	notifications: { message: string; level?: string }[];
 	messages: string[];
 	editorPrefills: string[];
+	/** Editor titles, which carry the no-review hint `ctx.ui.editor` has nowhere else to put. */
+	editorTitles: string[];
 	/** Follow-up drafts requested by "Accept and hand off leftovers". */
 	leftovers: LeftoversScopeInput[];
 	/** Titles rendered by read-only viewers, whose headings are part of the warning contract. */
 	viewerTitles: string[];
+	/** Prompt-file contents written by feedback iterations, which is where the sent text lands. */
+	promptWrites: string[];
 }
 
 interface HarnessOptions {
@@ -84,6 +88,8 @@ interface HarnessOptions {
 	outcomes?: WorkerRunOutcome[];
 	maxIterations?: number;
 	editorResult?: string | undefined;
+	/** Submits the prefill unchanged, as the real editor does when the user just presses Enter. */
+	editorSubmitsPrefill?: boolean;
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -92,13 +98,20 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const notifications: { message: string; level?: string }[] = [];
 	const messages: string[] = [];
 	const editorPrefills: string[] = [];
+	const editorTitles: string[] = [];
 	const leftovers: LeftoversScopeInput[] = [];
 	const viewerTitles: string[] = [];
+	const promptWrites: string[] = [];
 	const selections = [...(options.selections ?? [])];
 
 	const recorder: HandoffStateRecorder = { record: () => {} };
 	const reportRecorder: HandoffReportRecorder = { record: () => {} };
-	const promptWriter: PromptFileWriter = { write: async () => ok(undefined) };
+	const promptWriter: PromptFileWriter = {
+		write: async (_path: string, contents: string) => {
+			promptWrites.push(contents);
+			return ok(undefined);
+		},
+	};
 
 	let workerRun = 0;
 	const runner: WorkerRunner = {
@@ -177,9 +190,10 @@ function createHarness(options: HarnessOptions = {}): Harness {
 				return selections.shift();
 			},
 			select: async () => undefined,
-			editor: async (_title: string, prefill?: string) => {
+			editor: async (title: string, prefill?: string) => {
+				editorTitles.push(title);
 				editorPrefills.push(prefill ?? "");
-				return options.editorResult;
+				return options.editorSubmitsPrefill === true ? (prefill ?? "") : options.editorResult;
 			},
 		},
 	} as unknown as ExtensionContext;
@@ -198,7 +212,20 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 	});
 
-	return { flow, machine, runService, ctx, overlays, notifications, messages, editorPrefills, leftovers, viewerTitles };
+	return {
+		flow,
+		machine,
+		runService,
+		ctx,
+		overlays,
+		notifications,
+		messages,
+		editorPrefills,
+		editorTitles,
+		leftovers,
+		viewerTitles,
+		promptWrites,
+	};
 }
 
 /** Drives the machine to a pending review, which is Gate B's precondition. */
@@ -361,6 +388,57 @@ describe("GateBFlow.run", () => {
 		assert.deepEqual(harness.editorPrefills, [""]);
 	});
 
+	/**
+	 * The editor takes a title and a prefill and nothing else, so a blank buffer can
+	 * only explain itself in its title.
+	 */
+	it("says in the editor title that no review was captured", async () => {
+		const harness = createHarness({ selections: ["feedback"], editorResult: undefined });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.editorTitles[0] ?? "", /no review captured for iteration 1/);
+		assert.match(harness.editorTitles[0] ?? "", /Review here/);
+	});
+
+	/** A review turn that failed stores empty text, which is no more usable than no review. */
+	it("treats a captured review with empty text as no review", async () => {
+		const harness = createHarness({ selections: ["feedback"], editorResult: undefined });
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, text: "" });
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.editorPrefills, [""]);
+		assert.match(harness.editorTitles[0] ?? "", /no review captured for iteration 1/);
+	});
+
+	/**
+	 * The gate's labels and its reviewer block key off the review's presence, so an
+	 * empty one has to be absent from the view rather than reinterpreted downstream:
+	 * otherwise one render offers "Send review to worker" over an empty findings block
+	 * while the editor it opens says no review was captured.
+	 */
+	it("keeps an empty captured review out of the view entirely", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, text: "   " });
+
+		assert.equal((await harness.flow.viewFromPendingReview(harness.ctx))?.review, undefined);
+	});
+
+	/** A verdict is real evidence even with no findings, and it orders the gate's actions. */
+	it("keeps a verdict-only review in the view", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, verdict: "accept", text: "Verdict: accept" });
+
+		assert.equal((await harness.flow.viewFromPendingReview(harness.ctx))?.review?.verdict, "accept");
+	});
+
 	it("returns to the gate without sending verdict-only feedback", async () => {
 		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "Verdict: fix" });
 		await reachReview(harness);
@@ -370,7 +448,106 @@ describe("GateBFlow.run", () => {
 
 		assert.equal(harness.overlays.length, 2);
 		assert.equal(harness.machine.reviewing()?.iteration, 1);
-		assert.match(harness.notifications[0]?.message ?? "", /No feedback to send/);
+		assert.match(harness.notifications[0]?.message ?? "", /only a verdict line/);
+	});
+
+	/**
+	 * The dead end this replaced: Enter submits and the editor trims, so typing nothing
+	 * used to be reported as a verdict-only submission, which describes text the user
+	 * never wrote.
+	 */
+	it("reports an empty feedback submission as empty rather than verdict-only", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "" });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.notifications[0]?.message ?? "", /the feedback editor was empty/);
+		assert.doesNotMatch(harness.notifications[0]?.message ?? "", /verdict line/);
+		assert.match(harness.notifications[0]?.message ?? "", /Shift\+Enter/);
+	});
+
+	it("starts no iteration and reopens the gate after an empty submission", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "   " });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.iteration, 1);
+		assert.equal(harness.overlays.length, 2);
+	});
+
+	/**
+	 * The interrupted run is the case with no review and no prospect of one, so the
+	 * editor opens on an editable draft rather than the blank buffer that sent users
+	 * back to the gate.
+	 */
+	it("prefills resume instructions when an interrupted iteration has no review", async () => {
+		const harness = createHarness({ interrupted: true, selections: ["feedback"], editorResult: undefined });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		const prefill = harness.editorPrefills[0] ?? "";
+		assert.match(
+			prefill,
+			/What ended the previous iteration: The worker exited with code 1 without producing a report\./,
+		);
+		assert.match(prefill, /Write the final report/);
+		assert.match(harness.editorTitles[0] ?? "", /interrupted iteration 1/);
+	});
+
+	it("sends the resume draft as feedback when it is submitted unchanged", async () => {
+		const harness = createHarness({
+			interrupted: true,
+			selections: ["feedback", "dismiss"],
+			editorSubmitsPrefill: true,
+		});
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.equal(harness.machine.reviewing()?.iteration, 2);
+		// No reviewer saw this iteration, so the section says whose instructions these are.
+		assert.match(harness.promptWrites[0] ?? "", /## Instructions from the user \(iteration 2\)/);
+		assert.doesNotMatch(harness.promptWrites[0] ?? "", /A reviewer inspected that tree/);
+		assert.match(harness.promptWrites[0] ?? "", /What ended the previous iteration:/);
+		// The interruption is stated once, by the preamble, not again by the draft under it.
+		assert.equal((harness.promptWrites[0] ?? "").match(/did not finish/g)?.length, 1);
+	});
+
+	/**
+	 * The advice has to name an option the gate actually offers. Review here is refused
+	 * for a run that produced no report, so pointing an interrupted user at it would be
+	 * the same dead end this message replaced.
+	 */
+	it("offers no Review here advice when an interrupted iteration submits nothing", async () => {
+		const harness = createHarness({ interrupted: true, selections: ["feedback", "dismiss"], editorResult: "" });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.notifications[0]?.message ?? "", /the feedback editor was empty/);
+		assert.doesNotMatch(harness.notifications[0]?.message ?? "", /Review (here|again)/);
+		assert.equal(harness.machine.reviewing()?.iteration, 1);
+	});
+
+	/** The menu relabels the option once a review exists, so the advice has to follow. */
+	it("names Review again when the captured review was only a verdict", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "" });
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, verdict: "fix", text: "Verdict: fix" });
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		assert.match(harness.editorTitles[0] ?? "", /only its verdict/);
+		assert.match(harness.notifications[0]?.message ?? "", /choose Review again first/);
 	});
 
 	it("refuses feedback at the bound without opening an editor", async () => {
