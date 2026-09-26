@@ -27,10 +27,16 @@ import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import type { LeftoversScopeInput } from "../domain/draft/leftovers.ts";
-import { parseReviewLeftovers } from "../domain/review.ts";
+import { hasReviewEvidence, parseReviewLeftovers } from "../domain/review.ts";
 import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
-import { openAcknowledgement, openGateB, type GateBView } from "../presentation/gate-b.ts";
+import {
+	buildFeedbackEditorRequest,
+	feedbackDraftAdvice,
+	openAcknowledgement,
+	openGateB,
+	type GateBView,
+} from "../presentation/gate-b.ts";
 import { describeGitFailure, describeGitOrConflict } from "../presentation/git-failure.ts";
 import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
@@ -163,7 +169,14 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			if (reviewing === undefined) return undefined;
 
 			const allowance = reviewService.feedbackAllowance();
-			const review = reviewing.review?.iteration === reviewing.iteration ? reviewing.review : undefined;
+			// A review turn that failed stores a record with empty text. Presence drives the
+			// menu's labels and the summary's reviewer block, so an empty one is dropped here
+			// rather than allowed to claim a review that never happened. A review that is only
+			// a verdict is kept: the verdict is real, and it orders the gate's actions.
+			const review =
+				reviewing.review?.iteration === reviewing.iteration && hasReviewEvidence(reviewing.review)
+					? reviewing.review
+					: undefined;
 			const base = {
 				slug: reviewing.draft.slug,
 				choice: reviewing.choice,
@@ -316,14 +329,22 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					continue;
 				}
 
-				const feedback = await ctx.ui.editor(
-					"Review feedback",
-					current.review === undefined ? "" : normalizeReviewFeedback(current.review.text),
-				);
+				const editorRequest = buildFeedbackEditorRequest(current);
+				const feedback = await ctx.ui.editor(editorRequest.title, editorRequest.prefill);
 				if (feedback === undefined) continue;
 				const normalizedFeedback = normalizeReviewFeedback(feedback);
 				if (normalizedFeedback === "") {
-					ctx.ui.notify("No feedback to send: the editor contained only a verdict line.", "warning");
+					// Enter submits and the editor trims, so a user who typed nothing arrives here with
+					// "" and used to be told their text was a verdict line. Naming what happened is the
+					// difference between retrying deliberately and accepting out of confusion.
+					ctx.ui.notify(
+						feedback.trim() === ""
+							? `Nothing was sent: the feedback editor was empty. Type the feedback for the worker (Shift+Enter adds a line)${feedbackDraftAdvice(
+									editorRequest.kind,
+								)}.`
+							: "No feedback to send: the editor contained only a verdict line.",
+						"warning",
+					);
 					continue;
 				}
 

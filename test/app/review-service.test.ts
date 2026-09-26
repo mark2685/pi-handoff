@@ -466,6 +466,7 @@ describe("ReviewService.sendFeedback", () => {
 	it("appends the feedback to the prompt file the worker reads", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, verdict: "fix", text: "The timeout path needs a test." });
 		await harness.service.sendFeedback({
 			feedback: "Handle the timeout case too.",
 			cwd: CWD,
@@ -480,6 +481,72 @@ describe("ReviewService.sendFeedback", () => {
 			),
 		);
 		assert.ok(harness.writes[0]?.contents.includes("Handle the timeout case too."));
+	});
+
+	/**
+	 * The prompt tells the worker who inspected its tree, so it can only credit a
+	 * reviewer when one reported on this iteration. Claiming one anyway put "address
+	 * only the reviewer findings" above text saying no review was captured.
+	 */
+	it("credits a reviewer only when a review reported on the iteration", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, verdict: "fix", text: "The timeout path needs a test." });
+		await harness.service.sendFeedback({
+			feedback: "Handle the timeout case too.",
+			cwd: CWD,
+			isChoiceRunnable: () => true,
+		});
+
+		assert.ok(harness.writes[0]?.contents.includes("A reviewer inspected that tree and reported the findings below."));
+	});
+
+	it("says the instructions are the user's when no review was captured", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		await harness.service.sendFeedback({
+			feedback: "Handle the timeout case too.",
+			cwd: CWD,
+			isChoiceRunnable: () => true,
+		});
+
+		const contents = harness.writes[0]?.contents ?? "";
+		assert.ok(contents.includes("## Instructions from the user (iteration 2)"));
+		assert.ok(contents.includes("The instructions below come from the user, not from a reviewer."));
+		assert.ok(!contents.includes("A reviewer inspected that tree"));
+	});
+
+	/** An empty review is a review turn that failed, so it credits no reviewer either. */
+	it("treats an empty captured review as no review when wording the prompt", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.machine.clearReviewTurn({ iteration: 1, text: "" });
+		await harness.service.sendFeedback({
+			feedback: "Handle the timeout case too.",
+			cwd: CWD,
+			isChoiceRunnable: () => true,
+		});
+
+		assert.ok(!(harness.writes[0]?.contents ?? "").includes("A reviewer inspected that tree"));
+	});
+
+	/**
+	 * An interrupted iteration leaves the handoff unfinished, so its section says so
+	 * rather than telling the worker to address findings alone and stop.
+	 */
+	it("tells the worker to finish the handoff after an interrupted iteration", async () => {
+		const harness = createHarness({ interrupted: true });
+		await reachReview(harness);
+		await harness.service.sendFeedback({
+			feedback: "Pick up where the crash left off.",
+			cwd: CWD,
+			isChoiceRunnable: () => true,
+		});
+
+		const contents = harness.writes[0]?.contents ?? "";
+		assert.ok(contents.includes("The previous iteration did not finish, and no review of it was captured."));
+		assert.ok(contents.includes("finish this handoff's remaining work"));
+		assert.ok(!contents.includes("A reviewer inspected that tree"));
 	});
 
 	it("keeps the approved prompt above the appended feedback", async () => {
