@@ -27,7 +27,9 @@ import type { ModelChoice } from "../../src/domain/types.ts";
 import {
 	GATE_B_COMMON_COMPLETED_FIXED_ROWS,
 	GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS,
+	buildFeedbackEditorRequest,
 	diffstatPreviewLimit,
+	feedbackDraftAdvice,
 	gateBOptions,
 	formatGateBSummary,
 	formatGateBTitle,
@@ -291,6 +293,78 @@ describe("formatGateBTitle", () => {
 
 	it("does not title an unfinished run as a result", () => {
 		assert.equal(formatGateBTitle(INTERRUPTED_VIEW), "Handoff did not complete");
+	});
+});
+
+describe("buildFeedbackEditorRequest", () => {
+	it("prefills reviewer findings without their verdict line", () => {
+		const request = buildFeedbackEditorRequest({
+			...COMPLETED_VIEW,
+			review: { iteration: 1, verdict: "fix", text: "Cover the timeout path.\nVerdict: fix" },
+		});
+
+		assert.deepEqual(request, { kind: "review", title: "Review feedback", prefill: "Cover the timeout path." });
+	});
+
+	/** The buffer is blank, so the title is the only place left to say why. */
+	it("says in the title that no review was captured for a finished iteration", () => {
+		const request = buildFeedbackEditorRequest(COMPLETED_VIEW);
+
+		assert.equal(request.kind, "none");
+		assert.equal(request.prefill, "");
+		assert.match(request.title, /no review captured for iteration 1/);
+	});
+
+	/** A verdict-only review is a review, so the title must not deny one was captured. */
+	it("distinguishes a verdict-only review from no review", () => {
+		const request = buildFeedbackEditorRequest({
+			...COMPLETED_VIEW,
+			review: { iteration: 1, verdict: "fix", text: "Verdict: fix" },
+		});
+
+		assert.equal(request.kind, "verdict_only");
+		assert.equal(request.prefill, "");
+		assert.match(request.title, /only its verdict/);
+		assert.doesNotMatch(request.title, /no review captured/);
+	});
+
+	it("drafts resume instructions quoting the note for an interrupted iteration", () => {
+		const request = buildFeedbackEditorRequest(INTERRUPTED_VIEW);
+
+		assert.equal(request.kind, "interrupted");
+		assert.match(request.prefill, /The worker was stopped before it reported a result\./);
+		assert.match(request.title, /interrupted iteration 1/);
+	});
+});
+
+describe("feedbackDraftAdvice", () => {
+	/**
+	 * The advice names an option the user has to be able to find. The menu renders
+	 * Review here only until a review exists, then Review again, and drops it entirely
+	 * for an interrupted run.
+	 */
+	it("matches the label the menu renders for each state", () => {
+		assert.match(feedbackDraftAdvice("none"), /choose Review here first/);
+		assert.equal(gateBMenu({ interrupted: false }).find((option) => option.id === "review")?.label, "Review here");
+
+		assert.match(feedbackDraftAdvice("verdict_only"), /choose Review again first/);
+		assert.equal(
+			gateBMenu({ interrupted: false, review: { verdict: "fix" } }).find((option) => option.id === "review")?.label,
+			"Review again",
+		);
+	});
+
+	it("offers no review option where the gate has none to offer", () => {
+		assert.equal(feedbackDraftAdvice("interrupted"), "");
+		assert.equal(
+			gateBMenu({ interrupted: true }).find((option) => option.id === "review"),
+			undefined,
+		);
+	});
+
+	/** The review text was already there and the user cleared it, so there is nothing to draft. */
+	it("says nothing when the findings were already prefilled", () => {
+		assert.equal(feedbackDraftAdvice("review"), "");
 	});
 });
 

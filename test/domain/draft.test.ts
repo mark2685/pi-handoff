@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { appendReviewFeedback, normalizeReviewFeedback } from "../../src/domain/draft/feedback.ts";
+import {
+	appendReviewFeedback,
+	buildInterruptedResumeFeedback,
+	normalizeReviewFeedback,
+} from "../../src/domain/draft/feedback.ts";
 import { extractNeedsInput, hasNeedsInputMarker, parseDraft } from "../../src/domain/draft/parse.ts";
 import {
 	buildRecommendedAnswers,
@@ -247,6 +251,57 @@ describe("normalizeReviewFeedback", () => {
 	});
 });
 
+describe("buildInterruptedResumeFeedback", () => {
+	const NOTE =
+		"The worker failed: Internal server error. The text it had already produced is kept as pre-crash output.";
+
+	/**
+	 * That the iteration did not finish and was not reviewed belongs to the `resume`
+	 * preamble; repeating it here opened one prompt section with the same sentence twice.
+	 */
+	it("leads with what ended the previous iteration", () => {
+		const draft = buildInterruptedResumeFeedback(NOTE);
+
+		assert.match(draft, /^What ended the previous iteration: /);
+		assert.doesNotMatch(draft, /no review of it was captured/);
+	});
+
+	/** The note is the only account of what ended the run, so it is quoted rather than summarized. */
+	it("quotes the interruption note verbatim", () => {
+		assert.ok(buildInterruptedResumeFeedback(`  ${NOTE}  `).includes(NOTE));
+	});
+
+	it("tells the worker the changes are still there and must not be restarted", () => {
+		const draft = buildInterruptedResumeFeedback(NOTE);
+
+		assert.match(draft, /nothing was reverted/);
+		assert.match(draft, /Do not start over/);
+	});
+
+	/** The unfinished text is evidence, not a result; the draft must not promote it either. */
+	it("denies the unfinished output the status of a report and asks for a real one", () => {
+		const draft = buildInterruptedResumeFeedback(NOTE);
+
+		assert.match(draft, /is not a report/);
+		assert.match(draft, /Write the final report/);
+	});
+
+	it("omits the reason line when no note was recorded", () => {
+		const draft = buildInterruptedResumeFeedback("   ");
+
+		assert.doesNotMatch(draft, /What ended the previous iteration/);
+		assert.match(draft, /^The working tree still holds/);
+		assert.match(draft, /Write the final report/);
+	});
+
+	/** The draft is sent through normalization, which must leave all of it intact. */
+	it("survives feedback normalization unchanged", () => {
+		const draft = buildInterruptedResumeFeedback(NOTE);
+
+		assert.equal(normalizeReviewFeedback(draft), draft);
+	});
+});
+
 describe("appendReviewFeedback", () => {
 	const CHECKPOINT_HEAD = "abc1234def5678";
 	const PREAMBLE =
@@ -273,6 +328,51 @@ describe("appendReviewFeedback", () => {
 			appendReviewFeedback("# Worker prompt\n", "**Verdict:** fix", 1, CHECKPOINT_HEAD),
 			"# Worker prompt\n",
 		);
+	});
+
+	/**
+	 * The preamble tells the worker who inspected its tree, and only one of these paths
+	 * had a reviewer. Crediting one on the others contradicted the instructions directly
+	 * below it, which is how a resume draft arrived under "address only these".
+	 */
+	describe("unreviewed sources", () => {
+		it("names the user rather than a reviewer for an unreviewed iteration", () => {
+			const appended = appendReviewFeedback(
+				"# Worker prompt",
+				"Handle the retry edge case.",
+				2,
+				CHECKPOINT_HEAD,
+				"user",
+			);
+
+			assert.match(appended, /## Instructions from the user \(iteration 2\)/);
+			assert.match(appended, /The instructions below come from the user, not from a reviewer\./);
+			assert.doesNotMatch(appended, /A reviewer inspected that tree/);
+		});
+
+		it("keeps the no-restart rule on every source", () => {
+			for (const source of ["review", "user", "resume"] as const) {
+				const appended = appendReviewFeedback("# Worker prompt", "Carry on.", 2, CHECKPOINT_HEAD, source);
+				assert.match(appended, /do not start over/, source);
+				assert.match(appended, /checkpoint `abc1234`/, source);
+			}
+		});
+
+		it("says an interrupted iteration left work unfinished", () => {
+			const appended = appendReviewFeedback("# Worker prompt", "Carry on.", 2, CHECKPOINT_HEAD, "resume");
+
+			assert.match(appended, /The previous iteration did not finish, and no review of it was captured\./);
+			assert.match(appended, /finish this handoff's remaining work/);
+			assert.doesNotMatch(appended, /Address only these/);
+		});
+
+		/** The reviewed path is the default so existing callers keep their exact wording. */
+		it("defaults to the reviewed wording", () => {
+			assert.equal(
+				appendReviewFeedback("# Worker prompt", "Carry on.", 1, CHECKPOINT_HEAD),
+				appendReviewFeedback("# Worker prompt", "Carry on.", 1, CHECKPOINT_HEAD, "review"),
+			);
+		});
 	});
 });
 

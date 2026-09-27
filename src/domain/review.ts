@@ -21,6 +21,19 @@ export interface CapturedReview {
 	text: string;
 }
 
+/**
+ * Whether a captured review actually says something about the iteration it names.
+ *
+ * A review turn that fails — a provider error, a final message with no text — still
+ * stores a record, with empty text. Presence alone therefore cannot stand for "the
+ * work was reviewed": treating it that way offered a reviewer-findings block with
+ * nothing in it, relabelled the gate's actions as though a review existed, and told
+ * the worker a reviewer had inspected its tree.
+ */
+export function hasReviewEvidence(review: CapturedReview | undefined): boolean {
+	return review !== undefined && review.text.trim() !== "";
+}
+
 /** The structured follow-up work, if any, named by a review. */
 export type ReviewLeftovers = { kind: "none" } | { kind: "items"; items: string[] } | { kind: "missing" };
 

@@ -20,6 +20,7 @@
 
 import { Container, SelectList, Spacer, Text, type SelectItem } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { buildInterruptedResumeFeedback, normalizeReviewFeedback } from "../domain/draft/feedback.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatUsageLines, type UsageTotals } from "../domain/report/format.ts";
 import { parseReviewLeftovers, type CapturedReview } from "../domain/review.ts";
@@ -394,6 +395,79 @@ export function formatGateBSummary(view: GateBView, terminalRows?: number): stri
 		...reportLines(view, limits),
 		...reviewLines(view, limits),
 	];
+}
+
+/**
+ * What the feedback editor can start from, which decides its prefill and its title.
+ *
+ * `review` has reviewer findings to prefill. `verdict_only` has a review that said
+ * nothing but its `Verdict:` line, so there is a review but nothing to edit.
+ * `interrupted` has no review and never will, because Review here is refused for a
+ * run that produced no report. `none` is a finished iteration nobody has reviewed yet.
+ */
+export type FeedbackEditorKind = "review" | "verdict_only" | "interrupted" | "none";
+
+/** The title and prefill for Send feedback's editor, which takes nothing else. */
+export interface FeedbackEditorRequest {
+	kind: FeedbackEditorKind;
+	title: string;
+	prefill: string;
+}
+
+/**
+ * Builds Send feedback's editor request.
+ *
+ * `ctx.ui.editor` accepts a title and a prefill and nothing else, so everything the
+ * user needs to know about why the buffer looks the way it does has to be in one of
+ * those two. A blank buffer with no explanation is what sent users back to the gate
+ * until they accepted a handoff they had not reviewed.
+ */
+export function buildFeedbackEditorRequest(view: GateBView): FeedbackEditorRequest {
+	const reviewFeedback = view.review === undefined ? "" : normalizeReviewFeedback(view.review.text);
+	if (reviewFeedback !== "") return { kind: "review", title: "Review feedback", prefill: reviewFeedback };
+	if (view.review !== undefined) {
+		return {
+			kind: "verdict_only",
+			title: `Review feedback (the review for iteration ${view.iteration} was only its verdict, so there is nothing to edit)`,
+			prefill: "",
+		};
+	}
+	// An interrupted run is the one case with nothing to start from and no review to
+	// wait for, so the editor opens on a draft the user edits, rewrites, or deletes.
+	if (view.report === null) {
+		return {
+			kind: "interrupted",
+			title: `Feedback for interrupted iteration ${view.iteration} (edit this draft before sending)`,
+			prefill: buildInterruptedResumeFeedback(view.interruptionNote ?? ""),
+		};
+	}
+	return {
+		kind: "none",
+		title: `Review feedback (no review captured for iteration ${view.iteration}; Review here would pre-fill this)`,
+		prefill: "",
+	};
+}
+
+/**
+ * Names the option that would produce the missing text, when there is one.
+ *
+ * The label has to match what the menu renders, which relabels Review here to
+ * Review again once a review exists, and drops it for an interrupted run. Pointing
+ * a user at an option the gate refuses, or one under a different name, is the same
+ * dead end as the message this advice was added to fix.
+ */
+export function feedbackDraftAdvice(kind: FeedbackEditorKind): string {
+	switch (kind) {
+		case "none":
+			return ", or choose Review here first to draft it";
+		case "verdict_only":
+			return ", or choose Review again first to draft it";
+		// `review` had the text already and the user cleared it; `interrupted` is offered
+		// no review option at all.
+		case "review":
+		case "interrupted":
+			return "";
+	}
 }
 
 /** Chooses the gate's heading, so an unfinished run is not titled as a result. */
