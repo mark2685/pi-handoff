@@ -247,7 +247,7 @@ export interface HandoffMachine {
 	 * when crash evidence (pre-crash text, stderr) is available to retain.
 	 */
 	interruptRun(input: string | InterruptRunInput): Result<HandoffInterruptedReviewingState, HandoffConflict>;
-	/** Arms the one `agent_end` event caused by Review here. */
+	/** Arms the one review turn caused by Review here. */
 	beginReviewTurn(): Result<HandoffCompletedReviewingState, HandoffConflict>;
 	/** Clears the Review here arm and records the response that caused Gate B to reopen. */
 	clearReviewTurn(review?: CapturedReview): Result<HandoffReviewingState, HandoffConflict>;

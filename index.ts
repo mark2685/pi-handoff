@@ -16,11 +16,11 @@
  *
  * Almost everything is built once per session, because a session owns at most one
  * handoff and three separate entry points have to reach the same one: the command,
- * the `agent_end` reopen, and the `session_shutdown` kill. In particular the run
- * service is session-scoped so the shutdown hook can stop a worker it never
- * started, and the live-registry check it needs is passed per call instead of
- * captured, so a session-lived object cannot approve a model that has since
- * disappeared.
+ * the review-turn hooks that capture a review and reopen Gate B, and the
+ * `session_shutdown` kill. In particular the run service is session-scoped so the
+ * shutdown hook can stop a worker it never started, and the live-registry check it
+ * needs is passed per call instead of captured, so a session-lived object cannot
+ * approve a model that has since disappeared.
  *
  * The drafting service is the exception: it depends on `ctx.model` and the live
  * registry, which can both change between commands, and a stale model must never
@@ -123,10 +123,11 @@ export default function handoff(pi: ExtensionAPI) {
 		isChoiceRunnable,
 		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
 		// handler, so this is fire-and-forget by construction: the injected message
-		// starts an agent turn that the calling handler must return from, and that turn's
-		// `agent_end` is what reopens the gate. `deliverAs: "followUp"` is required because
-		// Gate B can reopen from `agent_end`, while the agent is still streaming and an
-		// un-queued message is refused; when the agent is idle, the option is ignored.
+		// starts an agent turn that the calling handler must return from, and the gate is
+		// reopened once that turn settles. `deliverAs: "followUp"` is kept as the safe
+		// case: Gate B now reopens from `agent_settled`, where the session reports idle and
+		// the option is ignored, but a gate that outlives that idle window would otherwise
+		// have its message refused for being un-queued while the agent streams.
 		sendUserMessage: (content) => {
 			pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs: "followUp" });
 		},
@@ -160,6 +161,9 @@ export default function handoff(pi: ExtensionAPI) {
 	 * visible instead of silently losing the checkpoint Discard needs.
 	 */
 	pi.on("session_start", (_event, ctx) => {
+		// Dropped with the state it belonged to: a review captured before the session was
+		// replaced has no gate to reopen here, and keeping it would offer one anyway.
+		gateBFlow.forgetReviewTurn();
 		const restored = rehydrateLatestHandoffState(ctx.sessionManager.getBranch());
 		if (restored === undefined) machine.reset();
 		else machine.restore(restored);
@@ -180,18 +184,37 @@ export default function handoff(pi: ExtensionAPI) {
 	 * hook cannot try to kill a process that was never this session's to begin with.
 	 */
 	pi.on("session_shutdown", async () => {
+		// A capture cannot be reopened into a session that is being torn down, so it is
+		// dropped before anything waits: a gate opening during shutdown would prompt a user
+		// who has already left.
+		gateBFlow.forgetReviewTurn();
 		if (!runService.abortActiveRun()) return;
 		await runService.whenSettled();
 	});
 
 	/**
-	 * Reopens Gate B after the review turn that Review here injected.
+	 * Records the result of the review turn that Review here injected.
 	 *
-	 * Inert in every other case. The flow reads the arm flag, clears it before
-	 * opening anything, and returns early otherwise, so an ordinary turn in a session
-	 * with no handoff never sees handoff UI.
+	 * Nothing opens here, and nothing is awaited: Pi awaits extension `agent_end`
+	 * handlers before its interactive listener clears the `Working` spinner, so a
+	 * handler that opened the gate would leave Pi claiming to be working underneath
+	 * it. Inert in every other case — the flow reads the arm flag and returns early —
+	 * so an ordinary turn in a session with no handoff never sees handoff UI.
 	 */
-	pi.on("agent_end", async (event, ctx) => {
-		await gateBFlow.handleAgentEnd(ctx, finalAssistantText(event.messages));
+	pi.on("agent_end", (event) => {
+		gateBFlow.captureReviewTurn(finalAssistantText(event.messages));
+	});
+
+	/**
+	 * Reopens Gate B once the review turn has fully settled.
+	 *
+	 * Pi emits this after retries, compaction, and queued continuations are ruled out,
+	 * with the session already reporting idle, so the gate and any run it starts happen
+	 * while nothing claims to be working. The flow launches the loop detached and
+	 * reports its own failures, so this handler returns immediately rather than holding
+	 * up the other extensions' handlers and Pi's own idle bookkeeping behind a gate.
+	 */
+	pi.on("agent_settled", (_event, ctx) => {
+		gateBFlow.reopenAfterReviewTurn(ctx);
 	});
 }

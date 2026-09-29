@@ -1,21 +1,35 @@
 /**
- * The Gate B loop, shared by `/handoff` and the `agent_end` reopen.
+ * The Gate B loop, shared by `/handoff` and the review-turn reopen.
  *
  * Gate B is reached three ways — a run finishing, `/handoff` while a review is
- * pending, and `agent_end` after a Review here turn — and all three must offer the
- * same options with the same guarantees. Keeping the loop here means the third
- * path cannot drift from the first, which matters because the reopen runs from a
+ * pending, and the end of a Review here turn — and all three must offer the same
+ * options with the same guarantees. Keeping the loop here means the third path
+ * cannot drift from the first, which matters because the reopen runs from a
  * lifecycle hook where a mistake fires UI in sessions that have no handoff.
  *
- * The hook body is the delicate part. It reads the arm flag, clears it *before*
- * opening anything, and returns early in every other case. Clearing first is what
- * makes a second `agent_end` inert: `_runAgentPrompt` can loop on auto-retry, so
- * more than one event per prompt is normal, and a flag cleared only after the gate
- * closed would let the second event open a second gate behind the first.
+ * The reopen is deliberately split across two hooks, and the split is the delicate
+ * part.
+ *
+ * `agent_end` only *captures* the review, because Pi awaits extension `agent_end`
+ * handlers before its own interactive listener runs, and that listener is what
+ * clears the `Working` spinner. A handler that held the gate open would therefore
+ * leave Pi claiming to be working underneath it, and alongside the running
+ * overlay of any worker the gate started. The capture is overwritten on every
+ * event, since `_runAgentPrompt` loops on auto-retry and more than one `agent_end`
+ * per prompt is normal — the last one is the review.
+ *
+ * `agent_settled` reopens the gate, and does it *without being awaited*. Pi emits
+ * that event once the run has fully settled, with the session already reporting
+ * not-streaming and idle, so a gate opened from there runs while nothing claims to
+ * be working. Pi awaits extension handlers there too, so the loop is launched
+ * detached: the handler returns immediately and the launch reports its own
+ * failures, because a rejection nobody awaits would otherwise be unhandled.
+ * Clearing the capture before the first `await` is what keeps a second settle for
+ * the same turn from stacking a second gate behind the first.
  *
  * Review here fires `pi.sendUserMessage` without awaiting anything. The injected
- * message triggers a full agent turn, and the handler must return so that turn can
- * run at all — the gate it is arming is reopened by the turn's own `agent_end`.
+ * message triggers a full agent turn, and the caller must return so that turn can
+ * run at all — the gate it is arming is reopened after that turn settles.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -42,6 +56,38 @@ import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
 import { HANDOFF_COMMAND } from "./parse.ts";
+
+/**
+ * Describes a failure inside the detached Gate B reopen.
+ *
+ * The failure can land anywhere in the loop, not just at the first render: Accept
+ * and hand off leftovers resets the machine before its draft runs, and Discard
+ * resets it before its acknowledgement. Promising that `/handoff` reopens the
+ * review is only true while one is still pending, so the recovery line follows
+ * the machine rather than the failure site.
+ *
+ * The stack goes into the message because nothing else will carry it. When the
+ * reopen ran inside `agent_end`, Pi caught the rejection and printed its stack
+ * in the chat; a detached promise has no such handler, and `console.error` would
+ * write over the TUI rather than into it.
+ */
+export function formatReopenFailure(error: unknown, reviewPending: boolean): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	const recovery = reviewPending
+		? `The review is still pending; run \`${HANDOFF_COMMAND}\` to reopen Gate B.`
+		: `Run \`${HANDOFF_COMMAND} status\` to see where the handoff stands.`;
+	// Pi's own extension-error display drops the first stack line for the same reason:
+	// it repeats the message already shown above it.
+	const stack =
+		error instanceof Error && error.stack !== undefined
+			? error.stack
+					.split("\n")
+					.slice(1)
+					.map((line) => `  ${line.trim()}`)
+					.join("\n")
+			: "";
+	return `Gate B stopped with an error: ${detail}\n${recovery}${stack === "" ? "" : `\n${stack}`}`;
+}
 
 export interface GateBFlowDeps {
 	machine: HandoffMachine;
@@ -81,17 +127,85 @@ export interface GateBFlow {
 	 * Injects the review turn directly, as Review here does, without opening Gate B.
 	 *
 	 * This is "Run and review": the same arming, the same message, and the same
-	 * `agent_end` reopen, reached without the intervening click. Returns false when
+	 * post-settle reopen, reached without the intervening click. Returns false when
 	 * the machine refused to arm, so the caller can fall back to the gate.
 	 */
 	startReviewTurn(ctx: ExtensionContext): boolean;
-	/** The `agent_end` body: captures the review and reopens Gate B exactly once. */
-	handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void>;
+	/**
+	 * The `agent_end` body: records the armed review turn's result, opening nothing.
+	 *
+	 * Synchronous and inert in every other case, so an ordinary turn in a session with
+	 * no handoff costs a single flag read.
+	 */
+	captureReviewTurn(reviewText?: string): void;
+	/**
+	 * The `agent_settled` body: reopens Gate B once for a captured review turn.
+	 *
+	 * Returns as soon as the loop is launched rather than when the gate closes, so
+	 * neither review-turn hook waits on a gate, a worker run, or a leftovers draft.
+	 */
+	reopenAfterReviewTurn(ctx: ExtensionContext): void;
+	/**
+	 * Resolves once a launched reopen has finished, rejecting never.
+	 *
+	 * The seam for observing detached work whose handler has already returned; the
+	 * loop itself reports its outcome to the user.
+	 */
+	whenReopenSettled(): Promise<void>;
+	/**
+	 * Drops a capture that will never be reopened, on session replacement or shutdown.
+	 *
+	 * Without it a review captured in one session could reopen a gate in the next one,
+	 * against a handoff that session never had.
+	 */
+	forgetReviewTurn(): void;
 }
 
 /** Wires Gate B's surfaces to the machine and the two session-scoped services. */
 export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 	const { machine, runService, reviewService, clock, isChoiceRunnable, sendUserMessage, draftLeftovers } = deps;
+
+	/**
+	 * The armed review turn's result, held between `agent_end` and the turn's settle.
+	 *
+	 * A wrapper rather than a bare string: a review turn that produced no assistant
+	 * text still has to reopen the gate, so an absent `text` and an absent capture have
+	 * to stay distinguishable.
+	 */
+	let capture: { text?: string } | undefined;
+
+	/** The detached reopen in flight, if any, so `whenReopenSettled` can await it. */
+	let reopen: Promise<void> | undefined;
+
+	/**
+	 * Persists the captured review and reopens Gate B, reporting its own failures.
+	 *
+	 * Nothing awaits this from Pi's side, so an escaping error would be an unhandled
+	 * rejection with no user-visible trace. The catch covers the whole loop, including
+	 * the runs, drafts, and dialogs the gate starts, so the report is worded from the
+	 * machine's state afterwards rather than assuming the gate never opened.
+	 */
+	async function reopenGateB(ctx: ExtensionContext, captured: { text?: string }): Promise<void> {
+		try {
+			// Re-read rather than trusted: the session can be replaced between the capture and
+			// the settle, and a stale capture must not reopen a gate against another handoff.
+			if (machine.reviewing()?.awaitingReviewTurn !== true) return;
+
+			// Disarms the turn and persists its verdict and findings, so a dismissed gate
+			// leaves the review pending rather than armed.
+			const cleared = reviewService.clearReview(captured.text);
+			if (!cleared.ok) return;
+
+			// A gate is a TUI overlay; there is nothing to open elsewhere.
+			if (ctx.mode !== "tui") return;
+
+			const view = await flow.viewFromPendingReview(ctx);
+			if (view === undefined) return;
+			await flow.run(ctx, view);
+		} catch (error) {
+			ctx.ui.notify(formatReopenFailure(error, machine.reviewing() !== undefined), "error");
+		}
+	}
 
 	/** Discards the worker's changes, always reporting which paths were left alone. */
 	async function discardChanges(ctx: ExtensionContext): Promise<boolean> {
@@ -314,7 +428,8 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					}
 
 					// Deliberately not awaited: the message starts an agent turn, and this
-					// handler has to return for that turn to run. `agent_end` reopens the gate.
+					// handler has to return for that turn to run. The gate reopens once that
+					// turn has settled.
 					sendUserMessage(reviewService.buildReviewMessage(armed.value));
 					return;
 				}
@@ -431,27 +546,41 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 			// Deliberately not awaited, exactly as the gate's own Review here is not: the
 			// message starts an agent turn, the caller has to return for that turn to run, and
-			// the turn's `agent_end` is what reopens the gate.
+			// the gate reopens once that turn has settled.
 			sendUserMessage(reviewService.buildReviewMessage(armed.value));
 			ctx.ui.notify("The worker finished. Reviewing its work in this session now.", "info");
 			return true;
 		},
 
-		async handleAgentEnd(ctx: ExtensionContext, reviewText?: string): Promise<void> {
+		captureReviewTurn(reviewText?: string): void {
 			// The arm flag is the sole condition under which this hook does anything.
 			if (machine.reviewing()?.awaitingReviewTurn !== true) return;
 
-			// Cleared before the gate opens, so a second agent_end for the same prompt
-			// finds the flag already down and does nothing.
-			const cleared = reviewService.clearReview(reviewText);
-			if (!cleared.ok) return;
+			// Overwritten, not kept: an auto-retried prompt ends more than once, and the last
+			// attempt is the review. Wrapped so a turn that produced no assistant text is
+			// still a capture — "no text" and "nothing captured" mean different things here.
+			capture = reviewText === undefined ? {} : { text: reviewText };
+		},
 
-			// A gate is a TUI overlay; there is nothing to open elsewhere.
-			if (ctx.mode !== "tui") return;
+		reopenAfterReviewTurn(ctx: ExtensionContext): void {
+			const captured = capture;
+			if (captured === undefined) return;
 
-			const view = await flow.viewFromPendingReview(ctx);
-			if (view === undefined) return;
-			await flow.run(ctx, view);
+			// Cleared before anything is awaited, so a second settle for the same turn finds
+			// nothing to reopen and cannot stack a second gate behind the first.
+			capture = undefined;
+
+			// The launch reports its own failure, and the outer catch keeps even a notify that
+			// threw from becoming an unhandled rejection in a handler that already returned.
+			reopen = reopenGateB(ctx, captured).catch(() => undefined);
+		},
+
+		async whenReopenSettled(): Promise<void> {
+			await reopen;
+		},
+
+		forgetReviewTurn(): void {
+			capture = undefined;
 		},
 	};
 

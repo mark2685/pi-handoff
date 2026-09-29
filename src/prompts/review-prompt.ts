@@ -10,9 +10,9 @@
  * exactly the overclaiming a reviewer is looking for.
  *
  * The instructions push the reviewer at the diff rather than the report. A report
- * is a claim; the diff is the evidence. The closing verdict line is required so
- * `agent_end` can capture the recommendation and show it inside the reopened Gate
- * B overlay, which otherwise obscures the transcript.
+ * is a claim; the diff is the evidence. The closing verdict line is required so the
+ * end of the review turn can capture the recommendation and show it inside the
+ * reopened Gate B overlay, which otherwise obscures the transcript.
  *
  * The reviewer is told not to edit files. Fixes belong to the worker through the
  * feedback loop, where they land inside the checkpoint that Discard can undo; a
