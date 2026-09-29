@@ -85,7 +85,7 @@ export interface ReviewServiceDeps {
 export interface ReviewService {
 	/** Records the accepted report, returns to idle, and persists the reset. */
 	accept(): Result<AcceptOutcome, HandoffConflict>;
-	/** Arms the one `agent_end` that Review here is allowed to act on. */
+	/** Arms the one review turn whose result Review here is allowed to act on. */
 	beginReview(): Result<HandoffReviewingState, HandoffConflict>;
 	/** Disarms the review turn and persists its final assistant response before reopening Gate B. */
 	clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict>;

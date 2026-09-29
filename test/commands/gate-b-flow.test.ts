@@ -1,12 +1,17 @@
 /**
- * Behavioral tests for the Gate B loop and the `agent_end` reopen.
+ * Behavioral tests for the Gate B loop and the review-turn reopen.
  *
- * These exist mainly for one ordering property that no other test can express:
- * `agent_end` must clear the review arm *before* it opens Gate B. Pi's
- * `_runAgentPrompt` loops on auto-retry, so more than one `agent_end` per prompt is
- * normal, and a flag cleared only after the gate closed would let the second event
- * stack a second gate behind the first. The double-fire test below is what pins
- * that; removing the clear makes it fail.
+ * These exist mainly for two properties no other test can express.
+ *
+ * The capture and the reopen are separate: `agent_end` records the review and opens
+ * nothing, and the turn's settle reopens Gate B without being awaited. The tests
+ * that hold a gate open and assert the reopen has already returned are what pin the
+ * second half, since Pi awaits extension handlers and an awaited gate would stall
+ * the turn it belongs to.
+ *
+ * The reopen happens exactly once. The capture is dropped before the first `await`,
+ * so a repeated settle finds nothing to reopen, and several captures from one
+ * retried prompt still collapse into one gate showing the last attempt's review.
  *
  * Gate B is faked at `ctx.ui.custom`, which resolves queued option ids without
  * constructing the overlay. That keeps these tests about the flow's decisions
@@ -26,7 +31,7 @@ import { createHandoffMachine, type HandoffMachine } from "../../src/app/handoff
 import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService, type RunService } from "../../src/app/run-service.ts";
 import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
-import { createGateBFlow, type GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import { createGateBFlow, formatReopenFailure, type GateBFlow } from "../../src/commands/gate-b-flow.ts";
 import type { LeftoversScopeInput } from "../../src/domain/draft/leftovers.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
@@ -90,6 +95,19 @@ interface HarnessOptions {
 	editorResult?: string | undefined;
 	/** Submits the prefill unchanged, as the real editor does when the user just presses Enter. */
 	editorSubmitsPrefill?: boolean;
+	/**
+	 * Keeps a gate open until the returned promise resolves, so a detached reopen can be
+	 * observed while its gate is still on screen. Consulted per render, which lets a
+	 * test hold only the gate it cares about.
+	 */
+	holdGate?: () => Promise<void> | undefined;
+	/** Makes the gate surface throw, standing in for any failure inside the detached loop. */
+	gateThrows?: boolean;
+	/**
+	 * Makes the leftovers draft throw, standing in for a failure that lands after the gate
+	 * opened and Accept already reset the machine.
+	 */
+	draftLeftoversThrows?: boolean;
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -187,6 +205,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
 				const viewer = component as { render?: (width: number) => string[]; scrollBy?: (delta: number) => void };
 				if (viewer.scrollBy !== undefined) viewerTitles.push(viewer.render?.(80)[0]?.trim() ?? "");
 				overlays.push(overlays.length);
+				if (options.gateThrows === true) throw new Error("the overlay could not be rendered");
+				const hold = options.holdGate?.();
+				if (hold !== undefined) await hold;
 				return selections.shift();
 			},
 			select: async () => undefined,
@@ -209,6 +230,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 		draftLeftovers: async (_ctx, input) => {
 			leftovers.push(input);
+			if (options.draftLeftoversThrows === true) throw new Error("the drafting call failed");
 		},
 	});
 
@@ -238,6 +260,26 @@ async function reachReview(harness: Harness, options: { autoReview?: boolean } =
 		isChoiceRunnable: () => true,
 		...(options.autoReview === true ? { autoReview: true } : {}),
 	});
+}
+
+/**
+ * Ends an armed review turn the way Pi does: `agent_end` captures, and the turn's
+ * settle reopens. The reopen is detached by design, so this awaits the flow's own
+ * seam rather than the handler, which returns long before the gate closes.
+ */
+async function endReviewTurn(
+	harness: Harness,
+	reviewText?: string,
+	ctx: ExtensionContext = harness.ctx,
+): Promise<void> {
+	harness.flow.captureReviewTurn(reviewText);
+	harness.flow.reopenAfterReviewTurn(ctx);
+	await harness.flow.whenReopenSettled();
+}
+
+/** Lets detached work reach its next suspension point without awaiting its completion. */
+async function flush(): Promise<void> {
+	for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("GateBFlow.viewFromPendingReview", () => {
@@ -635,10 +677,10 @@ describe("GateBFlow.run", () => {
 	});
 });
 
-describe("GateBFlow.handleAgentEnd", () => {
+describe("GateBFlow review-turn capture and reopen", () => {
 	it("does nothing when no handoff is active", async () => {
 		const harness = createHarness();
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await endReviewTurn(harness);
 
 		assert.deepEqual(harness.overlays, []);
 		assert.deepEqual(harness.notifications, []);
@@ -647,7 +689,7 @@ describe("GateBFlow.handleAgentEnd", () => {
 	it("does nothing while a review is pending but unarmed", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await endReviewTurn(harness);
 
 		assert.deepEqual(harness.overlays, []);
 	});
@@ -658,9 +700,66 @@ describe("GateBFlow.handleAgentEnd", () => {
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await endReviewTurn(harness);
 
 		assert.equal(harness.overlays.length, 2);
+	});
+
+	/**
+	 * The reason the capture and the reopen are separate hooks: Pi awaits extension
+	 * `agent_end` handlers before the listener that clears its `Working` spinner runs,
+	 * so anything opened here would sit under a spinner that cannot clear.
+	 */
+	it("opens nothing from the capture itself", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		await flush();
+
+		// Only Review here's own gate. The captured review is not even persisted yet.
+		assert.equal(harness.overlays.length, 1);
+		assert.equal(harness.machine.reviewing()?.review, undefined);
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
+	});
+
+	/**
+	 * The property the whole split exists for: Pi awaits its extension handlers, so a
+	 * reopen that was awaited would hold the turn — and every other extension's settle
+	 * handler — open for the gate and any worker run it starts.
+	 */
+	it("returns from the settle while the reopened gate is still open", async () => {
+		let release: (() => void) | undefined;
+		let held: Promise<void> | undefined;
+		const harness = createHarness({ selections: ["dismiss"], holdGate: () => held });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		// Synchronous by signature, and asserted rather than assumed: a method that became
+		// async would still type-check against `void`, and would hand Pi a promise that
+		// stays pending until the gate closes.
+		const returned: unknown = harness.flow.reopenAfterReviewTurn(harness.ctx);
+		assert.equal(returned, undefined, "the settle handler has nothing for Pi to await");
+
+		let finished = false;
+		void harness.flow.whenReopenSettled().then(() => {
+			finished = true;
+		});
+		await flush();
+
+		assert.equal(harness.overlays.length, 1, "the reopened gate is on screen");
+		assert.equal(finished, false, "the gate is still open, so the handler cannot have awaited it");
+
+		release?.();
+		await harness.flow.whenReopenSettled();
+		assert.equal(finished, true);
 	});
 
 	it("captures the final reviewer text and verdict before reopening Gate B", async () => {
@@ -669,7 +768,7 @@ describe("GateBFlow.handleAgentEnd", () => {
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
-		await harness.flow.handleAgentEnd(harness.ctx, "The timeout path needs a test.\nVerdict: FIX\n");
+		await endReviewTurn(harness, "The timeout path needs a test.\nVerdict: FIX\n");
 
 		assert.deepEqual(harness.machine.reviewing()?.review, {
 			iteration: 1,
@@ -679,38 +778,90 @@ describe("GateBFlow.handleAgentEnd", () => {
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
 	});
 
-	/**
-	 * The ordering guard. `agent_end` can fire more than once per prompt, so the arm
-	 * has to be down before the gate opens; clearing it afterwards would let the
-	 * second event open a second gate behind the first.
-	 */
-	it("opens exactly one gate when agent_end fires twice for one prompt", async () => {
-		const harness = createHarness({ selections: ["review", "dismiss", "dismiss"] });
-		await reachReview(harness);
-		const view = await harness.flow.viewFromPendingReview(harness.ctx);
-		assert.ok(view);
-		await harness.flow.run(harness.ctx, view);
+	it("reopens chained Run and review feedback with the next review's text exactly once", async () => {
+		let releaseFirstGate: (() => void) | undefined;
+		let firstGate: Promise<void> | undefined;
+		let holdFirstGate = true;
+		const harness = createHarness({
+			selections: ["feedback", "dismiss"],
+			editorResult: "Fix the timeout edge case.",
+			holdGate: () => {
+				if (!holdFirstGate) return undefined;
+				holdFirstGate = false;
+				return firstGate;
+			},
+		});
+		await reachReview(harness, { autoReview: true });
+		assert.equal(harness.machine.reviewing()?.autoReview, true);
+		assert.equal(harness.flow.startReviewTurn(harness.ctx), true);
 
-		await harness.flow.handleAgentEnd(harness.ctx);
-		await harness.flow.handleAgentEnd(harness.ctx);
+		const firstReview = "The timeout path needs a test.\nVerdict: fix";
+		firstGate = new Promise<void>((resolve) => {
+			releaseFirstGate = resolve;
+		});
+		harness.flow.captureReviewTurn(firstReview);
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await flush();
 
-		// One for Review here, one for the reopen. A third would be the stacked gate.
-		assert.equal(harness.overlays.length, 2);
+		assert.equal(harness.overlays.length, 1, "the first settled review reopens one gate");
+		assert.equal((await harness.flow.viewFromPendingReview(harness.ctx))?.review?.text, firstReview);
+
+		releaseFirstGate?.();
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.iteration, 2);
+		assert.equal(harness.machine.reviewing()?.autoReview, true, "the Run and review latch survives feedback");
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
+		assert.equal(harness.messages.length, 2, "feedback starts a new review turn through sendUserMessage");
+
+		const secondReview = "The retry also needs an error-path assertion.\nVerdict: fix";
+		harness.flow.captureReviewTurn(secondReview);
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.overlays.length, 2, "each settled review reopens exactly one gate");
+		assert.equal((await harness.flow.viewFromPendingReview(harness.ctx))?.review?.text, secondReview);
+		assert.notEqual(harness.machine.reviewing()?.review?.text, firstReview);
 	});
 
 	/**
-	 * A concurrent second event must not slip past the flag either: the clear happens
-	 * before the first `await`, so the second call sees it down without interleaving.
+	 * `_runAgentPrompt` loops on auto-retry, so one prompt can end several times before
+	 * it settles. The review is whatever the *last* attempt said; keeping the first
+	 * capture would persist the text of an attempt that was thrown away.
 	 */
-	it("opens one gate when two agent_end events race", async () => {
+	it("keeps the last capture when a retried prompt ends more than once", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn("Partial attempt.\nVerdict: fix");
+		harness.flow.captureReviewTurn("The retry got there.\nVerdict: accept");
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.review?.text, "The retry got there.\nVerdict: accept");
+		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
+		assert.equal(harness.overlays.length, 1, "several captures still reopen one gate");
+	});
+
+	/**
+	 * The ordering guard. The capture is dropped before the first `await`, so a second
+	 * settle for the same turn finds nothing to reopen; a capture cleared only after the
+	 * gate closed would let the second event stack a gate behind the first.
+	 */
+	it("opens exactly one gate when a settle is delivered twice", async () => {
 		const harness = createHarness({ selections: ["review", "dismiss", "dismiss"] });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		await Promise.all([harness.flow.handleAgentEnd(harness.ctx), harness.flow.handleAgentEnd(harness.ctx)]);
+		harness.flow.captureReviewTurn();
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
 
+		// One for Review here, one for the reopen. A third would be the stacked gate.
 		assert.equal(harness.overlays.length, 2);
 	});
 
@@ -720,11 +871,105 @@ describe("GateBFlow.handleAgentEnd", () => {
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await endReviewTurn(harness);
 		harness.overlays.length = 0;
 
-		await harness.flow.handleAgentEnd(harness.ctx);
+		await endReviewTurn(harness);
 		assert.deepEqual(harness.overlays, []);
+	});
+
+	/** A session replaced between the two events has no gate for the old capture to reopen. */
+	it("reopens nothing when the machine was reset between the capture and the settle", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+
+		harness.machine.reset();
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.deepEqual(harness.overlays, []);
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+	});
+
+	/**
+	 * The case the reopen's arm re-read exists for. A reset machine is already stopped by
+	 * `clearReview` finding nothing to clear, but `clearReviewTurn` accepts any `reviewing`
+	 * state, so a pending review that is no longer armed is only protected by the re-read.
+	 * Rehydration always comes back that way, so this stands in for a replacement session
+	 * that restored a pending review.
+	 */
+	it("reopens nothing when the pending review was disarmed between the capture and the settle", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		harness.flow.captureReviewTurn("Stale.\n\nVerdict: accept");
+
+		harness.machine.clearReviewTurn();
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.deepEqual(harness.overlays, []);
+		assert.equal(harness.machine.reviewing()?.review, undefined, "the stale text was not persisted");
+	});
+
+	/** What `session_start` and `session_shutdown` call, so a stale capture cannot reopen. */
+	it("reopens nothing after the capture is forgotten", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+
+		harness.flow.forgetReviewTurn();
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.deepEqual(harness.overlays, []);
+	});
+
+	/**
+	 * Nothing awaits the detached loop, so a failure inside it has to be reported here or
+	 * it becomes an unhandled rejection the user never sees.
+	 */
+	it("reports a failure from the detached reopen instead of rejecting", async () => {
+		const harness = createHarness({ gateThrows: true });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		const reported = harness.notifications.at(-1);
+		assert.equal(reported?.level, "error");
+		assert.match(reported?.message ?? "", /Gate B stopped with an error: the overlay could not be rendered/);
+		// The review still landed, and the message says how to get back to it.
+		assert.match(reported?.message ?? "", /still pending; run `\/handoff` to reopen Gate B/);
+		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
+	});
+
+	/**
+	 * The catch covers the whole loop, so a failure can land after Accept has already
+	 * reset the machine. Promising that `/handoff` reopens the review would then send the
+	 * user into a fresh draft instead.
+	 */
+	it("does not promise a reopen when the failure lands after Accept reset the machine", async () => {
+		const harness = createHarness({ selections: ["accept_leftovers"], draftLeftoversThrows: true });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn("Correct.\n\nLeftovers:\n- Rename the misleading test\nVerdict: accept");
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		const reported = harness.notifications.at(-1);
+		assert.equal(reported?.level, "error");
+		assert.match(reported?.message ?? "", /Gate B stopped with an error: the drafting call failed/);
+		assert.doesNotMatch(reported?.message ?? "", /still pending|to reopen Gate B/);
+		assert.match(reported?.message ?? "", /`\/handoff status`/);
 	});
 
 	it("opens no gate outside a TUI, but still clears the arm", async () => {
@@ -735,7 +980,7 @@ describe("GateBFlow.handleAgentEnd", () => {
 		await harness.flow.run(harness.ctx, view);
 
 		const headless = { ...harness.ctx, mode: "print" } as unknown as ExtensionContext;
-		await harness.flow.handleAgentEnd(headless);
+		await endReviewTurn(harness, undefined, headless);
 
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
 		assert.equal(harness.overlays.length, 1);
@@ -796,24 +1041,55 @@ describe("GateBFlow.startReviewTurn", () => {
 		const harness = createHarness({ selections: ["dismiss"] });
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
-		await harness.flow.handleAgentEnd(harness.ctx, "Looks right.\n\nVerdict: accept");
+		await endReviewTurn(harness, "Looks right.\n\nVerdict: accept");
 
 		assert.equal(harness.overlays.length, 1);
 		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
 	});
 });
 
+describe("formatReopenFailure", () => {
+	it("offers the reopen only while a review is pending", () => {
+		const pending = formatReopenFailure(new Error("boom"), true);
+		const gone = formatReopenFailure(new Error("boom"), false);
+
+		assert.match(
+			pending,
+			/^Gate B stopped with an error: boom\nThe review is still pending; run `\/handoff` to reopen Gate B\./,
+		);
+		assert.match(gone, /^Gate B stopped with an error: boom\nRun `\/handoff status` to see where the handoff stands\./);
+	});
+
+	/** The stack used to reach Pi's own extension-error display; now only this carries it. */
+	it("keeps the stack below the message, without repeating the message line", () => {
+		const error = new Error("boom");
+		error.stack = "Error: boom\n    at reopenGateB (gate-b-flow.ts:180:5)\n    at run (gate-b-flow.ts:400:9)";
+
+		const lines = formatReopenFailure(error, true).split("\n");
+
+		assert.deepEqual(lines.slice(2), ["  at reopenGateB (gate-b-flow.ts:180:5)", "  at run (gate-b-flow.ts:400:9)"]);
+		assert.equal(lines.filter((line) => line.includes("Error: boom")).length, 0);
+	});
+
+	it("reports a thrown non-Error without a stack", () => {
+		assert.equal(
+			formatReopenFailure("plain string", false),
+			"Gate B stopped with an error: plain string\nRun `/handoff status` to see where the handoff stands.",
+		);
+	});
+});
+
 describe("GateBFlow leftovers follow-up", () => {
 	/** Captured before Accept, which resets the machine and takes the review with it. */
 	it("accepts, then requests a follow-up draft from the prompt and structured items only", async () => {
-		// The reopen from `agent_end` is what renders the gate here, and its single queued
-		// selection is the leftovers option.
+		// The reopen after the review turn is what renders the gate here, and its single
+		// queued selection is the leftovers option.
 		const harness = createHarness({ selections: ["accept_leftovers"] });
 		await reachReview(harness);
-		// Armed first: `agent_end` only captures a review for a turn Review here started.
+		// Armed first: a review is only captured for a turn Review here started.
 		harness.flow.startReviewTurn(harness.ctx);
-		await harness.flow.handleAgentEnd(
-			harness.ctx,
+		await endReviewTurn(
+			harness,
 			"Correct.\n\nNote for you: schedule the rollout.\n\nLeftovers:\n- Update the stale comment on line 12\n- Rename the misleading test\nVerdict: accept",
 		);
 

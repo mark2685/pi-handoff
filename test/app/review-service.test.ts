@@ -283,7 +283,7 @@ describe("ReviewService review turn", () => {
 		assert.ok(!armed.ok);
 	});
 
-	it("clears the arm, which is what makes a second agent_end inert", async () => {
+	it("clears the arm, which is what makes a second review-turn reopen inert", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
 		harness.service.beginReview();

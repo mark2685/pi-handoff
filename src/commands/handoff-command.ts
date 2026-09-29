@@ -20,7 +20,7 @@
  * service is the only path from that draft to Gate A, so this gate can never be
  * bypassed by construction.
  *
- * Gate B's own loop lives in `gate-b-flow.ts`, because the `agent_end` reopen and
+ * Gate B's own loop lives in `gate-b-flow.ts`, because the review-turn reopen and
  * `/handoff` while a review is pending both need it and neither goes through
  * drafting.
  *
@@ -64,7 +64,7 @@ export interface HandoffCommandDeps {
 	createService: (ctx: ExtensionContext) => DraftService | undefined;
 	/** Session-scoped, so a reopened gate and the shutdown hook reach the same run. */
 	runService: RunService;
-	/** Session-scoped for the same reason: `agent_end` has no invocation to build one in. */
+	/** Session-scoped for the same reason: the review-turn hooks have no invocation to build one in. */
 	gateBFlow: GateBFlow;
 	/** Re-checked at every click, so a vanished provider blocks the spawn. */
 	isChoiceRunnable: (ctx: ExtensionContext, choice: ModelChoice | undefined) => boolean;

@@ -2,15 +2,20 @@
  * Contract tests for the extension entry point.
  *
  * These load the real `index.ts` and drive it through a stub `ExtensionAPI`,
- * pinning the registration surface: one command, no tools, and exactly the three
+ * pinning the registration surface: one command, no tools, and exactly the four
  * lifecycle hooks the design's §4 names.
  *
- * The `agent_end` assertions are the important ones. That hook fires on every
- * ordinary turn in every session, including sessions with no handoff, so it is
- * tested for inertness rather than for its effect: no UI, no state change, and no
- * session entry unless a Review here turn armed it. `agent_end` can also fire more
- * than once per prompt, since `_runAgentPrompt` loops on auto-retry, which is why
- * the arm flag is cleared before a gate opens rather than after.
+ * The review-turn assertions are the important ones. `agent_end` and
+ * `agent_settled` fire on every ordinary turn in every session, including sessions
+ * with no handoff, so they are tested for inertness rather than for their effect: no
+ * UI, no state change, and no session entry unless a Review here turn armed them.
+ *
+ * Their split is asserted end to end here, because only the entry point wires it:
+ * `agent_end` captures the review and opens nothing, and `agent_settled` reopens
+ * Gate B without being awaited. The reopen is therefore observed after a flush
+ * rather than on the handler's own promise. `agent_end` can also fire more than once
+ * per prompt, since `_runAgentPrompt` loops on auto-retry, so the last capture is
+ * the one that reaches the gate.
  *
  * The non-interactive assertions matter beyond registration: `npm run smoke` runs
  * `/handoff status` headlessly, so status must not touch a TUI surface, and
@@ -88,6 +93,55 @@ async function fireHook(recorder: Recorder, event: string, eventPayload: unknown
 	await (handlers[0] as (event: unknown, ctx: unknown) => unknown)(eventPayload, ctx);
 }
 
+/**
+ * Lets work a handler launched but did not await reach its next suspension point.
+ *
+ * The reopen is deliberately detached, so there is no promise to await from out here;
+ * that is the property under test, not a shortcut.
+ */
+async function flush(): Promise<void> {
+	for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * A resumable session holding a completed run whose review is pending and unarmed.
+ *
+ * Shared because it is the only starting point from which `/handoff` can arm a review
+ * turn, and both the follow-up delivery test and the capture/reopen tests need to
+ * start there rather than from idle.
+ */
+const COMPLETED_REVIEW_BRANCH = [
+	{
+		type: "custom",
+		customType: "handoff-state",
+		data: {
+			kind: "reviewing",
+			completion: "completed",
+			draft: { slug: "add-retries", prompt: "Do it.", tier: "standard", rationale: "Because." },
+			choice: { provider: "bifrost", model: "claude-sonnet-5", thinking: "high" },
+			iteration: 1,
+			checkpoint: { repositoryRoot: "/repo", head: "abc1234", statuses: [] },
+			report: "Did it.",
+			diffstat: " 1 file changed",
+			usage: {
+				inputTokens: 1,
+				outputTokens: 1,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+				cost: 0,
+				contextTokens: 1,
+				turns: 1,
+			},
+			awaitingReviewTurn: false,
+		},
+	},
+];
+
+/** The shape `agent_end` carries a reviewer's text in, as the real event's messages do. */
+function assistantMessage(text: string) {
+	return { role: "assistant", content: [{ type: "text", text }] };
+}
+
 interface Notification {
 	message: string;
 	level?: string;
@@ -99,6 +153,8 @@ interface CommandContextOptions {
 	hasModel?: boolean;
 	branch?: unknown[];
 	customResult?: unknown;
+	/** Consumed one per overlay, for flows that render more than one gate. */
+	customResults?: unknown[];
 }
 
 function createCommandContext(options: CommandContextOptions = {}) {
@@ -128,7 +184,7 @@ function createCommandContext(options: CommandContextOptions = {}) {
 			},
 			custom: async () => {
 				uiCalls.push("custom");
-				return options.customResult;
+				return options.customResults === undefined ? options.customResult : options.customResults.shift();
 			},
 			editor: async () => {
 				uiCalls.push("editor");
@@ -164,8 +220,13 @@ describe("extension registration", () => {
 		assert.equal(recorder.tools.length, 0);
 	});
 
-	it("registers exactly the three lifecycle hooks the design names", () => {
-		assert.deepEqual([...recorder.hooks.keys()].sort(), ["agent_end", "session_shutdown", "session_start"]);
+	it("registers exactly the four lifecycle hooks the design names", () => {
+		assert.deepEqual([...recorder.hooks.keys()].sort(), [
+			"agent_end",
+			"agent_settled",
+			"session_shutdown",
+			"session_start",
+		]);
 	});
 
 	it("registers one handler per hook, so no gate can open twice", () => {
@@ -313,33 +374,7 @@ describe("session_start rehydration", () => {
 	it("delivers Review here as a follow-up and arms the next review turn", async () => {
 		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
-		const branch = [
-			{
-				type: "custom",
-				customType: "handoff-state",
-				data: {
-					kind: "reviewing",
-					completion: "completed",
-					draft: { slug: "add-retries", prompt: "Do it.", tier: "standard", rationale: "Because." },
-					choice: { provider: "bifrost", model: "claude-sonnet-5", thinking: "high" },
-					iteration: 1,
-					checkpoint: { repositoryRoot: "/repo", head: "abc1234", statuses: [] },
-					report: "Did it.",
-					diffstat: " 1 file changed",
-					usage: {
-						inputTokens: 1,
-						outputTokens: 1,
-						cacheReadTokens: 0,
-						cacheWriteTokens: 0,
-						cost: 0,
-						contextTokens: 1,
-						turns: 1,
-					},
-					awaitingReviewTurn: false,
-				},
-			},
-		];
-		const { ctx } = createCommandContext({ mode: "tui", branch, customResult: "review" });
+		const { ctx } = createCommandContext({ mode: "tui", branch: COMPLETED_REVIEW_BRANCH, customResult: "review" });
 		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
 		await command.handler("", ctx);
 
@@ -375,7 +410,7 @@ describe("session_shutdown cleanup", () => {
 	});
 });
 
-describe("agent_end reopen", () => {
+describe("review-turn capture and reopen", () => {
 	let recorder: Recorder;
 
 	beforeEach(() => {
@@ -383,10 +418,27 @@ describe("agent_end reopen", () => {
 		handoff(recorder.api);
 	});
 
-	/** This hook fires on every turn of every session; inertness is its main requirement. */
+	/** Arms a review turn the way Review here does, leaving Gate B's first render behind. */
+	async function armReviewTurn(options: { customResults: unknown[] }) {
+		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
+		assert.ok(command);
+		const context = createCommandContext({
+			mode: "tui",
+			branch: COMPLETED_REVIEW_BRANCH,
+			customResults: options.customResults,
+		});
+		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, context.ctx);
+		await command.handler("", context.ctx);
+		assert.deepEqual(context.uiCalls, ["custom"], "Review here's own gate");
+		return context;
+	}
+
+	/** Both hooks fire on every turn of every session; inertness is their main requirement. */
 	it("opens no UI when the machine is idle", async () => {
 		const { ctx, uiCalls, notifications } = createCommandContext({ mode: "tui" });
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
 
 		assert.deepEqual(uiCalls, []);
 		assert.deepEqual(notifications, []);
@@ -397,6 +449,8 @@ describe("agent_end reopen", () => {
 		assert.ok(command);
 		const { ctx, notifications } = createCommandContext({ mode: "tui" });
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
 		await command.handler("status", ctx);
 
 		assert.deepEqual(notifications, [{ message: "Handoff: idle", level: "info" }]);
@@ -405,8 +459,116 @@ describe("agent_end reopen", () => {
 	it("appends no session entry when the machine is idle", async () => {
 		const { ctx } = createCommandContext({ mode: "tui" });
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
 
 		assert.deepEqual(recorder.entries, []);
+	});
+
+	/**
+	 * The end-to-end shape of the split. `agent_end` may not open anything: Pi awaits
+	 * extension `agent_end` handlers before the listener that clears its `Working`
+	 * spinner runs, so a gate opened there would sit under a spinner that cannot clear.
+	 */
+	it("captures in agent_end and reopens Gate B from agent_settled, exactly once", async () => {
+		const { ctx, uiCalls } = await armReviewTurn({ customResults: ["review", "dismiss"] });
+
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await flush();
+		assert.deepEqual(uiCalls, ["custom"], "agent_end opens nothing");
+
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
+		assert.deepEqual(uiCalls, ["custom", "custom"], "the settle reopens one gate");
+
+		// A repeated settle for the same turn must not stack another.
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
+		assert.deepEqual(uiCalls, ["custom", "custom"]);
+	});
+
+	/**
+	 * The property the split exists for, pinned at the entry point. Every other settle test
+	 * resolves its gate at once, so an `index.ts` handler that awaited the reopen would
+	 * pass them all; this one keeps the reopened gate open and requires the hook itself
+	 * to have settled first, racing it against a flush so a regression fails, not hangs.
+	 */
+	it("settles the agent_settled hook while the reopened gate is still open", async () => {
+		let release: ((value: unknown) => void) | undefined;
+		const held = new Promise((resolve) => {
+			release = resolve;
+		});
+		const { ctx, uiCalls } = await armReviewTurn({ customResults: ["review", held] });
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		try {
+			const hook = fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx).then(() => "hook");
+			const first = await Promise.race([hook, flush().then(() => "flush")]);
+
+			assert.equal(first, "hook", "the hook must not wait on the gate it opened");
+			await flush();
+			assert.deepEqual(uiCalls, ["custom", "custom"], "the reopened gate is still on screen");
+		} finally {
+			release?.("dismiss");
+			await flush();
+		}
+	});
+
+	/** An auto-retried prompt ends more than once, and the review is the last attempt's. */
+	it("reopens once with the last capture when a retried prompt ends twice", async () => {
+		const { ctx, uiCalls } = await armReviewTurn({ customResults: ["review", "dismiss"] });
+
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [assistantMessage("Partial.")] }, ctx);
+		await fireHook(
+			recorder,
+			"agent_end",
+			{ type: "agent_end", messages: [assistantMessage("The retry got there.")] },
+			ctx,
+		);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
+
+		assert.deepEqual(uiCalls, ["custom", "custom"]);
+		const recorded = recorder.entries.at(-1)?.data as { review?: { text?: string } };
+		assert.equal(recorded.review?.text, "The retry got there.");
+	});
+
+	/**
+	 * A capture cannot outlive the session it was taken in, or it reopens a stale gate.
+	 *
+	 * The replacement session arms a review turn of its own, so the arm check passes and
+	 * the dropped capture is the only thing standing between it and a gate showing the
+	 * previous session's review. A replacement that merely reset to idle would be
+	 * stopped by the arm check alone and prove nothing about `session_start`.
+	 */
+	it("reopens nothing from a capture taken before the session was replaced", async () => {
+		const previous = await armReviewTurn({ customResults: ["review", "dismiss"] });
+		await fireHook(
+			recorder,
+			"agent_end",
+			{ type: "agent_end", messages: [assistantMessage("The previous session's review.")] },
+			previous.ctx,
+		);
+
+		const replacement = await armReviewTurn({ customResults: ["review", "dismiss"] });
+		const entriesBefore = recorder.entries.length;
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, replacement.ctx);
+		await flush();
+
+		assert.deepEqual(previous.uiCalls, ["custom"]);
+		assert.deepEqual(replacement.uiCalls, ["custom"], "only the replacement's own Review here gate");
+		assert.equal(recorder.entries.length, entriesBefore, "no stale review was persisted");
+	});
+
+	it("reopens nothing when the session shuts down between the two events", async () => {
+		const { ctx, uiCalls } = await armReviewTurn({ customResults: ["review", "dismiss"] });
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		await fireHook(recorder, "session_shutdown", { type: "session_shutdown", reason: "quit" }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
+
+		assert.deepEqual(uiCalls, ["custom"]);
 	});
 
 	/**
@@ -415,35 +577,11 @@ describe("agent_end reopen", () => {
 	 * §5.5 possible.
 	 */
 	it("opens no UI while reviewing with the review arm clear", async () => {
-		const branch = [
-			{
-				type: "custom",
-				customType: "handoff-state",
-				data: {
-					kind: "reviewing",
-					completion: "completed",
-					draft: { slug: "add-retries", prompt: "Do it.", tier: "standard", rationale: "Because." },
-					choice: { provider: "bifrost", model: "claude-sonnet-5", thinking: "high" },
-					iteration: 1,
-					checkpoint: { repositoryRoot: "/repo", head: "abc1234", statuses: [] },
-					report: "Did it.",
-					diffstat: " 1 file changed",
-					usage: {
-						inputTokens: 1,
-						outputTokens: 1,
-						cacheReadTokens: 0,
-						cacheWriteTokens: 0,
-						cost: 0,
-						contextTokens: 1,
-						turns: 1,
-					},
-					awaitingReviewTurn: false,
-				},
-			},
-		];
-		const { ctx, uiCalls, notifications } = createCommandContext({ mode: "tui", branch });
+		const { ctx, uiCalls, notifications } = createCommandContext({ mode: "tui", branch: COMPLETED_REVIEW_BRANCH });
 		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
 
 		assert.deepEqual(uiCalls, []);
 		assert.deepEqual(notifications, []);
@@ -594,10 +732,12 @@ describe("external run recovery", () => {
 		assert.deepEqual(recorder.entries, []);
 	});
 
-	it("opens no UI from agent_end while an external run is in flight", async () => {
+	it("opens no UI from a review turn while an external run is in flight", async () => {
 		const { ctx, uiCalls } = createCommandContext({ mode: "tui", branch: EXTERNAL_BRANCH });
 		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
 
 		assert.deepEqual(uiCalls, []);
 	});
