@@ -82,6 +82,9 @@ export function createPiSessionTranscriptSource(ctx: ExtensionContext): SessionT
 	};
 }
 
+/** Shown when the provider reported a failure but named no reason for it. */
+const UNNAMED_COMPLETION_FAILURE = "the drafting model reported an error without naming it";
+
 /** Extracts assistant text, which is the only content a draft envelope can occupy. */
 function extractText(content: readonly { type: string }[]): string {
 	return content
@@ -119,8 +122,30 @@ export function createPiDraftingModel(ctx: ExtensionContext, model: Model<Api>):
 
 				if (response.stopReason === "aborted") return err({ kind: "aborted" });
 
+				// `complete` resolves for provider failures instead of throwing, so the stop reason
+				// is the only place the failure is stated. Reporting all of them as "returned no
+				// text" hid a 402 budget error behind a sentence that suggested the model had
+				// answered with nothing, which no retry or reword could have fixed.
+				if (response.stopReason === "error") {
+					return err({ kind: "completion_failed", detail: response.errorMessage ?? UNNAMED_COMPLETION_FAILURE });
+				}
+
 				const text = extractText(response.content);
-				return text.trim() === "" ? err({ kind: "empty_response" }) : ok(text);
+				if (text.trim() !== "") return ok(text);
+
+				// A truncated-at-zero-text response is a failure of the call, not an empty answer:
+				// the envelope never started, and the reason is the output limit rather than the
+				// model having nothing to say.
+				if (response.stopReason === "length") {
+					return err({
+						kind: "completion_failed",
+						detail:
+							response.errorMessage ??
+							"the drafting model hit its output limit before writing any text; try a narrower scope",
+					});
+				}
+
+				return err({ kind: "empty_response" });
 			} catch (error) {
 				if (request.signal?.aborted === true) return err({ kind: "aborted" });
 				return err({

@@ -77,6 +77,36 @@ export function unparseableMenu(): MenuOption<UnparseableOptionId>[] {
 	];
 }
 
+export type ReviewOptionLabel = "Review here" | "Review again";
+
+/**
+ * The label Gate B gives its review option.
+ *
+ * Shared so that text pointing the user at the option, such as a failed review turn's
+ * notice, names exactly what the menu renders.
+ */
+export function reviewOptionLabel(reviewed: boolean): ReviewOptionLabel {
+	return reviewed ? "Review again" : "Review here";
+}
+
+export type AnsweredRetryOptionId = "retry" | "cancel";
+
+/**
+ * Builds the menu shown when a re-draft carrying answered NEEDS INPUT questions fails.
+ *
+ * Retry re-sends the identical answered scope, because the answers are the expensive
+ * part of this flow: one observed session spent fifty minutes on a single answer, and
+ * a provider failure ten seconds later dropped the handoff to idle and took the answer
+ * with it. Cancel is spelled out as discarding them, so ending the flow stays a
+ * decision rather than a side effect.
+ */
+export function answeredRetryMenu(): MenuOption<AnsweredRetryOptionId>[] {
+	return [
+		{ id: "retry", label: "Retry the draft with the same answers" },
+		{ id: "cancel", label: "Cancel the handoff and discard the answers" },
+	];
+}
+
 export type NeedsInputOptionId = "answer" | "proceed" | "edit" | "view" | "cancel";
 
 /**
@@ -150,7 +180,7 @@ export function gateBMenu(options: {
 	const reviewed = options.review !== undefined;
 	const reviewOptions: MenuOption<GateBOptionId>[] = options.interrupted
 		? []
-		: [{ id: "review", label: reviewed ? "Review again" : "Review here" }];
+		: [{ id: "review", label: reviewOptionLabel(reviewed) }];
 
 	const feedbackLabel =
 		options.feedback !== undefined && !options.feedback.allowed

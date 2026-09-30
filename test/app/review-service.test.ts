@@ -317,6 +317,18 @@ describe("ReviewService review turn", () => {
 		assert.deepEqual(cleared.value.review, { iteration: 1, text: "I cannot make a recommendation." });
 	});
 
+	/** A failed review turn hands over empty text; recording it claims a review happened. */
+	it("records no review when the turn produced only blank text", async () => {
+		const harness = createHarness();
+		await reachReview(harness);
+		harness.service.beginReview();
+		const cleared = harness.service.clearReview("   \n");
+
+		assert.ok(cleared.ok);
+		assert.equal(cleared.value.review, undefined);
+		assert.equal(cleared.value.awaitingReviewTurn, false);
+	});
+
 	it("keeps the review pending after the arm is cleared", async () => {
 		const harness = createHarness();
 		await reachReview(harness);

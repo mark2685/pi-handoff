@@ -47,6 +47,13 @@ function send(event) {
 	process.stdout.write(JSON.stringify(event) + "\\n");
 }
 
+function failedAttempt(errorMessage) {
+	return {
+		type: "message_end",
+		message: { role: "assistant", content: [], usage: zeroUsage, stopReason: "error", errorMessage },
+	};
+}
+
 function assistant(text, usage, stopReason = "stop", errorMessage) {
 	const message = {
 		role: "assistant",
@@ -119,6 +126,37 @@ if (scenario.includes("capture-args")) {
 	process.stderr.write("worker exploded\\n");
 	send(assistant("Partial report before failure.", firstUsage, "error", "provider failed"));
 	process.exitCode = 17;
+} else if (scenario === "retry-recovered") {
+	send({ type: "agent_start" });
+	send(failedAttempt("529 overloaded"));
+	send({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1, errorMessage: "529 overloaded" });
+	send(assistant("Done. Final report: the work is complete.", firstUsage));
+	send({ type: "auto_retry_end", success: true, attempt: 1 });
+	send({ type: "agent_end", messages: [], willRetry: false });
+} else if (scenario === "retry-exhausted") {
+	send({ type: "agent_start" });
+	send(assistant("Reading the files.", firstUsage, "toolUse"));
+	send(failedAttempt("529 overloaded"));
+	send({ type: "auto_retry_start", attempt: 1, maxAttempts: 1, delayMs: 1, errorMessage: "529 overloaded" });
+	send(failedAttempt("529 overloaded again"));
+	send({ type: "agent_end", messages: [], willRetry: false });
+	send({ type: "auto_retry_end", success: false, attempt: 1, finalError: "529 overloaded again" });
+} else if (scenario === "retry-exhausted-final-error") {
+	// The last message and auto_retry_end disagree, so only the retry bookkeeping can win.
+	send({ type: "agent_start" });
+	send(failedAttempt("529 overloaded"));
+	send({ type: "auto_retry_start", attempt: 1, maxAttempts: 1, delayMs: 1, errorMessage: "529 overloaded" });
+	send(failedAttempt("529 last attempt"));
+	send({ type: "agent_end", messages: [], willRetry: false });
+	send({ type: "auto_retry_end", success: false, attempt: 1, finalError: "529 final" });
+} else if (scenario === "retry-exhausted-unnamed") {
+	// Neither the last message nor auto_retry_end names the failure.
+	send({ type: "agent_start" });
+	send(failedAttempt("529 overloaded"));
+	send({ type: "auto_retry_start", attempt: 1, maxAttempts: 1, delayMs: 1, errorMessage: "529 overloaded" });
+	send(failedAttempt(undefined));
+	send({ type: "agent_end", messages: [], willRetry: false });
+	send({ type: "auto_retry_end", success: false, attempt: 1 });
 } else if (scenario === "malformed") {
 	process.stdout.write("not JSON\\n{not valid JSON}\\n");
 	send(assistant("Report after malformed progress.", firstUsage));

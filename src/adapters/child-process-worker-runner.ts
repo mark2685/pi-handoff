@@ -247,10 +247,38 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 			const activeTools = new Map<string, WorkerActiveTool>();
 			let activity: WorkerActivity = { kind: "starting" };
 			let lastProgressAtMs = Number.NEGATIVE_INFINITY;
+			/**
+			 * The stop reason and error of the *latest* assistant message, not of any earlier one.
+			 *
+			 * Both are replaced wholesale on every assistant `message_end`, including being
+			 * cleared. Pi retries a transient provider failure by emitting the failed attempt's
+			 * `message_end` (`stopReason: "error"` plus an `errorMessage`), then continuing the
+			 * run; a sticky error therefore made a worker that went on to write a complete final
+			 * report reach Gate B as interrupted, with that report discarded as pre-crash text.
+			 * When the retries are exhausted instead, the last assistant message is itself the
+			 * error, so the failure survives exactly where it should.
+			 */
 			let stopReason: string | undefined;
-			let errorMessage: string | undefined;
+			let messageErrorMessage: string | undefined;
+			/**
+			 * The final error reported by `auto_retry_end`, which is the authoritative name for
+			 * an exhausted-retry failure even if the last message carried no `errorMessage`.
+			 * Cleared by a successful retry, since that run has no failure left to report.
+			 */
+			let retryErrorMessage: string | undefined;
+			/**
+			 * A failure this adapter itself observed: a spawn error, a process `error` event, or a
+			 * progress callback that threw. Kept separate from the worker's own message errors so
+			 * a later successful assistant message cannot clear it — the run is broken on our side
+			 * regardless of what the child went on to say.
+			 */
+			let adapterErrorMessage: string | undefined;
 			let stderr = "";
 			let aborted = false;
+
+			/** The run's error as of now, preferring adapter failures over the worker's own. */
+			const currentErrorMessage = (): string | undefined =>
+				adapterErrorMessage ?? retryErrorMessage ?? messageErrorMessage;
 
 			return new Promise<WorkerRunOutcome>((resolve) => {
 				let settled = false;
@@ -265,7 +293,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 					usage: copyUsage(usage),
 					toolResults: toolResults.map((result) => ({ ...result })),
 					stopReason,
-					errorMessage,
+					errorMessage: currentErrorMessage(),
 					stderr,
 					aborted,
 				});
@@ -335,14 +363,14 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 						usage: copyUsage(usage),
 						toolResults: toolResults.map((result) => ({ ...result })),
 						stopReason,
-						errorMessage,
+						errorMessage: currentErrorMessage(),
 						activity: { ...activity },
 						activeTools: Array.from(activeTools.values(), (tool) => ({ ...tool })),
 					};
 					try {
 						request.onProgress(progress);
 					} catch (error) {
-						errorMessage ??= `Worker progress callback failed: ${errorText(error)}`;
+						adapterErrorMessage ??= `Worker progress callback failed: ${errorText(error)}`;
 						stopProcess(false);
 					}
 				};
@@ -443,8 +471,10 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 								usage.cost += message.usage.cost;
 								usage.contextTokens = message.usage.contextTokens;
 							}
-							if (message.stopReason !== undefined) stopReason = message.stopReason;
-							if (message.errorMessage !== undefined) errorMessage = message.errorMessage;
+							// Replaced, never merged: only the final assistant message describes how the run
+							// ended, and a retried attempt's error is superseded by whatever followed it.
+							stopReason = message.stopReason;
+							messageErrorMessage = message.errorMessage;
 							emitProgress(
 								setActivity(message.stopReason === "toolUse" ? { kind: "preparing_tool" } : { kind: "writing" }),
 							);
@@ -457,6 +487,21 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 							setActivity({ kind: "thinking" });
 							emitProgress(true);
 						}
+						return;
+					}
+
+					// Pi's own retry bookkeeping, which is the only record of a retry that was
+					// exhausted rather than superseded. A successful retry clears it, so a run that
+					// recovered reports no error at all.
+					if (event.type === "auto_retry_end") {
+						if (event.success === true) {
+							retryErrorMessage = undefined;
+							return;
+						}
+						retryErrorMessage =
+							typeof event.finalError === "string" && event.finalError !== ""
+								? event.finalError
+								: "The worker's model request failed and every automatic retry was exhausted.";
 						return;
 					}
 
@@ -488,7 +533,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 				};
 
 				const onError = (error: Error) => {
-					errorMessage ??= errorText(error);
+					adapterErrorMessage ??= errorText(error);
 					settle(1);
 				};
 
@@ -503,7 +548,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 						stdio: ["ignore", "pipe", "pipe"],
 					});
 				} catch (error) {
-					errorMessage = errorText(error);
+					adapterErrorMessage = errorText(error);
 					settle(1);
 					return;
 				}

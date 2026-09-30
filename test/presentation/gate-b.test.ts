@@ -1051,4 +1051,11 @@ describe("formatGateBSummary external runs", () => {
 		const lines = formatGateBSummary(INTERRUPTED_VIEW);
 		assert.ok(lines.includes("Usage:     not available for an unfinished run"));
 	});
+
+	it("shows an interrupted run's measured usage under a heading that says it is partial", () => {
+		const lines = formatGateBSummary({ ...INTERRUPTED_VIEW, usage: USAGE });
+		assert.ok(lines.includes("Usage:     measured before the run ended"));
+		assert.ok(lines.includes("Cost:      $0.4231"));
+		assert.ok(!lines.includes("Usage:     not available for an unfinished run"));
+	});
 });

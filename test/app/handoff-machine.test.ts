@@ -513,6 +513,18 @@ describe("handoff run interruption", () => {
 		assert.equal(result.value.usage, null);
 	});
 
+	it("keeps usage that was measured before the run ended", () => {
+		machine.beginDraft("interrupted run");
+		machine.propose(draft, choice);
+		machine.startRun(startInput());
+
+		const result = machine.interruptRun({ note: "stopped", usage });
+
+		assert.ok(result.ok);
+		// Null still means "never measured"; a killed child's tokens were spent for real.
+		assert.deepEqual(result.value.usage, usage);
+	});
+
 	it("keeps the checkpoint so the worker's changes remain discardable", () => {
 		machine.beginDraft("interrupted run");
 		machine.propose(draft, choice);

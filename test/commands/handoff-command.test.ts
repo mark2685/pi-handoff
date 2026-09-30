@@ -21,14 +21,15 @@ import assert from "node:assert/strict";
 import { before, describe, it } from "node:test";
 import { initTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createDraftService, type DraftService } from "../../src/app/draft-service.ts";
-import { createHandoffMachine } from "../../src/app/handoff-machine.ts";
+import { createHandoffMachine, rehydrateHandoffState, type HandoffState } from "../../src/app/handoff-machine.ts";
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
 import type { RunService } from "../../src/app/run-service.ts";
 import { createHandoffCommandHandler, type HandoffCommand } from "../../src/commands/handoff-command.ts";
 import type { GateBFlow } from "../../src/commands/gate-b-flow.ts";
 import { LEFTOVERS_PROMPT_HEADING, LEFTOVERS_REVIEW_HEADING } from "../../src/domain/draft/leftovers.ts";
-import { ok, type Result } from "../../src/domain/result.ts";
+import { err, ok, type Result } from "../../src/domain/result.ts";
 import { DEFAULT_RUBRIC } from "../../src/domain/rubric/defaults.ts";
+import { validateHandoffState } from "../../src/persistence/schemas.ts";
 import type { AvailableModel, Draft } from "../../src/domain/types.ts";
 import type { Clock } from "../../src/ports/clock.ts";
 import type { Clipboard } from "../../src/ports/clipboard.ts";
@@ -76,6 +77,7 @@ interface Harness {
 	transcriptReads: () => number;
 	notifications: { message: string; level?: string }[];
 	selectCalls: { title: string; options: string[] }[];
+	recorded: HandoffState[];
 }
 
 /**
@@ -89,6 +91,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const scopeAtCall: (string | undefined)[] = [];
 	const notifications: { message: string; level?: string }[] = [];
 	const selectCalls: { title: string; options: string[] }[] = [];
+	const recorded: HandoffState[] = [];
 	const gateSelections = [...(options.gateSelections ?? [])];
 	const selectResults = [...(options.selectResults ?? [])];
 	const inputResults = [...(options.inputResults ?? [])];
@@ -110,7 +113,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	};
 
 	const promptWriter: PromptFileWriter = { write: async () => ok(undefined) };
-	const recorder: HandoffStateRecorder = { record: () => {} };
+	const recorder: HandoffStateRecorder = { record: (state) => recorded.push(state) };
 
 	const service = createDraftService({
 		machine,
@@ -212,6 +215,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		transcriptReads: () => transcriptReads,
 		notifications,
 		selectCalls,
+		recorded,
 	};
 }
 
@@ -374,6 +378,95 @@ describe("handle", () => {
 				level: "warning",
 			},
 		]);
+	});
+
+	/**
+	 * The observed dead end: the user answered after fifty minutes, the re-draft failed
+	 * ten seconds later, the handoff went idle, and the answer was gone. The answers are
+	 * the expensive part of this loop, so a failed re-draft offers to re-send them.
+	 */
+	it("retries a failed re-draft with the same answers instead of going idle", async () => {
+		const harness = createHarness({
+			responses: [
+				ok(questioningDraft()),
+				err({ kind: "completion_failed", detail: "402 Budget exceeded" }),
+				ok(JSON.stringify(DRAFT)),
+			],
+			gateSelections: ["answer", "cancel"],
+			inputResults: ["In the README."],
+			selectResults: ["Retry the draft with the same answers"],
+		});
+
+		await harness.command.handle("fix the nits", harness.ctx);
+
+		// The failure is named rather than reported as "returned no text".
+		assert.ok(
+			harness.notifications.some(({ message }) => message === "Handoff drafting failed: 402 Budget exceeded"),
+			"expected the provider's reason to be shown",
+		);
+		assert.equal(harness.requests.length, 3, "expected the retry to have made a third drafting call");
+		const retry = harness.requests[2];
+		assert.ok(retry !== undefined);
+		assert.match(retry.userMessage, /A: In the README\./, "the retry must not ask the questions again");
+		assert.match(harness.selectCalls[0]?.title ?? "", /re-draft with your answers failed/);
+		// The retry reached Gate A, whose Cancel is the last scripted selection.
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+	});
+
+	it("keeps a dismissed retry prompt's answered state and resumes it with /handoff", async () => {
+		const harness = createHarness({
+			responses: [
+				ok(questioningDraft()),
+				err({ kind: "completion_failed", detail: "402 Budget exceeded" }),
+				ok(JSON.stringify(DRAFT)),
+			],
+			gateSelections: ["answer", "cancel"],
+			inputResults: ["In the README."],
+			selectResults: [undefined],
+		});
+
+		await harness.command.handle("fix the nits", harness.ctx);
+
+		const retained = harness.machine.current();
+		assert.equal(retained.kind, "drafting", "dismissing the retry prompt is not a cancel");
+		assert.equal(retained.kind === "drafting" ? retained.answeredRetryPending : undefined, true);
+		assert.match(retained.kind === "drafting" ? retained.scope : "", /A: In the README\./);
+		assert.deepEqual(harness.recorded.at(-1), retained, "the answered retry state must be persisted");
+		assert.ok(validateHandoffState(harness.recorded.at(-1)).ok, "the persisted state must remain valid");
+		assert.ok(
+			harness.notifications.some(({ message }) => message.includes("resume the re-draft with your saved answers")),
+			"expected a notice explaining how to resume",
+		);
+
+		// Restore the validated entry as session_start does before the later `/handoff`.
+		harness.machine.restore(rehydrateHandoffState(retained));
+		await harness.command.handle("", harness.ctx);
+
+		assert.equal(harness.requests.length, 3, "expected /handoff to resume the saved re-draft");
+		assert.match(harness.requests[2]?.userMessage ?? "", /A: In the README\./);
+		assert.equal(
+			harness.selectCalls.length,
+			1,
+			"the resumed flow must re-draft directly instead of asking the question again",
+		);
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+	});
+
+	it("discards answers only when the retry prompt's explicit cancel is selected", async () => {
+		const harness = createHarness({
+			responses: [ok(questioningDraft()), err({ kind: "completion_failed", detail: "402 Budget exceeded" })],
+			gateSelections: ["answer"],
+			inputResults: ["In the README."],
+			selectResults: ["Cancel the handoff and discard the answers"],
+		});
+
+		await harness.command.handle("fix the nits", harness.ctx);
+
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.ok(
+			harness.notifications.some(({ message }) => message.includes("the answers were discarded")),
+			"expected the explicit discard to be stated",
+		);
 	});
 
 	it("warns when a pending NEEDS INPUT draft retains a different command-line override", async () => {

@@ -16,7 +16,10 @@
  * instead of dumping the whole drafted prompt into the editor: Answer folds the
  * user's response into the accumulated scope and re-enters drafting, so a
  * re-draft that again needs input loops rather than dead-ends; Edit finishes the
- * retained draft in place once the marker is gone. `continueWithPrompt` on the
+ * retained draft in place once the marker is gone. A re-draft that *fails* loops
+ * too: the answered round is retained by the service, so the loop offers a retry of
+ * the identical answered scope rather than returning to idle and discarding answers
+ * the user has already spent real time on. `continueWithPrompt` on the
  * service is the only path from that draft to Gate A, so this gate can never be
  * bypassed by construction.
  *
@@ -49,7 +52,7 @@ import type { Clipboard } from "../ports/clipboard.ts";
 import { withLoader } from "../presentation/drafting-loader.ts";
 import { openGateA } from "../presentation/gate-a.ts";
 import { describeGitFailure } from "../presentation/git-failure.ts";
-import { externalRunMenu, selectOption, unparseableMenu } from "../presentation/menus.ts";
+import { answeredRetryMenu, externalRunMenu, selectOption, unparseableMenu } from "../presentation/menus.ts";
 import { pickModel } from "../presentation/model-picker.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
@@ -228,6 +231,32 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				}
 				view = flowResult.view;
 				continue;
+			}
+
+			// A failed re-draft that still holds the user's answers is retryable, not terminal.
+			// Dropping to idle here discarded answers that had taken the user fifty minutes to
+			// write, and left re-running `/handoff` with the original scope as the only way back.
+			if (outcome.value.kind === "failed" && outcome.value.answersRetained) {
+				reportTerminalOutcome(ctx, outcome.value);
+				const retry = await selectOption(
+					(title, options) => ctx.ui.select(title, options),
+					"The re-draft with your answers failed",
+					answeredRetryMenu(),
+				);
+				if (retry === "retry") continue;
+				if (retry === "cancel") {
+					service.abandon();
+					ctx.ui.notify(
+						`Handoff cancelled; the answers were discarded. Run \`${HANDOFF_COMMAND}\` to start again.`,
+						"info",
+					);
+					return;
+				}
+				ctx.ui.notify(
+					`The re-draft is still pending. Run \`${HANDOFF_COMMAND}\` to resume the re-draft with your saved answers.`,
+					"info",
+				);
+				return;
 			}
 
 			if (outcome.value.kind !== "ready") {
@@ -602,10 +631,20 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 					...(command.modelOverride === undefined ? [] : [`the --model override \"${command.modelOverride}\"`]),
 				];
 				if (ignored.length > 0) {
+					const pendingDescription =
+						drafting.answeredRetryPending === true
+							? "A saved re-draft with answers is pending"
+							: "Pending NEEDS INPUT questions are being reopened";
 					ctx.ui.notify(
-						`Pending NEEDS INPUT questions are being reopened; ${ignored.join(" and ")} ${ignored.length === 1 ? "was" : "were"} not used. Cancel on the gate, then re-run the command to start fresh with it.`,
+						`${pendingDescription}; ${ignored.join(" and ")} ${ignored.length === 1 ? "was" : "were"} not used. Cancel the pending handoff, then re-run the command to start fresh with it.`,
 						"warning",
 					);
+				}
+				if (drafting.answeredRetryPending === true) {
+					// The failed attempt already has its complete answered scope. Reopening the
+					// question gate here would ask the user to repeat answers that were persisted.
+					await runDraftingFlow(ctx, service, { scope: drafting.scope });
+					return;
 				}
 				const resumed = await runNeedsInputFlow(
 					ctx,

@@ -22,6 +22,7 @@ import type {
 	DraftingRequest,
 	SessionTranscriptSource,
 } from "../../src/ports/drafting-model.ts";
+import { validateHandoffState } from "../../src/persistence/schemas.ts";
 import type { PromptFileWriter, PromptWriteFailure } from "../../src/ports/prompt-file-writer.ts";
 import { err } from "../../src/domain/result.ts";
 
@@ -327,6 +328,73 @@ describe("DraftService.draft when the draft asks for context", () => {
 		assert.equal(restoredState.kind === "drafting" ? restoredState.scope : undefined, answeredScope);
 	});
 
+	/**
+	 * The dead end this replaced: one observed session spent fifty minutes on a single
+	 * answer, and the re-draft failed ten seconds later. The handoff went idle, and the
+	 * only way back was `/handoff` with the original scope and the answer retyped.
+	 */
+	it("keeps the answered round when the re-draft fails, instead of returning to idle", async () => {
+		const answeredScope =
+			"add retries\n\n## Answers to the previous draft's NEEDS INPUT questions\n\nQ: Which retry policy?\nA: Exponential";
+		const harness = createHarness({
+			responses: [ok(JSON.stringify(needsInput)), err({ kind: "completion_failed", detail: "402 Budget exceeded" })],
+		});
+		await draftOutcome(harness);
+
+		const failed = await harness.service.draft(answeredScope, undefined);
+
+		assert.ok(failed.ok);
+		assert.deepEqual(failed.value, {
+			kind: "failed",
+			failure: { kind: "completion_failed", detail: "402 Budget exceeded" },
+			answersRetained: true,
+		});
+		assert.deepEqual(harness.machine.current(), {
+			kind: "drafting",
+			scope: answeredScope,
+			pendingDraft: { draft: needsInput, promptPath: PROMPT_PATH },
+			needsInputRound: 1,
+			answeredRetryPending: true,
+		});
+		// The answered scope was persisted before the call, and the failure marker is persisted with it.
+		assert.deepEqual(harness.recorded.at(-1), harness.machine.current());
+		assert.ok(validateHandoffState(harness.machine.current()).ok);
+	});
+
+	it("re-sends the identical answered scope when the failed re-draft is retried", async () => {
+		const answeredScope =
+			"add retries\n\n## Answers to the previous draft's NEEDS INPUT questions\n\nQ: Which retry policy?\nA: Exponential";
+		const harness = createHarness({
+			responses: [
+				ok(JSON.stringify(needsInput)),
+				err({ kind: "completion_failed", detail: "402 Budget exceeded" }),
+				ok(JSON.stringify(DRAFT)),
+			],
+		});
+		await draftOutcome(harness);
+		await harness.service.draft(answeredScope, undefined);
+
+		const retried = await harness.service.draft(answeredScope, undefined);
+
+		assert.ok(retried.ok);
+		assert.deepEqual(retried.value, { kind: "ready", draft: DRAFT, choice: EXPECTED_CHOICE, promptPath: PROMPT_PATH });
+		// The answers are in the retry's own message, so nothing had to be answered twice.
+		assert.equal(harness.requests.length, 3);
+		assert.ok(harness.requests.at(-1)?.userMessage.includes("A: Exponential"));
+	});
+
+	/** Cancelling is the user's own decision, so it still ends the flow as it always did. */
+	it("returns to idle when the user cancels the re-draft", async () => {
+		const harness = createHarness({ responses: [ok(JSON.stringify(needsInput)), err({ kind: "aborted" })] });
+		await draftOutcome(harness);
+
+		const cancelled = await harness.service.draft("add retries\n\nQ: x\nA: y", undefined);
+
+		assert.ok(cancelled.ok);
+		assert.deepEqual(cancelled.value, { kind: "failed", failure: { kind: "aborted" }, answersRetained: false });
+		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+	});
+
 	it("refuses chooseModel while the marker is still present", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		await draftOutcome(harness);
@@ -509,7 +577,11 @@ describe("DraftService.draft failure paths", () => {
 	it("reports a failed completion as a value", async () => {
 		const harness = createHarness({ response: err({ kind: "completion_failed", detail: "upstream 500" }) });
 		const outcome = await draftOutcome(harness);
-		assert.deepEqual(outcome, { kind: "failed", failure: { kind: "completion_failed", detail: "upstream 500" } });
+		assert.deepEqual(outcome, {
+			kind: "failed",
+			failure: { kind: "completion_failed", detail: "upstream 500" },
+			answersRetained: false,
+		});
 	});
 
 	it("returns to idle after a failed completion", async () => {

@@ -56,11 +56,12 @@ export const GATE_B_COMMON_COMPLETED_FIXED_ROWS = 27;
 
 /**
  * Conservative reservation for the largest interrupted review: its evidence
- * headings, menu, and chrome can consume 32 rows before any preview expands.
- * This intentionally over-reserves the shorter crash shapes so their final action
- * is not displaced when all three evidence blocks are present.
+ * headings, usage block, menu, and chrome can consume 36 rows before any preview
+ * expands. This intentionally over-reserves the shorter crash shapes so their
+ * final action is not displaced when all three evidence blocks are present, and
+ * includes the four measured-usage rows an interrupted run now carries.
  */
-export const GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS = 32;
+export const GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS = 36;
 
 type PreviewKind = "report" | "review" | "diffstat" | "partialReport" | "stderr";
 
@@ -96,7 +97,11 @@ export interface GateBView {
 	diffstat: string;
 	/** Present when Git could not produce a diffstat, so the gate can say why. */
 	diffstatFailure: string | undefined;
-	/** Null when the run was interrupted and reported no metrics. */
+	/**
+	 * Null only when nothing was measured: an external run, or a run whose session
+	 * restarted. An interrupted child-process run carries the usage it spent before it
+	 * died, which the summary labels as partial rather than final.
+	 */
 	usage: UsageTotals | null;
 	/** Present only for an interrupted run, explaining what ended it. */
 	interruptionNote: string | undefined;
@@ -363,10 +368,13 @@ function fixedRowsFor(view: GateBView, menuRows: number): number {
 /**
  * Builds Gate B's summary lines.
  *
- * Usage is omitted rather than zeroed for an interrupted run: printing zero
- * tokens and no cost would claim the worker did nothing, when in fact what it
- * did was not measured. The same reasoning covers an external run, whose worker
- * ran in another terminal and was never measured at all.
+ * Usage is omitted rather than zeroed when it was never measured: printing zero
+ * tokens and no cost would claim the worker did nothing, when in fact nobody
+ * watched it. That covers an external run, whose worker ran in another terminal,
+ * and a run whose session restarted. A child-process run that crashed or was
+ * stopped *was* measured up to that point, so its figures are shown under a
+ * heading that says they are partial — the alternative is what left a seven-hour
+ * Opus run's cost unknown.
  */
 export function formatGateBSummary(view: GateBView, terminalRows?: number): string[] {
 	const usageLines =
@@ -376,7 +384,9 @@ export function formatGateBSummary(view: GateBView, terminalRows?: number): stri
 						? "Usage:     not available — the handoff ran in another terminal"
 						: "Usage:     not available for an unfinished run",
 				]
-			: formatUsageLines(view.usage);
+			: view.report === null
+				? ["Usage:     measured before the run ended", ...formatUsageLines(view.usage)]
+				: formatUsageLines(view.usage);
 	const present = presentPreviewKinds(view);
 	const limits =
 		terminalRows === undefined

@@ -31,7 +31,13 @@ import { createHandoffMachine, type HandoffMachine } from "../../src/app/handoff
 import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService, type RunService } from "../../src/app/run-service.ts";
 import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
-import { createGateBFlow, formatReopenFailure, type GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import {
+	createGateBFlow,
+	formatReopenFailure,
+	formatReviewTurnFailure,
+	type GateBFlow,
+} from "../../src/commands/gate-b-flow.ts";
+import { gateBOptions } from "../../src/presentation/gate-b.ts";
 import type { LeftoversScopeInput } from "../../src/domain/draft/leftovers.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
@@ -272,7 +278,7 @@ async function endReviewTurn(
 	reviewText?: string,
 	ctx: ExtensionContext = harness.ctx,
 ): Promise<void> {
-	harness.flow.captureReviewTurn(reviewText);
+	harness.flow.captureReviewTurn(reviewText === undefined ? { kind: "empty" } : { kind: "review", text: reviewText });
 	harness.flow.reopenAfterReviewTurn(ctx);
 	await harness.flow.whenReopenSettled();
 }
@@ -315,6 +321,32 @@ describe("GateBFlow.viewFromPendingReview", () => {
 		const harness = createHarness();
 
 		assert.equal(await harness.flow.viewFromPendingReview(harness.ctx), undefined);
+	});
+
+	/** The interrupted run's tokens were spent, so the gate must be handed them to show. */
+	it("carries an interrupted review's measured usage into the view", async () => {
+		const harness = createHarness({ interrupted: true });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+
+		assert.equal(view?.report, null);
+		assert.deepEqual(view?.usage, USAGE);
+	});
+});
+
+describe("GateBFlow.viewFromOutcome", () => {
+	/** The path a feedback iteration takes straight from the run outcome to Gate B. */
+	it("carries an interrupted run's measured usage into the view", async () => {
+		const harness = createHarness({ interrupted: true });
+		harness.machine.beginDraft("add retries");
+		harness.machine.propose(DRAFT, CHOICE);
+		const outcome = await harness.runService.start({ promptPath: PROMPT_PATH, cwd: CWD, isChoiceRunnable: () => true });
+		assert.equal(outcome.kind, "interrupted");
+
+		const view = harness.flow.viewFromOutcome({ slug: DRAFT.slug, choice: CHOICE, promptPath: PROMPT_PATH }, outcome);
+
+		assert.equal(view?.report, null);
+		assert.deepEqual(view?.usage, USAGE);
 	});
 });
 
@@ -717,7 +749,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Looks right.\n\nVerdict: accept" });
 		await flush();
 
 		// Only Review here's own gate. The captured review is not even persisted yet.
@@ -741,7 +773,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		held = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Looks right.\n\nVerdict: accept" });
 		// Synchronous by signature, and asserted rather than assumed: a method that became
 		// async would still type-check against `void`, and would hand Pi a promise that
 		// stays pending until the gate closes.
@@ -799,7 +831,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		firstGate = new Promise<void>((resolve) => {
 			releaseFirstGate = resolve;
 		});
-		harness.flow.captureReviewTurn(firstReview);
+		harness.flow.captureReviewTurn({ kind: "review", text: firstReview });
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await flush();
 
@@ -815,7 +847,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.equal(harness.messages.length, 2, "feedback starts a new review turn through sendUserMessage");
 
 		const secondReview = "The retry also needs an error-path assertion.\nVerdict: fix";
-		harness.flow.captureReviewTurn(secondReview);
+		harness.flow.captureReviewTurn({ kind: "review", text: secondReview });
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
 
@@ -834,8 +866,8 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
 
-		harness.flow.captureReviewTurn("Partial attempt.\nVerdict: fix");
-		harness.flow.captureReviewTurn("The retry got there.\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Partial attempt.\nVerdict: fix" });
+		harness.flow.captureReviewTurn({ kind: "review", text: "The retry got there.\nVerdict: accept" });
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
 
@@ -856,7 +888,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		harness.flow.captureReviewTurn();
+		harness.flow.captureReviewTurn({ kind: "empty" });
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
@@ -883,7 +915,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		const harness = createHarness({ selections: ["dismiss"] });
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
-		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Looks right.\n\nVerdict: accept" });
 
 		harness.machine.reset();
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
@@ -904,7 +936,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		const harness = createHarness({ selections: ["dismiss"] });
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
-		harness.flow.captureReviewTurn("Stale.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Stale.\n\nVerdict: accept" });
 
 		harness.machine.clearReviewTurn();
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
@@ -915,12 +947,138 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.equal(harness.machine.reviewing()?.review, undefined, "the stale text was not persisted");
 	});
 
+	/**
+	 * The 402 case: the reviewer model failed, so the turn ended with an error stop
+	 * reason and no content. Persisting that as `review: { text: "" }` reopened Gate B as
+	 * though the diff had been reviewed, with the failure never mentioned.
+	 */
+	it("records no review when the review turn failed, and names the failure", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		harness.flow.captureReviewTurn({ kind: "failed", errorMessage: "402 Budget exceeded" });
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.review, undefined, "a failed turn is not a review");
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+		const reported = harness.notifications.find((entry) => entry.message.startsWith("Review turn failed"));
+		assert.equal(reported?.level, "error");
+		assert.match(reported?.message ?? "", /402 Budget exceeded/);
+	});
+
+	it("still offers Review here after a failed review turn", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		harness.flow.captureReviewTurn({ kind: "failed", errorMessage: "402 Budget exceeded" });
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.overlays.length, 2, "the gate still reopens so the review can be retried");
+		const reopened = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(reopened);
+		assert.equal(reopened.report, REPORT, "the completed run is untouched, so Review here remains available");
+		assert.equal(
+			gateBOptions(reopened).find((option) => option.id === "review")?.label,
+			"Review here",
+			"a failed turn must not relabel the option as Review again",
+		);
+	});
+
+	it("says so, and records nothing, when the review turn produced no text at all", async () => {
+		const harness = createHarness({ selections: ["review", "dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+
+		await endReviewTurn(harness);
+
+		assert.equal(harness.machine.reviewing()?.review, undefined);
+		assert.ok(harness.notifications.some((entry) => /produced no review/.test(entry.message)));
+	});
+
+	/**
+	 * Escape during the review turn ends it with `stopReason: "aborted"` and whatever the
+	 * reviewer had streamed. That is a truncated review, not a review.
+	 */
+	it("records no review when the review turn was stopped, and says so", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn({ kind: "stopped" });
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.review, undefined, "a stopped turn is not a review");
+		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, false);
+		const reported = harness.notifications.find((entry) => /stopped before it finished/.test(entry.message));
+		assert.equal(reported?.level, "info");
+		assert.match(reported?.message ?? "", /Choose "Review here" to run it again\./);
+		assert.equal(harness.overlays.length, 1, "the gate still reopens so the review can be run again");
+	});
+
+	/**
+	 * A Review again turn that fails keeps the earlier review, so the reopened menu offers
+	 * "Review again". A notice that says "Review here" would name an option that is not there.
+	 */
+	it("names Review again in the notice when a repeat review fails over an earlier one", async () => {
+		const harness = createHarness({ selections: ["dismiss", "dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		await endReviewTurn(harness, "Findings.\n\nVerdict: fix");
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn({ kind: "failed", errorMessage: "402 Budget exceeded" });
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.review?.text, "Findings.\n\nVerdict: fix", "the earlier review is kept");
+		const reopened = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(reopened);
+		assert.equal(gateBOptions(reopened).find((option) => option.id === "review")?.label, "Review again");
+		const reported = harness.notifications.find((entry) => entry.message.startsWith("Review turn failed"));
+		assert.match(reported?.message ?? "", /Choose "Review again" to run it again\./);
+		assert.doesNotMatch(reported?.message ?? "", /Review here/);
+	});
+
+	/**
+	 * Pi retries the reviewing session's turn too, and extensions never see `willRetry`.
+	 * The failed attempt is superseded by the attempt that followed it, and `agent_settled`
+	 * only fires once no retry remains, so the successful review is what lands.
+	 */
+	it("captures a review that only succeeded on Pi's retry", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+
+		harness.flow.captureReviewTurn({ kind: "failed", errorMessage: "529 overloaded" });
+		harness.flow.captureReviewTurn({ kind: "review", text: "The retry got there.\nVerdict: accept" });
+		harness.flow.reopenAfterReviewTurn(harness.ctx);
+		await harness.flow.whenReopenSettled();
+
+		assert.equal(harness.machine.reviewing()?.review?.text, "The retry got there.\nVerdict: accept");
+		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
+		assert.ok(
+			!harness.notifications.some((entry) => entry.message.startsWith("Review turn failed")),
+			"a superseded attempt is not reported as the turn's failure",
+		);
+	});
+
 	/** What `session_start` and `session_shutdown` call, so a stale capture cannot reopen. */
 	it("reopens nothing after the capture is forgotten", async () => {
 		const harness = createHarness({ selections: ["dismiss"] });
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
-		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Looks right.\n\nVerdict: accept" });
 
 		harness.flow.forgetReviewTurn();
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
@@ -938,7 +1096,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
 
-		harness.flow.captureReviewTurn("Looks right.\n\nVerdict: accept");
+		harness.flow.captureReviewTurn({ kind: "review", text: "Looks right.\n\nVerdict: accept" });
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
 
@@ -960,7 +1118,10 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
 
-		harness.flow.captureReviewTurn("Correct.\n\nLeftovers:\n- Rename the misleading test\nVerdict: accept");
+		harness.flow.captureReviewTurn({
+			kind: "review",
+			text: "Correct.\n\nLeftovers:\n- Rename the misleading test\nVerdict: accept",
+		});
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
 
@@ -1045,6 +1206,27 @@ describe("GateBFlow.startReviewTurn", () => {
 
 		assert.equal(harness.overlays.length, 1);
 		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
+	});
+});
+
+describe("formatReviewTurnFailure", () => {
+	it("names the provider's own error and the way back to a review", () => {
+		const message = formatReviewTurnFailure("402 Budget exceeded", "Review here");
+
+		assert.match(message, /^Review turn failed: 402 Budget exceeded\n/);
+		assert.match(message, /No review was recorded\. Choose "Review here" to run it again\./);
+	});
+
+	it("names the label the menu will render", () => {
+		assert.match(formatReviewTurnFailure("402 Budget exceeded", "Review again"), /Choose "Review again"/);
+	});
+
+	it("still states that the turn failed when the model named no reason", () => {
+		assert.match(
+			formatReviewTurnFailure(undefined, "Review here"),
+			/^Review turn failed: the model reported an error\n/,
+		);
+		assert.match(formatReviewTurnFailure("   ", "Review here"), /^Review turn failed: the model reported an error\n/);
 	});
 });
 
