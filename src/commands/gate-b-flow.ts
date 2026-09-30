@@ -52,10 +52,54 @@ import {
 	type GateBView,
 } from "../presentation/gate-b.ts";
 import { describeGitFailure, describeGitOrConflict } from "../presentation/git-failure.ts";
-import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
+import { confirmDiscardMenu, reviewOptionLabel, selectOption, type ReviewOptionLabel } from "../presentation/menus.ts";
 import { runWithWidget } from "../presentation/running-widget.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
 import { HANDOFF_COMMAND } from "./parse.ts";
+import type { ReviewTurnOutcome } from "./review-turn.ts";
+
+/**
+ * Names a failed review turn, and what is still available afterwards.
+ *
+ * The reviewer model can fail for reasons the reviewing user has to act on — a 402
+ * budget error is the observed one — and the failure used to be invisible: the gate
+ * reopened with an empty review recorded, as though the diff had been read.
+ */
+export function formatReviewTurnFailure(errorMessage: string | undefined, reviewLabel: ReviewOptionLabel): string {
+	const detail =
+		errorMessage === undefined || errorMessage.trim() === "" ? "the model reported an error" : errorMessage;
+	return `Review turn failed: ${detail}\nNo review was recorded. Choose "${reviewLabel}" to run it again.`;
+}
+
+/**
+ * Names why an armed review turn recorded nothing, or undefined when it did record one.
+ *
+ * The option to name is passed in because it is not always "Review here": a Review again
+ * turn that fails keeps the earlier review, so the reopened gate still offers
+ * "Review again", and a notice pointing at an option that is not on screen is the dead end
+ * `feedbackDraftAdvice` in gate-b.ts already guards against.
+ */
+export function describeUnrecordedReviewTurn(
+	captured: ReviewTurnOutcome,
+	reviewLabel: ReviewOptionLabel,
+): { message: string; level: "error" | "warning" | "info" } | undefined {
+	switch (captured.kind) {
+		case "review":
+			return undefined;
+		case "failed":
+			return { message: formatReviewTurnFailure(captured.errorMessage, reviewLabel), level: "error" };
+		case "stopped":
+			return {
+				message: `The review turn was stopped before it finished, so no review was recorded. Choose "${reviewLabel}" to run it again.`,
+				level: "info",
+			};
+		case "empty":
+			return {
+				message: `The review turn produced no review, so nothing was recorded. Choose "${reviewLabel}" to run it again.`,
+				level: "warning",
+			};
+	}
+}
 
 /**
  * Describes a failure inside the detached Gate B reopen.
@@ -135,9 +179,11 @@ export interface GateBFlow {
 	 * The `agent_end` body: records the armed review turn's result, opening nothing.
 	 *
 	 * Synchronous and inert in every other case, so an ordinary turn in a session with
-	 * no handoff costs a single flag read.
+	 * no handoff costs a single flag read. Takes the classified outcome rather than bare
+	 * text so a turn that ended on a provider error cannot be stored as a review whose
+	 * findings happen to be empty.
 	 */
-	captureReviewTurn(reviewText?: string): void;
+	captureReviewTurn(outcome: ReviewTurnOutcome): void;
 	/**
 	 * The `agent_settled` body: reopens Gate B once for a captured review turn.
 	 *
@@ -168,11 +214,12 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 	/**
 	 * The armed review turn's result, held between `agent_end` and the turn's settle.
 	 *
-	 * A wrapper rather than a bare string: a review turn that produced no assistant
-	 * text still has to reopen the gate, so an absent `text` and an absent capture have
-	 * to stay distinguishable.
+	 * A classified outcome rather than a bare string: a review turn that produced no
+	 * assistant text, and one that died on a provider error, both still have to reopen
+	 * the gate, so "no review" and "nothing captured" must stay distinguishable — and a
+	 * failure has to keep the reason it failed.
 	 */
-	let capture: { text?: string } | undefined;
+	let capture: ReviewTurnOutcome | undefined;
 
 	/** The detached reopen in flight, if any, so `whenReopenSettled` can await it. */
 	let reopen: Promise<void> | undefined;
@@ -185,16 +232,27 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 	 * the runs, drafts, and dialogs the gate starts, so the report is worded from the
 	 * machine's state afterwards rather than assuming the gate never opened.
 	 */
-	async function reopenGateB(ctx: ExtensionContext, captured: { text?: string }): Promise<void> {
+	async function reopenGateB(ctx: ExtensionContext, captured: ReviewTurnOutcome): Promise<void> {
 		try {
 			// Re-read rather than trusted: the session can be replaced between the capture and
 			// the settle, and a stale capture must not reopen a gate against another handoff.
 			if (machine.reviewing()?.awaitingReviewTurn !== true) return;
 
 			// Disarms the turn and persists its verdict and findings, so a dismissed gate
-			// leaves the review pending rather than armed.
-			const cleared = reviewService.clearReview(captured.text);
+			// leaves the review pending rather than armed. A turn that failed or said nothing
+			// records no review at all: Gate B's labels, its action order, and the feedback
+			// editor all read the presence of a review as "this iteration was reviewed", and a
+			// 402 on the reviewer model is not a review.
+			const cleared = reviewService.clearReview(captured.kind === "review" ? captured.text : undefined);
 			if (!cleared.ok) return;
+
+			// Reported before the TUI check, because a headless session still deserves to know
+			// its review never happened. The label is read from the state just persisted, with
+			// the same predicate the reopened gate's menu uses, so the two cannot disagree.
+			const reviewed =
+				cleared.value.review?.iteration === cleared.value.iteration && hasReviewEvidence(cleared.value.review);
+			const unrecorded = describeUnrecordedReviewTurn(captured, reviewOptionLabel(reviewed));
+			if (unrecorded !== undefined) ctx.ui.notify(unrecorded.message, unrecorded.level);
 
 			// A gate is a TUI overlay; there is nothing to open elsewhere.
 			if (ctx.mode !== "tui") return;
@@ -267,7 +325,8 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					diffstat: outcome.diffstat,
 					diffstatFailure:
 						outcome.diffstatFailure === undefined ? undefined : describeGitFailure(outcome.diffstatFailure),
-					usage: null,
+					// Whatever the worker spent before it died, which the gate labels as partial.
+					usage: outcome.state.usage,
 					interruptionNote: outcome.state.interruptionNote,
 					// Carried so the gate can label a crash's leftovers rather than hide them.
 					...(outcome.state.partialReport === undefined ? {} : { partialReport: outcome.state.partialReport }),
@@ -319,7 +378,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 				report: null,
 				diffstat: diffstat.ok ? diffstat.value : "",
 				diffstatFailure: diffstat.ok ? undefined : describeGitOrConflict(diffstat.error),
-				usage: null,
+				usage: reviewing.usage,
 				interruptionNote: reviewing.interruptionNote,
 				...(reviewing.partialReport === undefined ? {} : { partialReport: reviewing.partialReport }),
 				...(reviewing.stderrTail === undefined ? {} : { stderrTail: reviewing.stderrTail }),
@@ -552,14 +611,15 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			return true;
 		},
 
-		captureReviewTurn(reviewText?: string): void {
+		captureReviewTurn(outcome: ReviewTurnOutcome): void {
 			// The arm flag is the sole condition under which this hook does anything.
 			if (machine.reviewing()?.awaitingReviewTurn !== true) return;
 
 			// Overwritten, not kept: an auto-retried prompt ends more than once, and the last
-			// attempt is the review. Wrapped so a turn that produced no assistant text is
-			// still a capture — "no text" and "nothing captured" mean different things here.
-			capture = reviewText === undefined ? {} : { text: reviewText };
+			// attempt is the review. That is also what makes a failed attempt Pi then retried
+			// harmless — extensions never see `willRetry`, but they do see the attempt that
+			// followed it, and `agent_settled` only fires once no retry remains.
+			capture = outcome;
 		},
 
 		reopenAfterReviewTurn(ctx: ExtensionContext): void {

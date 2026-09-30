@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { createChildProcessWorkerRunner } from "../../src/adapters/child-process-worker-runner.ts";
+import { classifyOutcome } from "../../src/app/run-service.ts";
 import { writeFakeWorker } from "./fake-worker.ts";
 import { buildPromptPath } from "../../src/domain/draft/slug.ts";
 import type { ModelChoice } from "../../src/domain/types.ts";
@@ -272,6 +273,48 @@ describe("child-process worker runner", () => {
 			stderr: "worker exploded\n",
 			aborted: false,
 		});
+	});
+
+	it("drops a retried attempt's error once the worker goes on to finish", async () => {
+		const outcome = await createTestRunner().run(request(await createPrompt("retry-recovered")));
+
+		// The failed attempt is superseded rather than remembered: a worker that recovered
+		// and wrote its report must not reach Gate B as an interrupted run whose report was
+		// demoted to pre-crash text.
+		assert.equal(outcome.errorMessage, undefined);
+		assert.equal(outcome.stopReason, "stop");
+		assert.equal(outcome.report, "Done. Final report: the work is complete.");
+		assert.equal(outcome.exitCode, 0);
+		assert.deepEqual(classifyOutcome(outcome), { kind: "completed" });
+	});
+
+	it("keeps the final error when the worker's retries are exhausted", async () => {
+		const outcome = await createTestRunner().run(request(await createPrompt("retry-exhausted")));
+
+		assert.equal(outcome.errorMessage, "529 overloaded again");
+		assert.equal(outcome.stopReason, "error");
+		// Whatever the worker had already said is retained, but only as pre-crash output.
+		assert.equal(outcome.report, "Reading the files.");
+		const classified = classifyOutcome(outcome);
+		assert.equal(classified.kind, "interrupted");
+		assert.ok(classified.kind === "interrupted" && classified.note.includes("529 overloaded again"));
+		assert.ok(classified.kind === "interrupted" && classified.partialReport === "Reading the files.");
+	});
+
+	/** auto_retry_end is the authoritative name for an exhausted retry, over the last message's own. */
+	it("prefers auto_retry_end's final error over the last failed message's", async () => {
+		const outcome = await createTestRunner().run(request(await createPrompt("retry-exhausted-final-error")));
+
+		assert.equal(outcome.errorMessage, "529 final");
+		const classified = classifyOutcome(outcome);
+		assert.ok(classified.kind === "interrupted" && classified.note.includes("529 final"));
+	});
+
+	it("still names an exhausted retry when nothing reported why it failed", async () => {
+		const outcome = await createTestRunner().run(request(await createPrompt("retry-exhausted-unnamed")));
+
+		assert.equal(outcome.errorMessage, "The worker's model request failed and every automatic retry was exhausted.");
+		assert.equal(classifyOutcome(outcome).kind, "interrupted");
 	});
 
 	it("ignores malformed and non-event stdout lines while continuing to the final report", async () => {

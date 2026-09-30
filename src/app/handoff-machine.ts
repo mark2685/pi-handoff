@@ -41,6 +41,8 @@ export interface HandoffDraftingState {
 	readonly needsInputRound?: number;
 	/** A resolved `--model` choice retained until a pending draft can reach Gate A. */
 	readonly modelOverride?: ModelChoice;
+	/** A failed re-draft has saved answers that `/handoff` must retry without re-asking. */
+	readonly answeredRetryPending?: boolean;
 }
 
 export interface HandoffProposedState {
@@ -112,6 +114,12 @@ export interface HandoffCompletedReviewingState {
  * be collected. Null review fields deliberately mean unavailable, never "an empty
  * worker response".
  *
+ * `usage`, though, is measured rather than reported, so it survives the failure. A
+ * killed or crashed worker consumed exactly the tokens it consumed, and every
+ * interrupted review used to persist `usage: null` — including a seven-hour Opus
+ * run whose cost is now unknowable. Null still means "never measured" (a session
+ * restart, or a run in another terminal); a measured aggregate is kept.
+ *
  * `partialReport` and `stderrTail` are the crash evidence. A worker that dies
  * mid-task has usually already streamed assistant text, and that text is not a
  * report: showing it as one is how a mid-task sentence once reached a reviewer as
@@ -128,7 +136,8 @@ export interface HandoffInterruptedReviewingState {
 	readonly checkpoint: Checkpoint;
 	readonly report: null;
 	readonly diffstat: null;
-	readonly usage: null;
+	/** Usage accumulated before the run ended, or null when nothing was measured. */
+	readonly usage: WorkerUsage | null;
 	readonly interruptionNote: string;
 	/** Assistant text the worker emitted before it died. Never a report. */
 	readonly partialReport?: string;
@@ -186,6 +195,13 @@ export interface CompleteRunInput {
 export interface InterruptRunInput {
 	/** Human-readable reason, shown at Gate B and in the review turn. */
 	note: string;
+	/**
+	 * Usage accumulated before the run ended.
+	 *
+	 * Omitted or null when nothing was measured, which is a different claim from zero:
+	 * a restarted session and an external run never watched a child process at all.
+	 */
+	usage?: WorkerUsage | null;
 	/** Assistant text emitted before the worker died, if any. Never treated as a report. */
 	partialReport?: string;
 	/** Bounded tail of the worker's stderr, if any. */
@@ -221,6 +237,8 @@ export interface HandoffMachine {
 	setPendingDraft(pendingDraft: { draft: Draft; promptPath: string }): Result<HandoffDraftingState, HandoffConflict>;
 	/** Records that another NEEDS INPUT round has opened, so the gate can offer to end it. */
 	beginNeedsInputRound(): Result<HandoffDraftingState, HandoffConflict>;
+	/** Marks a failed answered re-draft for direct retry by a later `/handoff`. */
+	markAnsweredRetryPending(): Result<HandoffDraftingState, HandoffConflict>;
 	/** The current NEEDS INPUT round, counted from 1. */
 	needsInputRound(): number;
 	/** Clears a prior needs-input round before a re-draft resolves it. */
@@ -321,7 +339,15 @@ export function createHandoffMachine(): HandoffMachine {
 			if (state.kind !== "drafting") {
 				return conflict(state, "replaceDraftScope", "A draft scope can be replaced only while drafting");
 			}
-			const drafting: HandoffDraftingState = { ...state, scope };
+			// A new call consumes a prior failure's direct-retry marker. If it fails again,
+			// `markAnsweredRetryPending` records a fresh marker after the provider responds.
+			const drafting: HandoffDraftingState = {
+				kind: "drafting",
+				scope,
+				...(state.pendingDraft === undefined ? {} : { pendingDraft: state.pendingDraft }),
+				...(state.needsInputRound === undefined ? {} : { needsInputRound: state.needsInputRound }),
+				...(state.modelOverride === undefined ? {} : { modelOverride: state.modelOverride }),
+			};
 			state = drafting;
 			return ok(drafting);
 		},
@@ -344,6 +370,19 @@ export function createHandoffMachine(): HandoffMachine {
 			// restarting it and under-reporting how long the questioning has gone on.
 			const asked = state.needsInputRound ?? (state.pendingDraft === undefined ? 0 : 1);
 			const drafting: HandoffDraftingState = { ...state, needsInputRound: asked + 1 };
+			state = drafting;
+			return ok(drafting);
+		},
+
+		markAnsweredRetryPending(): Result<HandoffDraftingState, HandoffConflict> {
+			if (state.kind !== "drafting" || state.pendingDraft === undefined) {
+				return conflict(
+					state,
+					"markAnsweredRetryPending",
+					"An answered re-draft can be retained only while its round is pending",
+				);
+			}
+			const drafting: HandoffDraftingState = { ...state, answeredRetryPending: true };
 			state = drafting;
 			return ok(drafting);
 		},
@@ -461,7 +500,8 @@ export function createHandoffMachine(): HandoffMachine {
 				checkpoint: state.checkpoint,
 				report: null,
 				diffstat: null,
-				usage: null,
+				// Carried through the failure: the tokens were spent whether or not a report arrived.
+				usage: details.usage ?? null,
 				interruptionNote: details.note,
 				// Omitted rather than stored empty, so "absent" and "the worker said nothing" stay distinct.
 				...(partialReport === undefined || partialReport === "" ? {} : { partialReport }),

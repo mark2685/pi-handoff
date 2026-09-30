@@ -87,7 +87,11 @@ export interface ReviewService {
 	accept(): Result<AcceptOutcome, HandoffConflict>;
 	/** Arms the one review turn whose result Review here is allowed to act on. */
 	beginReview(): Result<HandoffReviewingState, HandoffConflict>;
-	/** Disarms the review turn and persists its final assistant response before reopening Gate B. */
+	/**
+	 * Disarms the review turn and persists its final assistant response before reopening
+	 * Gate B. Blank or absent text records no review, so a turn that failed leaves the
+	 * iteration unreviewed rather than reviewed-with-nothing-to-say.
+	 */
 	clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict>;
 	/** Builds the text Review here injects into the reviewing session. */
 	buildReviewMessage(state: HandoffReviewingState): string;
@@ -152,13 +156,16 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 		clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict> {
 			const reviewing = machine.reviewing();
 			if (reviewing === undefined) return err(noReview("clearReview"));
-			const verdict = reviewText === undefined ? undefined : parseReviewVerdict(reviewText);
+			// Blank text is not a review, and recording one made a failed review turn
+			// indistinguishable from a reviewer who had read the diff and said nothing.
+			const captured = reviewText === undefined || reviewText.trim() === "" ? undefined : reviewText;
+			const verdict = captured === undefined ? undefined : parseReviewVerdict(captured);
 			const review =
-				reviewText === undefined
+				captured === undefined
 					? undefined
 					: {
 							iteration: reviewing.iteration,
-							text: reviewText,
+							text: captured,
 							...(verdict === undefined ? {} : { verdict }),
 						};
 			const cleared = machine.clearReviewTurn(review);

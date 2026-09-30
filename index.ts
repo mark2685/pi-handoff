@@ -48,7 +48,7 @@ import { createReviewService } from "./src/app/review-service.ts";
 import { createRunService } from "./src/app/run-service.ts";
 import { createGateBFlow } from "./src/commands/gate-b-flow.ts";
 import { createHandoffCommandHandler, type HandoffCommand } from "./src/commands/handoff-command.ts";
-import { finalAssistantText } from "./src/commands/review-turn.ts";
+import { classifyReviewTurn } from "./src/commands/review-turn.ts";
 import { HANDOFF_COMMAND_NAME } from "./src/commands/parse.ts";
 import { DEFAULT_RUBRIC } from "./src/domain/rubric/defaults.ts";
 import { isModelAvailable } from "./src/domain/rubric/resolve.ts";
@@ -200,9 +200,15 @@ export default function handoff(pi: ExtensionAPI) {
 	 * handler that opened the gate would leave Pi claiming to be working underneath
 	 * it. Inert in every other case — the flow reads the arm flag and returns early —
 	 * so an ordinary turn in a session with no handoff never sees handoff UI.
+	 *
+	 * The turn is classified rather than reduced to text, because a reviewer model that
+	 * failed ends its turn with an error stop reason and no content. Extensions are not
+	 * given `willRetry` here, so a failed attempt Pi is about to retry is handled by the
+	 * capture being overwritten by the attempt that follows it; `agent_settled`, which
+	 * acts on the capture, fires only once no retry remains.
 	 */
 	pi.on("agent_end", (event) => {
-		gateBFlow.captureReviewTurn(finalAssistantText(event.messages));
+		gateBFlow.captureReviewTurn(classifyReviewTurn(event.messages));
 	});
 
 	/**

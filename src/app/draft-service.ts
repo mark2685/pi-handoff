@@ -82,6 +82,16 @@ export interface DraftEmptySession {
 export interface DraftFailed {
 	kind: "failed";
 	failure: DraftingFailure;
+	/**
+	 * True when the answered NEEDS INPUT round survived the failure, so the caller may
+	 * re-run the identical call without asking the questions again.
+	 *
+	 * The state kept is the whole round: the pending envelope, the round counter, and the
+	 * scope carrying the user's `Q:`/`A:` pairs — all of it already persisted, so a
+	 * restart keeps it too. A provider failure ten seconds after fifty minutes of
+	 * answering used to drop the handoff to `idle` and take the answers with it.
+	 */
+	answersRetained: boolean;
 }
 
 /** The prompt file could not be written, so no gate may open. */
@@ -332,8 +342,26 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			signal,
 		});
 		if (!response.ok) {
-			abandon();
-			return ok({ kind: "failed", failure: response.error });
+			// An answered round is kept rather than abandoned: the answers are the expensive
+			// part of this flow, and a provider failure is not a decision to throw them away
+			// (an unparseable envelope already stays in `drafting` further down). The scope that
+			// carries them was recorded before the call, so the retained state is already on
+			// disk. An explicit cancel still ends the flow, since that *is* the user's decision.
+			const drafting = machine.current();
+			const pending = drafting.kind === "drafting" ? drafting.pendingDraft : undefined;
+			if (response.error.kind === "aborted" || pending === undefined) {
+				abandon();
+				return ok({ kind: "failed", failure: response.error, answersRetained: false });
+			}
+			// Mark and record this separately from the scope update before the call. A later
+			// `/handoff` must retry the saved answers directly instead of reopening the questions.
+			const marked = machine.markAnsweredRetryPending();
+			if (!marked.ok) return err(marked.error);
+			record();
+			// Re-retained in memory so Change model, Edit, and View still have the draft the
+			// persisted round refers to.
+			retainedDraft = pending.draft;
+			return ok({ kind: "failed", failure: response.error, answersRetained: true });
 		}
 
 		const parsed = parseDraft(response.value, allowNoLeftovers ? validateDraft : validateOrdinaryDraft);

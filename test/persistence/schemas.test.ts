@@ -339,6 +339,16 @@ describe("validateHandoffState compatibility", () => {
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});
 
+	it("accepts a persisted answered re-draft retry alongside older drafting entries", () => {
+		const state = {
+			kind: "drafting",
+			scope: "scope\n\nQ: Which timeout?\nA: 30 seconds",
+			pendingDraft: { draft: validHandoffDraft, promptPath: "/tmp/pi-handoff-x.md" },
+			answeredRetryPending: true,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
 	it("accepts an old running entry with no external or auto-review flag", () => {
 		const state = {
 			kind: "running",
@@ -413,6 +423,18 @@ describe("validateHandoffState compatibility", () => {
 			usage: null,
 			interruptionNote: "The worker ended on an error rather than finishing its turn.",
 			autoReview: true,
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	/** An interrupted run's tokens were spent, so its measured usage is persisted too. */
+	it("accepts an interrupted review whose usage was measured before the failure", () => {
+		const state = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			interruptionNote: "The worker was stopped mid-run.",
 		};
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});

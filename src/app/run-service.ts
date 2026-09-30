@@ -27,7 +27,9 @@
  * A run that produces no report never fabricates one. An abort, a spawn failure,
  * and a worker that exits non-zero with nothing to show all reach `reviewing`
  * with `completion: "interrupted"` and a note, keeping the checkpoint available
- * so Discard can still undo whatever the worker managed to write.
+ * so Discard can still undo whatever the worker managed to write. The usage the
+ * adapter measured before the failure travels with it, because it was spent
+ * regardless of whether a report arrived.
  *
  * An abort is interrupted even when the worker had already streamed assistant
  * text. A killed worker's partial output is not a result, and treating it as one
@@ -425,6 +427,9 @@ export function createRunService(deps: RunServiceDeps): RunService {
 				const tail = stderrTail(outcome.stderr);
 				const interrupted = machine.interruptRun({
 					note: classified.note,
+					// Measured, so it is kept: an interrupted run's tokens and cost were real, and
+					// dropping them is how a seven-hour run's cost became unknowable.
+					usage: outcome.usage,
 					...(classified.partialReport === "" ? {} : { partialReport: classified.partialReport }),
 					...(tail === "" ? {} : { stderrTail: tail }),
 				});

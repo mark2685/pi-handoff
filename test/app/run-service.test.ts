@@ -27,6 +27,7 @@ import {
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
 import { err, ok, type Result } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
+import { validateHandoffState } from "../../src/persistence/schemas.ts";
 import type { Clock } from "../../src/ports/clock.ts";
 import type { DiscardOutcome, Git, GitFailure } from "../../src/ports/git.ts";
 import type { WorkerRunOutcome, WorkerRunRequest, WorkerRunner, WorkerUsage } from "../../src/ports/worker-runner.ts";
@@ -353,13 +354,51 @@ describe("RunService.start interruptions", () => {
 		assert.equal(outcome.state.report, null);
 	});
 
-	it("leaves null usage and diffstat on an interrupted state rather than zeroes", async () => {
+	it("leaves a null diffstat on an interrupted state, since none was stored", async () => {
 		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
 		const outcome = await start(harness);
 
 		assert.ok(outcome.kind === "interrupted");
-		assert.equal(outcome.state.usage, null);
 		assert.equal(outcome.state.diffstat, null);
+	});
+
+	it("keeps the usage measured before an interruption instead of discarding it", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		// The tokens were spent whether or not a report arrived; a seven-hour run whose cost
+		// is unknowable is the failure this prevents.
+		assert.deepEqual(outcome.state.usage, USAGE);
+	});
+
+	it("persists the interrupted run's usage so a resumed session still has it", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", aborted: true, exitCode: undefined }) });
+		await start(harness);
+
+		const persisted = harness.recorded.at(-1);
+		assert.ok(persisted?.kind === "reviewing" && persisted.completion === "interrupted");
+		assert.deepEqual(persisted.usage, USAGE);
+		assert.ok(validateHandoffState(persisted).ok, "the persisted interrupted state must still validate");
+	});
+
+	it("reports zeroed usage for a worker that died before any usage event, as a completed run would", async () => {
+		const zeroed: WorkerUsage = {
+			inputTokens: 0,
+			outputTokens: 0,
+			cacheReadTokens: 0,
+			cacheWriteTokens: 0,
+			cost: 0,
+			contextTokens: 0,
+			turns: 0,
+		};
+		const harness = createHarness({
+			outcome: workerOutcome({ report: "", usage: zeroed, exitCode: 1, errorMessage: "spawn failed" }),
+		});
+		const outcome = await start(harness);
+
+		assert.ok(outcome.kind === "interrupted");
+		assert.deepEqual(outcome.state.usage, zeroed);
 	});
 
 	it("explains an abort in the interruption note", async () => {

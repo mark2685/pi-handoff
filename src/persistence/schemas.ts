@@ -199,6 +199,8 @@ const DraftingHandoffStateSchema = Type.Object(
 		needsInputRound: Type.Optional(Type.Number()),
 		// Optional so an unfinished command-line override survives a restart without rejecting older entries.
 		modelOverride: Type.Optional(ModelChoiceSchema),
+		// Marks a failed re-draft whose saved answers `/handoff` must retry directly.
+		answeredRetryPending: Type.Optional(Type.Boolean()),
 	},
 	{ additionalProperties: false },
 );
@@ -259,7 +261,10 @@ const InterruptedReviewingHandoffStateSchema = Type.Object(
 		checkpoint: CheckpointSchema,
 		report: Type.Null(),
 		diffstat: Type.Null(),
-		usage: Type.Null(),
+		// Nullable rather than null: a crashed or aborted child still spent the tokens it
+		// spent, and dropping that made a seven-hour run's cost unrecoverable. Null keeps
+		// meaning "never measured", so entries written before this still decode.
+		usage: Type.Union([WorkerUsageSchema, Type.Null()]),
 		interruptionNote: Type.String({ minLength: 1 }),
 		// Optional so entries recorded before crash evidence and the feedback-loop latch still decode.
 		partialReport: Type.Optional(Type.String({ minLength: 1 })),
