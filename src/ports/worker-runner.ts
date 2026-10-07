@@ -2,7 +2,7 @@
  * Boundary for executing an approved handoff in an isolated worker process.
  *
  * App services depend on this small protocol instead of child-process details,
- * so Gate B can render ordinary outcomes (including worker failures) as values
+ * so the result gate can render ordinary outcomes (including worker failures) as values
  * and adapter tests can exercise real pipes without starting the Pi CLI.
  */
 
@@ -29,7 +29,7 @@ export interface WorkerUsage {
 	turns: number;
 }
 
-/** A normalized tool result retained for the running widget's recent-activity display. */
+/** A normalized tool result retained for the run monitor's recent-activity display. */
 export interface WorkerToolResult {
 	toolCallId: string;
 	toolName: string;
@@ -50,8 +50,8 @@ export type WorkerActivityKind =
 /**
  * A human-readable activity category, deliberately separate from the final report.
  *
- * Pi can be silent for a long time during a model request or tool call. The running
- * overlay uses this value together with its last-update age to distinguish a known
+ * Pi can be silent for a long time during a model request or tool call. The run
+ * monitor uses this value together with its last-update age to distinguish a known
  * phase from an absent worker event, without claiming that a silent process is
  * making progress.
  */
@@ -84,7 +84,7 @@ export interface WorkerRunRequest {
 	 * The quiet interval after which the adapter reports a stalled activity.
 	 *
 	 * Explicit rather than an adapter-hidden default so the run service and
-	 * running overlay describe the same policy, and tests can use a short interval.
+	 * run monitor describe the same policy, and tests can use a short interval.
 	 */
 	noProgressThresholdMs: number;
 	/** Optional because command-level Ctrl+C routing is owned by the later run service. */
@@ -101,7 +101,7 @@ export interface WorkerRunOutcome {
 	 * SIGTERM or SIGKILL leaves no exit code to report.
 	 */
 	exitCode: number | undefined;
-	/** The final assistant text, passed through verbatim for Gate B. */
+	/** The final assistant text, passed through verbatim for the result gate. */
 	report: string;
 	usage: WorkerUsage;
 	toolResults: readonly WorkerToolResult[];

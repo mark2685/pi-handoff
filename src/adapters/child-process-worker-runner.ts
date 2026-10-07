@@ -2,7 +2,7 @@
  * Child-process implementation of the isolated Pi worker boundary.
  *
  * This mirrors Pi's upstream subagent extension for reinvocation and NDJSON
- * buffering, while normalizing only the data Gate B and its widget need. The
+ * buffering, while normalizing only the data the result gate and the run monitor need. The
  * injectable invocation resolver keeps tests hermetic without weakening the
  * production `pi --mode json` spawn contract.
  */
@@ -162,7 +162,7 @@ function toolNameFromAssistantEvent(value: unknown): string | undefined {
 	return value.toolName;
 }
 
-/** Normalizes a completed tool result for the later running-widget adapter consumer. */
+/** Normalizes a completed tool result for the later run-monitor adapter consumer. */
 function parseToolResult(value: unknown): WorkerToolResult | undefined {
 	if (!isRecord(value) || value.role !== "toolResult") return undefined;
 	if (
@@ -254,7 +254,7 @@ export function createChildProcessWorkerRunner(options: ChildProcessWorkerRunner
 			 * cleared. Pi retries a transient provider failure by emitting the failed attempt's
 			 * `message_end` (`stopReason: "error"` plus an `errorMessage`), then continuing the
 			 * run; a sticky error therefore made a worker that went on to write a complete final
-			 * report reach Gate B as interrupted, with that report discarded as pre-crash text.
+			 * report reach the result gate as interrupted, with that report discarded as partial output.
 			 * When the retries are exhausted instead, the last assistant message is itself the
 			 * error, so the failure survives exactly where it should.
 			 */

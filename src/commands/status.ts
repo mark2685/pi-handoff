@@ -9,6 +9,7 @@
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import type { HandoffState } from "../app/handoff-machine.ts";
+import { LAUNCH_GATE, RESULT_GATE, waitingAt } from "../domain/vocabulary.ts";
 import { HANDOFF_COMMAND } from "./parse.ts";
 
 /** Formats one line describing the active handoff. */
@@ -19,7 +20,7 @@ export function formatHandoffStatus(state: HandoffState): string {
 		case "drafting":
 			return state.scope ? `Handoff: drafting (${state.scope})` : "Handoff: drafting";
 		case "proposed":
-			return `Handoff: proposed ${state.draft.slug} on ${formatModelChoice(state.choice)} (${buildPromptPath(state.draft.slug)})`;
+			return `Handoff: ${state.draft.slug} ${waitingAt(LAUNCH_GATE)} on ${formatModelChoice(state.choice)} (${buildPromptPath(state.draft.slug)})`;
 		case "running":
 			// An external run is reported as awaiting the user, not as work in progress here:
 			// nothing in this session is running, and the next step is theirs to take.
@@ -28,7 +29,7 @@ export function formatHandoffStatus(state: HandoffState): string {
 				: `Handoff: running ${state.draft.slug} on ${formatModelChoice(state.choice)}, iteration ${state.iteration}`;
 		case "reviewing":
 			return state.completion === "completed"
-				? `Handoff: awaiting review of ${state.draft.slug}, iteration ${state.iteration}`
-				: `Handoff: review interrupted for ${state.draft.slug} — ${state.interruptionNote}`;
+				? `Handoff: ${state.draft.slug} ${waitingAt(RESULT_GATE)}, iteration ${state.iteration}`
+				: `Handoff: ${state.draft.slug} interrupted, ${waitingAt(RESULT_GATE)} — ${state.interruptionNote}`;
 	}
 }

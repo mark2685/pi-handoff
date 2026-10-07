@@ -1,7 +1,7 @@
 /**
  * Tests for the pure parts of the run and review surfaces.
  *
- * Gate B's summary, the running widget's body, the discard summary, and the usage
+ * The result gate's summary, the run monitor's body, the discard summary, and the usage
  * formatters are all pure, so the decisions they encode are asserted here rather
  * than through an overlay.
  *
@@ -14,7 +14,12 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatDiscardHeadline, formatDiscardSummary, hasSkippedPaths } from "../../src/domain/report/discard.ts";
+import {
+	formatDiscardHeadline,
+	formatDiscardPaths,
+	formatDiscardSummary,
+	hasSkippedPaths,
+} from "../../src/domain/report/discard.ts";
 import {
 	formatCost,
 	formatElapsed,
@@ -25,28 +30,27 @@ import {
 } from "../../src/domain/report/format.ts";
 import type { ModelChoice } from "../../src/domain/types.ts";
 import {
-	GATE_B_COMMON_COMPLETED_FIXED_ROWS,
-	GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS,
 	buildFeedbackEditorRequest,
-	diffstatPreviewLimit,
 	feedbackDraftAdvice,
-	gateBOptions,
-	formatGateBSummary,
-	formatGateBTitle,
-	partialReportPreviewLimit,
-	reportPreviewLimit,
-	stderrPreviewLimit,
-	type GateBView,
-} from "../../src/presentation/gate-b.ts";
-import { visibleWidth } from "@earendil-works/pi-tui";
-import { confirmDiscardMenu, gateBMenu, selectOption } from "../../src/presentation/menus.ts";
+	discardSummarySpec,
+	DISCARD_PATHS_BLOCK,
+	resultGateContent,
+	resultGateOptions,
+	resultGateSpec,
+	formatResultGateSummary,
+	formatResultGateTitle,
+	type ResultGateView,
+} from "../../src/presentation/result-gate.ts";
+import { fitGate, fitGateWithMenu, gateRowBudget, type Wrap } from "../../src/presentation/gate-frame.ts";
+import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { confirmDiscardMenu, resultGateMenu, selectOption } from "../../src/presentation/menus.ts";
 import {
 	definitionOfDoneLimit,
 	formatRunningHeaderLines,
 	formatRunningLines,
 	formatWorkerStatusLine,
 	isAbortKey,
-} from "../../src/presentation/running-widget.ts";
+} from "../../src/presentation/run-monitor.ts";
 
 const CHOICE: ModelChoice = { provider: "bifrost-openai", model: "gpt-5.6-terra", thinking: "high" };
 
@@ -62,7 +66,7 @@ const USAGE: UsageTotals = {
 
 const DIFFSTAT = " src/client.ts | 12 +++++--\n 1 file changed, 9 insertions(+), 3 deletions(-)";
 
-const COMPLETED_VIEW: GateBView = {
+const COMPLETED_VIEW: ResultGateView = {
 	slug: "add-retry-logic",
 	choice: CHOICE,
 	promptPath: "/tmp/pi-handoff-add-retry-logic.md",
@@ -74,12 +78,26 @@ const COMPLETED_VIEW: GateBView = {
 	interruptionNote: undefined,
 };
 
-const INTERRUPTED_VIEW: GateBView = {
+const INTERRUPTED_VIEW: ResultGateView = {
 	...COMPLETED_VIEW,
 	report: null,
 	usage: null,
 	interruptionNote: "The worker was stopped before it reported a result.",
 };
+
+const wrapAt =
+	(width: number): Wrap =>
+	(line) =>
+		wrapTextWithAnsi(line, width);
+
+/** Fits the gate as the frame would at the given terminal size, with the menu it first offers. */
+function fitResultGate(view: ResultGateView, rows: number, columns = 120) {
+	const spec = resultGateSpec(view);
+	return fitGate(spec, spec.menu, rows, wrapAt(columns - 2));
+}
+
+const lines = (count: number, prefix: string) =>
+	Array.from({ length: count }, (_, index) => `${prefix} ${index}`).join("\n");
 
 describe("formatTokenCount", () => {
 	it("groups thousands without depending on the host locale", () => {
@@ -141,117 +159,141 @@ describe("formatUsageLines", () => {
 	});
 });
 
-describe("formatGateBSummary", () => {
+describe("formatResultGateSummary", () => {
 	it("shows the worker's report", () => {
-		const lines = formatGateBSummary(COMPLETED_VIEW);
+		const lines = formatResultGateSummary(COMPLETED_VIEW);
 		assert.ok(lines.includes("## Summary"));
 		assert.ok(lines.includes("Added retry logic."));
 	});
 
 	it("shows the diffstat against the checkpoint", () => {
-		const lines = formatGateBSummary(COMPLETED_VIEW);
+		const lines = formatResultGateSummary(COMPLETED_VIEW);
 		assert.ok(lines.some((line) => line.includes("1 file changed")));
 	});
 
 	it("shows the model and iteration", () => {
-		const lines = formatGateBSummary(COMPLETED_VIEW);
+		const lines = formatResultGateSummary(COMPLETED_VIEW);
 		assert.ok(lines.includes("Model:     bifrost-openai/gpt-5.6-terra:high"));
 		assert.ok(lines.includes("Iteration: 1"));
 	});
 
 	it("shows usage for a completed run", () => {
-		const lines = formatGateBSummary(COMPLETED_VIEW);
+		const lines = formatResultGateSummary(COMPLETED_VIEW);
 		assert.ok(lines.includes("Cost:      $0.4231"));
 	});
 
 	it("explains a missing report instead of leaving it blank", () => {
-		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		const lines = formatResultGateSummary(INTERRUPTED_VIEW);
 		assert.ok(lines.includes("Report:    none — the worker did not finish"));
 	});
 
 	it("carries the interruption note into the gate", () => {
-		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		const lines = formatResultGateSummary(INTERRUPTED_VIEW);
 		assert.ok(lines.some((line) => line.includes("stopped before it reported a result")));
 	});
 
 	it("says usage is unavailable rather than reporting zeroes", () => {
-		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		const lines = formatResultGateSummary(INTERRUPTED_VIEW);
 		assert.ok(lines.includes("Usage:     not available for an unfinished run"));
 		assert.ok(!lines.some((line) => line.includes("Cost:      $0.0000")));
 	});
 
 	it("distinguishes an unreadable diffstat from an empty one", () => {
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, diffstatFailure: "HEAD changed since the checkpoint" });
+		const lines = formatResultGateSummary({ ...COMPLETED_VIEW, diffstatFailure: "HEAD changed since the checkpoint" });
 		assert.ok(lines.includes("Changes:   could not be read"));
 	});
 
 	it("says so when the worker changed nothing", () => {
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, diffstat: "" });
+		const lines = formatResultGateSummary({ ...COMPLETED_VIEW, diffstat: "" });
 		assert.ok(lines.includes("Changes:   none against the checkpoint"));
 	});
 
-	it("truncates a long report and points at the option that shows the rest", () => {
-		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
-		const view = { ...COMPLETED_VIEW, report };
-		const lines = formatGateBSummary(view);
-		assert.ok(lines.includes('… 16 more lines — choose "View full report" to read all of it'));
-		assert.equal(gateBOptions(view).find((option) => option.id === "view_report")?.label, "View full report");
-	});
-
-	it("shares a 40-row completed-review budget between the report, diffstat, and findings", () => {
-		const report = Array.from({ length: 40 }, (_, index) => `report ${index}`).join("\n");
-		const diffstat = Array.from({ length: 30 }, (_, index) => `diff ${index}`).join("\n");
-		const review = Array.from({ length: 30 }, (_, index) => `finding ${index}`).join("\n");
-		const view: GateBView = {
-			...COMPLETED_VIEW,
-			report,
-			diffstat,
-			review: { iteration: 1, verdict: "fix", text: review },
-		};
-		const lines = formatGateBSummary(view, 40);
+	it("offers the report viewer whenever the fitted report hides text, and signposts it", () => {
+		const view = { ...COMPLETED_VIEW, report: lines(40, "line") };
+		const layout = fitResultGate(view, 30);
+		const report = layout.blocks.find((entry) => entry.id === "report");
+		assert.ok(report?.shortened);
+		assert.match(report.signpost ?? "", /^… \d+ more lines — choose "View full report" to read all of it$/);
 		assert.equal(
-			lines.length +
-				gateBMenu({ interrupted: false, hasReport: true, review: { verdict: "fix", leftovers: "missing" } }).length +
-				5,
-			40,
-		);
-		assert.ok(lines.includes('… 34 more lines — choose "View full report" to read all of it'));
-		assert.ok(lines.includes("… 28 more lines"));
-	});
-
-	it("keeps the three-row preview floor and gives the report the spare rows first", () => {
-		const completed = ["report", "review", "diffstat"] as const;
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => reportPreviewLimit(rows, GATE_B_COMMON_COMPLETED_FIXED_ROWS, completed)),
-			[3, 3, 7],
-		);
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => diffstatPreviewLimit(rows, GATE_B_COMMON_COMPLETED_FIXED_ROWS, completed)),
-			[3, 3, 3],
-		);
-
-		const interrupted = ["diffstat", "partialReport", "stderr"] as const;
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => partialReportPreviewLimit(rows, GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS, interrupted)),
-			[3, 3, 3],
-		);
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => stderrPreviewLimit(rows, GATE_B_LARGEST_INTERRUPTED_FIXED_ROWS, interrupted)),
-			[3, 3, 3],
+			resultGateOptions(view, layout.shortened).find((option) => option.id === "view_report")?.label,
+			"View full report",
 		);
 	});
 
-	it("preserves the historical formatter output when terminal rows are omitted", () => {
-		const report = Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n");
-		assert.deepEqual(
-			formatGateBSummary({ ...COMPLETED_VIEW, report }),
-			formatGateBSummary({ ...COMPLETED_VIEW, report }, undefined),
+	it("omits the report viewer once the whole report fits", () => {
+		const view = { ...COMPLETED_VIEW, report: "Done.\nAdded two tests." };
+		const layout = fitResultGate(view, 60);
+		assert.equal(layout.shortened.has("report"), false);
+		assert.equal(
+			resultGateOptions(view, layout.shortened).some((option) => option.id === "view_report"),
+			false,
 		);
+	});
+
+	it("fits a completed review — report, findings, and diffstat — in the rows it is given", () => {
+		const view: ResultGateView = {
+			...COMPLETED_VIEW,
+			report: lines(40, "report"),
+			diffstat: lines(30, "diff"),
+			review: { iteration: 1, verdict: "fix", text: lines(30, "finding") },
+		};
+		for (const rows of [20, 30, 40, 60]) {
+			const layout = fitResultGate(view, rows);
+			assert.ok(layout.rows <= rows, `${layout.rows} rows into ${rows}`);
+			assert.ok(
+				layout.titleRows.length +
+					1 +
+					layout.headerRows.length +
+					layout.headerSignpostRows.length +
+					1 +
+					layout.menuRows +
+					1 +
+					layout.hintRows.length <=
+					rows,
+				`the menu section fits in ${rows} rows`,
+			);
+		}
+		const at40 = fitResultGate(view, 40);
+		assert.deepEqual(
+			at40.blocks.map((entry) => entry.id),
+			["report", "review", "diffstat"],
+		);
+	});
+
+	/**
+	 * The verdict orders the menu, so it sits in the header rather than under 40 rows of
+	 * report — and with the identity lines, not at the header's end, because the frame
+	 * cuts the header from the bottom when even the menu will not fit.
+	 */
+	it("puts the reviewer verdict in the header, with the identity lines", () => {
+		const { header, blocks } = resultGateContent({
+			...COMPLETED_VIEW,
+			review: { iteration: 1, verdict: "fix", text: "Cover the timeout path.\nVerdict: fix" },
+		});
+		assert.equal(header[3], "Reviewer verdict: fix");
+		assert.equal(blocks.find((entry) => entry.id === "review")?.heading, "Reviewer findings:");
+	});
+
+	it("keeps the reviewer verdict on screen at the 24-row minimum, when the header is cut", () => {
+		const view: ResultGateView = {
+			...COMPLETED_VIEW,
+			report: lines(40, "report"),
+			diffstat: lines(30, "diff"),
+			review: { iteration: 1, verdict: "accept", text: `${lines(10, "finding")}\nLeftovers: none\nVerdict: accept` },
+		};
+		for (const rows of [24, 25, 26]) {
+			const layout = fitResultGate(view, rows - 4, 80);
+			assert.ok(layout.rows <= rows - 4, `${layout.rows} rows into ${rows - 4}`);
+			assert.ok(
+				layout.headerRows.some((row) => row.startsWith("Reviewer verdict: accept")),
+				`verdict cut at ${rows} rows; header kept ${layout.headerLinesKept} lines`,
+			);
+		}
 	});
 
 	it("is unchanged when no review was captured", () => {
-		const withoutReview = formatGateBSummary(COMPLETED_VIEW);
-		const copiedWithoutReview = formatGateBSummary({ ...COMPLETED_VIEW });
+		const withoutReview = formatResultGateSummary(COMPLETED_VIEW);
+		const copiedWithoutReview = formatResultGateSummary({ ...COMPLETED_VIEW });
 		assert.deepEqual(copiedWithoutReview, withoutReview);
 		assert.equal(
 			withoutReview.some((line) => line.startsWith("Reviewer verdict:")),
@@ -261,7 +303,7 @@ describe("formatGateBSummary", () => {
 
 	it("shows every parsed reviewer verdict and its findings", () => {
 		for (const verdict of ["accept", "fix", "discard"] as const) {
-			const lines = formatGateBSummary({
+			const lines = formatResultGateSummary({
 				...COMPLETED_VIEW,
 				review: { iteration: 1, verdict, text: `Finding for ${verdict}.\nVerdict: ${verdict}` },
 			});
@@ -271,7 +313,7 @@ describe("formatGateBSummary", () => {
 	});
 
 	it("shows captured findings when the verdict could not be parsed", () => {
-		const lines = formatGateBSummary({
+		const lines = formatResultGateSummary({
 			...COMPLETED_VIEW,
 			review: { iteration: 1, text: "The review ended without the required recommendation." },
 		});
@@ -279,20 +321,24 @@ describe("formatGateBSummary", () => {
 		assert.ok(lines.includes("The review ended without the required recommendation."));
 	});
 
-	it("truncates a long review preview", () => {
-		const text = Array.from({ length: 30 }, (_, index) => `finding ${index}`).join("\n");
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, review: { iteration: 1, verdict: "fix", text } });
-		assert.ok(lines.includes("… 6 more lines"));
+	it("shortens long findings without pointing at a viewer, because none exists for them", () => {
+		const layout = fitResultGate(
+			{ ...COMPLETED_VIEW, review: { iteration: 1, verdict: "fix", text: lines(30, "finding") } },
+			40,
+		);
+		const review = layout.blocks.find((entry) => entry.id === "review");
+		assert.ok(review?.shortened);
+		assert.match(review.signpost ?? "", /^… \d+ more lines$/);
 	});
 });
 
-describe("formatGateBTitle", () => {
+describe("formatResultGateTitle", () => {
 	it("titles a completed run as a result to review", () => {
-		assert.equal(formatGateBTitle(COMPLETED_VIEW), "Handoff complete — review the changes");
+		assert.equal(formatResultGateTitle(COMPLETED_VIEW), "Handoff complete — review the changes");
 	});
 
 	it("does not title an unfinished run as a result", () => {
-		assert.equal(formatGateBTitle(INTERRUPTED_VIEW), "Handoff did not complete");
+		assert.equal(formatResultGateTitle(INTERRUPTED_VIEW), "Handoff did not complete");
 	});
 });
 
@@ -345,11 +391,12 @@ describe("feedbackDraftAdvice", () => {
 	 */
 	it("matches the label the menu renders for each state", () => {
 		assert.match(feedbackDraftAdvice("none"), /choose Review here first/);
-		assert.equal(gateBMenu({ interrupted: false }).find((option) => option.id === "review")?.label, "Review here");
+		assert.equal(resultGateMenu({ interrupted: false }).find((option) => option.id === "review")?.label, "Review here");
 
 		assert.match(feedbackDraftAdvice("verdict_only"), /choose Review again first/);
 		assert.equal(
-			gateBMenu({ interrupted: false, review: { verdict: "fix" } }).find((option) => option.id === "review")?.label,
+			resultGateMenu({ interrupted: false, review: { verdict: "fix" } }).find((option) => option.id === "review")
+				?.label,
 			"Review again",
 		);
 	});
@@ -357,7 +404,7 @@ describe("feedbackDraftAdvice", () => {
 	it("offers no review option where the gate has none to offer", () => {
 		assert.equal(feedbackDraftAdvice("interrupted"), "");
 		assert.equal(
-			gateBMenu({ interrupted: true }).find((option) => option.id === "review"),
+			resultGateMenu({ interrupted: true }).find((option) => option.id === "review"),
 			undefined,
 		);
 	});
@@ -368,9 +415,9 @@ describe("feedbackDraftAdvice", () => {
 	});
 });
 
-describe("gateBMenu", () => {
+describe("resultGateMenu", () => {
 	it("keeps the original order and labels when no review was captured", () => {
-		const options = gateBMenu({ interrupted: false, hasReport: true });
+		const options = resultGateMenu({ interrupted: false, hasReport: true });
 		assert.deepEqual(
 			options.map((option) => option.id),
 			["review", "feedback", "discard", "accept", "view_report", "view_diffstat", "dismiss"],
@@ -380,7 +427,7 @@ describe("gateBMenu", () => {
 	});
 
 	it("omits the report viewer when there is no report text to show", () => {
-		const options = gateBMenu({ interrupted: true });
+		const options = resultGateMenu({ interrupted: true });
 		assert.equal(
 			options.some((option) => option.id === "view_report"),
 			false,
@@ -391,8 +438,8 @@ describe("gateBMenu", () => {
 		);
 	});
 
-	it("labels pre-crash output separately from a completed report", () => {
-		const options = gateBMenu({ interrupted: true, hasPartialReport: true });
+	it("labels partial output separately from a completed report", () => {
+		const options = resultGateMenu({ interrupted: true, hasPartialReport: true });
 		assert.equal(options.find((option) => option.id === "view_report")?.label, "View partial output");
 		assert.equal(
 			options.some((option) => option.label === "View full report"),
@@ -403,20 +450,20 @@ describe("gateBMenu", () => {
 	it("offers leftovers only for an accept review with items or a missing legacy block", () => {
 		for (const leftovers of ["items", "missing"] as const) {
 			assert.equal(
-				gateBMenu({ interrupted: false, review: { verdict: "accept", leftovers } }).some(
+				resultGateMenu({ interrupted: false, review: { verdict: "accept", leftovers } }).some(
 					(option) => option.id === "accept_leftovers",
 				),
 				true,
 			);
 		}
 		assert.equal(
-			gateBMenu({ interrupted: false, review: { verdict: "accept", leftovers: "none" } }).some(
+			resultGateMenu({ interrupted: false, review: { verdict: "accept", leftovers: "none" } }).some(
 				(option) => option.id === "accept_leftovers",
 			),
 			false,
 		);
 		assert.equal(
-			gateBMenu({ interrupted: false, review: { verdict: "fix", leftovers: "items" } }).some(
+			resultGateMenu({ interrupted: false, review: { verdict: "fix", leftovers: "items" } }).some(
 				(option) => option.id === "accept_leftovers",
 			),
 			false,
@@ -424,7 +471,7 @@ describe("gateBMenu", () => {
 	});
 
 	it("places leftovers after both view options and before leaving the gate", () => {
-		const ids = gateBMenu({
+		const ids = resultGateMenu({
 			interrupted: false,
 			hasReport: true,
 			review: { verdict: "accept", leftovers: "items" },
@@ -433,16 +480,16 @@ describe("gateBMenu", () => {
 	});
 
 	it("labels the live options plainly once they are implemented", () => {
-		const options = gateBMenu({ interrupted: false });
+		const options = resultGateMenu({ interrupted: false });
 		const review = options.find((option) => option.id === "review");
 		const feedback = options.find((option) => option.id === "feedback");
 		assert.equal(review?.label, "Review here");
 		assert.equal(feedback?.label, "Send feedback to worker");
 	});
 
-	/** Same convention as Gate A's blocked Run: a missing option reads as a broken gate. */
+	/** Same convention as the launch gate's blocked Run: a missing option reads as a broken gate. */
 	it("shows feedback as blocked once the iteration bound is reached", () => {
-		const options = gateBMenu({
+		const options = resultGateMenu({
 			interrupted: false,
 			feedback: { allowed: false, iteration: 3, maxIterations: 3 },
 		});
@@ -451,7 +498,7 @@ describe("gateBMenu", () => {
 	});
 
 	it("keeps the blocked feedback option present so the rule is visible", () => {
-		const ids = gateBMenu({
+		const ids = resultGateMenu({
 			interrupted: false,
 			feedback: { allowed: false, iteration: 3, maxIterations: 3 },
 		}).map((option) => option.id);
@@ -459,7 +506,7 @@ describe("gateBMenu", () => {
 	});
 
 	it("labels feedback plainly while iterations remain", () => {
-		const options = gateBMenu({
+		const options = resultGateMenu({
 			interrupted: false,
 			feedback: { allowed: true, iteration: 1, maxIterations: 3 },
 		});
@@ -467,7 +514,7 @@ describe("gateBMenu", () => {
 	});
 
 	it("relabels review actions after a review without a verdict", () => {
-		const options = gateBMenu({ interrupted: false, review: {}, hasReport: true });
+		const options = resultGateMenu({ interrupted: false, review: {}, hasReport: true });
 		assert.equal(options.find((option) => option.id === "review")?.label, "Review again");
 		assert.equal(options.find((option) => option.id === "feedback")?.label, "Send review to worker");
 		assert.deepEqual(
@@ -477,13 +524,13 @@ describe("gateBMenu", () => {
 	});
 
 	it("puts only fix and accept actions first", () => {
-		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "fix" } })[0]?.id, "feedback");
-		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "accept" } })[0]?.id, "accept");
-		assert.equal(gateBMenu({ interrupted: false, review: { verdict: "discard" } })[0]?.id, "review");
+		assert.equal(resultGateMenu({ interrupted: false, review: { verdict: "fix" } })[0]?.id, "feedback");
+		assert.equal(resultGateMenu({ interrupted: false, review: { verdict: "accept" } })[0]?.id, "accept");
+		assert.equal(resultGateMenu({ interrupted: false, review: { verdict: "discard" } })[0]?.id, "review");
 	});
 
 	it("explains a discard recommendation without moving the destructive action", () => {
-		const options = gateBMenu({ interrupted: false, review: { verdict: "discard" } });
+		const options = resultGateMenu({ interrupted: false, review: { verdict: "discard" } });
 		assert.equal(
 			options.find((option) => option.id === "discard")?.label,
 			"Discard changes (reviewer recommends discard)",
@@ -492,22 +539,22 @@ describe("gateBMenu", () => {
 
 	/** Re-running after a crash is exactly what a user wants from an interrupted review. */
 	it("still offers feedback after an interrupted run", () => {
-		const ids = gateBMenu({ interrupted: true }).map((option) => option.id);
+		const ids = resultGateMenu({ interrupted: true }).map((option) => option.id);
 		assert.ok(ids.includes("feedback"));
 	});
 
 	it("omits Review here when there is no report to review", () => {
-		const ids = gateBMenu({ interrupted: true }).map((option) => option.id);
+		const ids = resultGateMenu({ interrupted: true }).map((option) => option.id);
 		assert.ok(!ids.includes("review"));
 	});
 
 	it("still offers Discard after an interrupted run, since the worker may have edited the tree", () => {
-		const ids = gateBMenu({ interrupted: true }).map((option) => option.id);
+		const ids = resultGateMenu({ interrupted: true }).map((option) => option.id);
 		assert.ok(ids.includes("discard"));
 	});
 
 	it("offers a way to leave the review pending", () => {
-		const ids = gateBMenu({ interrupted: false }).map((option) => option.id);
+		const ids = resultGateMenu({ interrupted: false }).map((option) => option.id);
 		assert.ok(ids.includes("dismiss"));
 	});
 });
@@ -596,6 +643,63 @@ describe("formatDiscardSummary", () => {
 			skippedPaths: ["already-dirty.ts"],
 		});
 		assert.notEqual(lines[lines.length - 1], "");
+	});
+});
+
+describe("discardSummarySpec", () => {
+	const skipped = Array.from({ length: 12 }, (_, index) => `src/already-dirty-${index}.ts`);
+	const outcome = { restoredPaths: ["src/client.ts"], removedPaths: [], skippedPaths: skipped };
+
+	/** Fits the summary as the frame would on a terminal of the given size, menu re-resolved. */
+	const fitAt = (rows: number, columns = 80) =>
+		fitGateWithMenu(discardSummarySpec(outcome), gateRowBudget(rows), wrapAt(columns - 2));
+
+	it("keeps the whole warning on screen at the 24-row minimum", () => {
+		const { layout } = fitAt(24);
+		assert.equal(layout.headerLinesKept, 3);
+		assert.equal(layout.headerSignpost, undefined);
+		assert.ok(layout.rows <= gateRowBudget(24));
+	});
+
+	it("offers a viewer that the signpost names when the paths do not fit", () => {
+		const { layout, menu } = fitAt(24);
+		const block = layout.blocks.find((entry) => entry.id === DISCARD_PATHS_BLOCK);
+		assert.ok(block?.shortened);
+		assert.ok(block.signpost?.includes('choose "View all paths"'), block.signpost ?? "no signpost");
+		assert.deepEqual(
+			menu.map((option) => option.id),
+			["ok", "view_paths"],
+		);
+	});
+
+	it("withholds the viewer when every path is shown", () => {
+		const { layout, menu } = fitAt(60);
+		assert.equal(layout.shortened.size, 0);
+		assert.deepEqual(
+			menu.map((option) => option.id),
+			["ok"],
+		);
+		for (const path of skipped) assert.ok(layout.blocks[0]?.rows.includes(`  ${path}`), path);
+	});
+
+	it("has no warning header and an accent tone for a clean discard", () => {
+		const spec = discardSummarySpec({ restoredPaths: ["a.ts"], removedPaths: [], skippedPaths: [] });
+		assert.deepEqual(spec.header, []);
+		assert.equal(spec.tone, "accent");
+		assert.equal(spec.blocks[0]?.text, "Reverted to their checkpoint state:\n  a.ts");
+	});
+});
+
+describe("formatDiscardPaths", () => {
+	it("lists skipped paths before the reverted ones", () => {
+		const lines = formatDiscardPaths({ restoredPaths: ["b.ts"], removedPaths: [], skippedPaths: ["a.ts"] });
+		assert.deepEqual(lines, [
+			"Left as they were (review these yourself):",
+			"  a.ts",
+			"",
+			"Reverted to their checkpoint state:",
+			"  b.ts",
+		]);
 	});
 });
 
@@ -943,7 +1047,7 @@ describe("formatRunningLines", () => {
 });
 
 /**
- * Crash evidence at Gate B.
+ * Crash evidence at the result gate.
  *
  * The distinction these pin is the whole of Bug 1's presentation half: `report` is
  * a claim the worker chose to make, `partialReport` is whatever it happened to be
@@ -951,8 +1055,8 @@ describe("formatRunningLines", () => {
  * sentence about terminal width reached a reviewer as a finished result beside a
  * 2,816-line diff.
  */
-describe("formatGateBSummary crash evidence", () => {
-	const CRASHED_VIEW: GateBView = {
+describe("formatResultGateSummary crash evidence", () => {
+	const CRASHED_VIEW: ResultGateView = {
 		...INTERRUPTED_VIEW,
 		interruptionNote: "The worker ended on an error rather than finishing its turn.",
 		partialReport: "The pty defaulted to 80 columns… Let me set a larger window size.",
@@ -960,54 +1064,54 @@ describe("formatGateBSummary crash evidence", () => {
 	};
 
 	it("states that the worker did not finish", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.ok(lines.some((line) => line.includes("Report:    none — the worker did not finish")));
 	});
 
 	it("shows the interruption reason", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.ok(lines.some((line) => line.includes("ended on an error rather than finishing its turn")));
 	});
 
 	/** The heading is the warning: this text looks exactly like a report and is not one. */
-	it("labels the pre-crash text as not a report", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+	it("labels the partial output as not a report", () => {
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.ok(lines.includes("Partial output before the worker died (NOT a report — it never finished):"));
 	});
 
-	it("never introduces pre-crash text as the worker's report", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+	it("never introduces partial output as the worker's report", () => {
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.equal(lines.includes("Worker report:"), false);
 	});
 
-	it("includes the pre-crash text so the user can see what it was doing", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+	it("includes the partial output so the user can see what it was doing", () => {
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.ok(lines.some((line) => line.includes("The pty defaulted to 80 columns")));
 	});
 
 	it("shows the stderr tail, which usually names the real failure", () => {
-		const lines = formatGateBSummary(CRASHED_VIEW);
+		const lines = formatResultGateSummary(CRASHED_VIEW);
 		assert.ok(lines.includes("Worker stderr (tail):"));
 		assert.ok(lines.some((line) => line.includes("provider returned 503")));
 	});
 
-	it("keeps correctly counted signposts for every shortened crash-evidence preview", () => {
-		const lines = formatGateBSummary(
-			{
-				...CRASHED_VIEW,
-				diffstat: Array.from({ length: 12 }, (_, index) => `diff ${index}`).join("\n"),
-				partialReport: Array.from({ length: 10 }, (_, index) => `partial ${index}`).join("\n"),
-				stderrTail: Array.from({ length: 9 }, (_, index) => `stderr ${index}`).join("\n"),
-			},
-			24,
-		);
-		assert.ok(lines.includes('… 10 more lines — choose "View full diffstat" to read all of it'));
-		assert.ok(lines.includes('… 8 more lines — choose "View partial output" to read all of it'));
-		assert.ok(lines.includes('… 7 more lines — choose "View full diffstat" to read all of it'));
+	it("signposts every shortened crash-evidence block to the viewer that shows it", () => {
+		const view: ResultGateView = {
+			...CRASHED_VIEW,
+			diffstat: lines(12, "diff"),
+			partialReport: lines(10, "partial"),
+			stderrTail: lines(9, "stderr"),
+		};
+		const layout = fitResultGate(view, 34);
+		const signposts = Object.fromEntries(layout.blocks.map((entry) => [entry.id, entry.signpost]));
+		assert.match(signposts.diffstat ?? "", /choose "View full diffstat"/);
+		assert.match(signposts.partialOutput ?? "", /choose "View partial output"/);
+		assert.match(signposts.stderr ?? "", /choose "View full diffstat"/);
+		assert.ok(layout.rows <= 34);
 	});
 
 	it("omits both sections when a run was interrupted with no evidence", () => {
-		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		const lines = formatResultGateSummary(INTERRUPTED_VIEW);
 		assert.equal(
 			lines.some((line) => line.includes("Partial output")),
 			false,
@@ -1016,44 +1120,44 @@ describe("formatGateBSummary crash evidence", () => {
 	});
 
 	it("still titles the gate as an incomplete handoff", () => {
-		assert.equal(formatGateBTitle(CRASHED_VIEW), "Handoff did not complete");
+		assert.equal(formatResultGateTitle(CRASHED_VIEW), "Handoff did not complete");
 	});
 
-	it("offers a partial-output viewer only when the height-budgeted preview hides text", () => {
-		const truncated: GateBView = {
-			...CRASHED_VIEW,
-			partialReport: Array.from({ length: 10 }, (_, index) => `partial ${index}`).join("\n"),
-		};
+	it("offers a partial-output viewer only when the fitted block hides text", () => {
+		const truncated: ResultGateView = { ...CRASHED_VIEW, partialReport: lines(10, "partial") };
 		assert.equal(
-			gateBOptions(truncated, 24).find((option) => option.id === "view_report")?.label,
+			resultGateOptions(truncated, fitResultGate(truncated, 24).shortened).find((option) => option.id === "view_report")
+				?.label,
 			"View partial output",
 		);
 		assert.equal(
-			gateBOptions(CRASHED_VIEW, 24).some((option) => option.id === "view_report"),
+			resultGateOptions(CRASHED_VIEW, fitResultGate(CRASHED_VIEW, 60).shortened).some(
+				(option) => option.id === "view_report",
+			),
 			false,
 		);
 	});
 });
 
-describe("formatGateBSummary external runs", () => {
+describe("formatResultGateSummary external runs", () => {
 	it("explains absent usage by naming the other terminal, not an unfinished run", () => {
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, usage: null, external: true });
+		const lines = formatResultGateSummary({ ...COMPLETED_VIEW, usage: null, external: true });
 		assert.ok(lines.includes("Usage:     not available — the handoff ran in another terminal"));
 	});
 
 	it("still shows the report and diffstat for an external run", () => {
-		const lines = formatGateBSummary({ ...COMPLETED_VIEW, usage: null, external: true });
+		const lines = formatResultGateSummary({ ...COMPLETED_VIEW, usage: null, external: true });
 		assert.ok(lines.includes("Worker report:"));
 		assert.ok(lines.includes("Changes:"));
 	});
 
 	it("distinguishes an unfinished run from an unmeasured one", () => {
-		const lines = formatGateBSummary(INTERRUPTED_VIEW);
+		const lines = formatResultGateSummary(INTERRUPTED_VIEW);
 		assert.ok(lines.includes("Usage:     not available for an unfinished run"));
 	});
 
 	it("shows an interrupted run's measured usage under a heading that says it is partial", () => {
-		const lines = formatGateBSummary({ ...INTERRUPTED_VIEW, usage: USAGE });
+		const lines = formatResultGateSummary({ ...INTERRUPTED_VIEW, usage: USAGE });
 		assert.ok(lines.includes("Usage:     measured before the run ended"));
 		assert.ok(lines.includes("Cost:      $0.4231"));
 		assert.ok(!lines.includes("Usage:     not available for an unfinished run"));

@@ -1,5 +1,5 @@
 /**
- * Behavioral tests for the drafting flow that precedes Gate A.
+ * Behavioral tests for the drafting flow that precedes the launch gate.
  *
  * Every dependency is a fake, so these assert the decisions T7 owns: that a
  * malformed response never reaches a gate, that a `NEEDS INPUT` draft diverts to
@@ -169,7 +169,7 @@ describe("DraftService.draft", () => {
 		assert.deepEqual(harness.writes, [{ path: PROMPT_PATH, contents: DRAFT.prompt }]);
 	});
 
-	it("writes the prompt file before reporting an outcome that opens Gate A", async () => {
+	it("writes the prompt file before reporting an outcome that opens the launch gate", async () => {
 		await draftOutcome(harness);
 		assert.deepEqual(harness.events, ["complete", `write:${PROMPT_PATH}`]);
 	});
@@ -246,7 +246,7 @@ describe("DraftService.draft when the response is malformed", () => {
 describe("DraftService.draft when the draft asks for context", () => {
 	const needsInput: Draft = { ...DRAFT, prompt: "NEEDS INPUT: which retry policy applies to streaming calls?" };
 
-	it("diverts to the user instead of opening Gate A", async () => {
+	it("diverts to the user instead of opening the launch gate", async () => {
 		const harness = createHarness({ response: ok(JSON.stringify(needsInput)) });
 		const outcome = await draftOutcome(harness);
 		assert.deepEqual(outcome, { kind: "needs_input", draft: needsInput, promptPath: PROMPT_PATH });
@@ -409,7 +409,7 @@ describe("DraftService.draft when the draft asks for context", () => {
 		assert.equal(revised.ok, false);
 	});
 
-	it("allows a prompt that discusses NEEDS INPUT without raising it to reach Gate A", async () => {
+	it("allows a prompt that discusses NEEDS INPUT without raising it to reach the launch gate", async () => {
 		const completeDraft: Draft = {
 			...DRAFT,
 			prompt:
@@ -534,7 +534,7 @@ describe("DraftService.continueWithPrompt", () => {
 });
 
 describe("DraftService.draft when the tier resolves to no model", () => {
-	it("still reports a ready draft so Gate A can open", async () => {
+	it("still reports a ready draft so the launch gate can open", async () => {
 		const harness = createHarness({ models: [] });
 		const outcome = await draftOutcome(harness);
 		assert.deepEqual(outcome, { kind: "ready", draft: DRAFT, choice: undefined, promptPath: PROMPT_PATH });
@@ -701,7 +701,7 @@ describe("DraftService.draftLeftovers", () => {
 		assert.equal(outcome.kind, "ready");
 	});
 
-	it("reaches Gate A through the ordinary path, with the prompt written first", async () => {
+	it("reaches the launch gate through the ordinary path, with the prompt written first", async () => {
 		const harness = createHarness();
 		const outcome = await leftoversOutcome(harness);
 		assert.deepEqual(outcome, { kind: "ready", draft: DRAFT, choice: EXPECTED_CHOICE, promptPath: PROMPT_PATH });

@@ -97,7 +97,7 @@ interface HarnessOptions {
 	runnable?: boolean;
 	/** Fixed millisecond readings, consumed in order, so elapsed time is deterministic. */
 	msReadings?: number[];
-	/** Skips Gate A's transitions, leaving the machine idle to test the refusal. */
+	/** Skips the launch gate's transitions, leaving the machine idle to test the refusal. */
 	startIdle?: boolean;
 	/** Replaces the production no-progress interval with a test-sized value. */
 	noProgressThresholdMs?: number;
@@ -283,7 +283,7 @@ describe("RunService.start", () => {
 });
 
 describe("RunService.start refusals", () => {
-	it("refuses a model that vanished from the registry between Gate A and spawn", async () => {
+	it("refuses a model that vanished from the registry between the launch gate and spawn", async () => {
 		const harness = createHarness({ runnable: false });
 		const outcome = await start(harness);
 
@@ -452,7 +452,7 @@ describe("RunService.start interruptions", () => {
 
 	/**
 	 * A killed worker often has already emitted assistant text. Treating that as a
-	 * completed review would let a partial, abandoned result reach Gate B as though
+	 * completed review would let a partial, abandoned result reach the result gate as though
 	 * the worker had finished, which is the exact thing an interrupted state exists
 	 * to prevent.
 	 */
@@ -490,7 +490,7 @@ describe("RunService.start interruptions", () => {
 
 	/**
 	 * Inverted deliberately. This case used to assert that a non-zero exit with earlier
-	 * text reached Gate B as a *completed* review carrying that text as its report, and
+	 * text reached the result gate as a *completed* review carrying that text as its report, and
 	 * that is the bug: the adapter's report is the last assistant text it saw, not the
 	 * worker's conclusion. A 2h19m run whose final message was an error reached a
 	 * reviewer as a completed handoff whose whole report was a mid-task sentence about
@@ -504,7 +504,7 @@ describe("RunService.start interruptions", () => {
 		assert.equal(outcome.state.report, null);
 	});
 
-	it("keeps a crashed worker's text as pre-crash output rather than dropping it", async () => {
+	it("keeps a crashed worker's text as partial output rather than dropping it", async () => {
 		const harness = createHarness({ outcome: workerOutcome({ exitCode: 1, report: "## Summary\nPartial work." }) });
 		const outcome = await start(harness);
 
@@ -537,14 +537,14 @@ describe("RunService.start interruptions", () => {
 		assert.match(outcome.state.interruptionNote, /context length exceeded/);
 	});
 
-	it("says the pre-crash text is not a report, since the user watched it stream in", async () => {
+	it("says the partial output is not a report, since the user watched it stream in", async () => {
 		const harness = createHarness({
 			outcome: workerOutcome({ exitCode: 0, stopReason: "error", report: "Mid-task sentence." }),
 		});
 		const outcome = await start(harness);
 
 		assert.ok(outcome.kind === "interrupted");
-		assert.match(outcome.state.interruptionNote, /pre-crash output, not as a report/);
+		assert.match(outcome.state.interruptionNote, /partial output, not as a report/);
 	});
 
 	it("retains a bounded tail of a failed worker's stderr", async () => {
@@ -939,7 +939,7 @@ describe("RunService.diffstat", () => {
  * the extension forgot the handoff, so the user's own worker edited a tree with no
  * checkpoint, and its result came back as a pasted message with no diffstat and no
  * Discard. These assert the two halves that fix it — a checkpoint taken with no
- * spawn, and a review that reaches Gate B the same way an internal run does.
+ * spawn, and a review that reaches the result gate the same way an internal run does.
  */
 describe("RunService.startExternal", () => {
 	it("takes a checkpoint, exactly as a spawned run does", async () => {
@@ -1035,7 +1035,7 @@ describe("RunService.completeExternal", () => {
 	});
 
 	/**
-	 * An empty paste is allowed but is not a report: Gate B's completed branch promises
+	 * An empty paste is allowed but is not a report: the result gate's completed branch promises
 	 * one, and an empty string there renders as a worker that reported nothing.
 	 */
 	it("treats an empty report as interrupted rather than as an empty result", async () => {
@@ -1136,7 +1136,7 @@ describe("classifyOutcome", () => {
 		assert.equal(classifyOutcome({ ...clean, report: "  " }).kind, "interrupted");
 	});
 
-	it("carries the pre-crash text through for retention", () => {
+	it("carries the partial output through for retention", () => {
 		const classified = classifyOutcome({ ...clean, stopReason: "error" });
 		assert.ok(classified.kind === "interrupted");
 		assert.equal(classified.partialReport, "## Summary");

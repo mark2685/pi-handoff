@@ -135,7 +135,7 @@ describe("handoff machine", () => {
 		assert.equal(machine.reviewing(), undefined);
 	});
 
-	it("records a completed worker run for Gate B", () => {
+	it("records a completed worker run for the result gate", () => {
 		const result = completedRun(machine);
 		assert.deepEqual(result, {
 			kind: "reviewing",
@@ -289,7 +289,7 @@ describe("handoff machine", () => {
 		});
 	});
 
-	it("refuses proposal edits outside Gate A", () => {
+	it("refuses proposal edits outside the launch gate", () => {
 		assertConflict(
 			machine.updateProposal(draft, choice),
 			"idle",
@@ -298,7 +298,7 @@ describe("handoff machine", () => {
 		);
 	});
 
-	it("refuses a worker start before Gate A proposes a handoff", () => {
+	it("refuses a worker start before the launch gate proposes a handoff", () => {
 		assertConflict(
 			machine.startRun(startInput()),
 			"idle",
@@ -307,7 +307,7 @@ describe("handoff machine", () => {
 		);
 	});
 
-	it("refuses a feedback run outside Gate B", () => {
+	it("refuses a feedback run outside the result gate", () => {
 		assertConflict(
 			machine.restartRun({ ...startInput(1), draft, choice }),
 			"idle",
@@ -335,7 +335,7 @@ describe("handoff machine", () => {
 		);
 	});
 
-	it("refuses clearing a review arm outside Gate B", () => {
+	it("refuses clearing a review arm outside the result gate", () => {
 		assertConflict(machine.clearReviewTurn(), "idle", "clearReviewTurn", "No review turn is awaiting completion");
 	});
 
@@ -551,7 +551,7 @@ describe("handoff run interruption", () => {
 		assertConflict(machine.interruptRun("stopped"), "idle", "interruptRun", "No worker run is active to interrupt");
 	});
 
-	it("retains a crashed worker's pre-crash text without promoting it to a report", () => {
+	it("retains a crashed worker's partial output without promoting it to a report", () => {
 		machine.beginDraft("crashed run");
 		machine.propose(draft, choice);
 		machine.startRun(startInput());
@@ -595,11 +595,11 @@ describe("handoff run interruption", () => {
 });
 
 /**
- * The round counter is what lets the NEEDS INPUT gate notice a drafting model that
+ * The round counter is what lets the questions gate notice a drafting model that
  * keeps asking instead of converging, so it has to be persisted with the round it
  * describes and it has to survive the envelope being cleared.
  */
-describe("needs-input round counting", () => {
+describe("questions round counting", () => {
 	it("reports the first round before any round has opened", () => {
 		machine.beginDraft("scope");
 		assert.equal(machine.needsInputRound(), 1);
@@ -607,29 +607,29 @@ describe("needs-input round counting", () => {
 
 	it("counts each opened round", () => {
 		machine.beginDraft("scope");
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		assert.equal(machine.needsInputRound(), 1);
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		assert.equal(machine.needsInputRound(), 2);
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		assert.equal(machine.needsInputRound(), 3);
 	});
 
 	it("keeps the count when a pending envelope is cleared, since that ends a round", () => {
 		machine.beginDraft("scope");
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		machine.setPendingDraft({ draft, promptPath: "/tmp/pi-handoff-x.md" });
 		machine.clearPendingDraft();
 		assert.equal(machine.needsInputRound(), 1);
 		// The next round continues the count rather than re-asking as though it were the first.
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		assert.equal(machine.needsInputRound(), 2);
 	});
 
 	it("resets with the handoff, so a later draft does not inherit a stale count", () => {
 		machine.beginDraft("scope");
-		machine.beginNeedsInputRound();
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
+		machine.beginQuestionsRound();
 		machine.reset();
 		machine.beginDraft("a different handoff");
 		assert.equal(machine.needsInputRound(), 1);
@@ -639,16 +639,16 @@ describe("needs-input round counting", () => {
 	it("treats an absent counter as the first round when resuming an old entry", () => {
 		machine.restore({ kind: "drafting", scope: "old", pendingDraft: { draft, promptPath: "/tmp/x.md" } });
 		assert.equal(machine.needsInputRound(), 1);
-		machine.beginNeedsInputRound();
+		machine.beginQuestionsRound();
 		assert.equal(machine.needsInputRound(), 2);
 	});
 
 	it("refuses to count a round outside drafting", () => {
 		assertConflict(
-			machine.beginNeedsInputRound(),
+			machine.beginQuestionsRound(),
 			"idle",
-			"beginNeedsInputRound",
-			"A needs-input round can open only while drafting",
+			"beginQuestionsRound",
+			"A questions round can open only while drafting",
 		);
 	});
 

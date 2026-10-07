@@ -1,11 +1,10 @@
 /**
  * A read-only scrollable viewer for text a gate can only preview.
  *
- * Every gate in this package shows a bounded preview: Gate A truncates the prompt
- * to twelve lines, Gate B truncates the report to twenty-four and the diffstat to
- * twelve. Those bounds exist because the gates do not scroll, and they were the
- * reason a user sat at Gate A for up to twenty-eight minutes deciding whether to
- * approve a hundred-line prompt they could only see the head of. The remedy is not
+ * Every gate in this package shows only as much of its evidence as fits below its menu
+ * (the gate frame decides how much). That bound exists because the gates do not scroll,
+ * and it was the reason a user sat at the launch gate for up to twenty-eight minutes
+ * deciding whether to approve a hundred-line prompt they could only see the head of. The remedy is not
  * bigger previews — a gate that fills the screen hides its own options — but a
  * separate surface that shows the whole text and gives it back.
  *
@@ -30,7 +29,7 @@
  * footer advertising a key that does nothing.
  *
  * Read-only on purpose. `ctx.ui.editor` was the previous stand-in for this (the
- * NEEDS INPUT gate's View full draft used it, titled "read-only; edits are
+ * questions gate's View full draft used it, titled "read-only; edits are
  * discarded"), which asks the user to type into a buffer whose changes are thrown
  * away — a surface that lies about what it does. This viewer cannot edit, so it
  * cannot mislead.

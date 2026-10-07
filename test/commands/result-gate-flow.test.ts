@@ -1,10 +1,10 @@
 /**
- * Behavioral tests for the Gate B loop and the review-turn reopen.
+ * Behavioral tests for the result gate loop and the review-turn reopen.
  *
  * These exist mainly for two properties no other test can express.
  *
  * The capture and the reopen are separate: `agent_end` records the review and opens
- * nothing, and the turn's settle reopens Gate B without being awaited. The tests
+ * nothing, and the turn's settle reopens the result gate without being awaited. The tests
  * that hold a gate open and assert the reopen has already returned are what pin the
  * second half, since Pi awaits extension handlers and an awaited gate would stall
  * the turn it belongs to.
@@ -13,13 +13,13 @@
  * so a repeated settle finds nothing to reopen, and several captures from one
  * retried prompt still collapse into one gate showing the last attempt's review.
  *
- * Gate B is faked at `ctx.ui.custom`, which resolves queued option ids without
+ * The result gate is faked at `ctx.ui.custom`, which resolves queued option ids without
  * constructing the overlay. That keeps these tests about the flow's decisions
  * rather than about rendering, matching how the gate formatters are tested
  * separately as pure functions.
  *
  * The feedback branch is deliberately not driven here: it runs behind
- * `runWithWidget`, which only performs its operation when a real TUI invokes the
+ * `runWithMonitor`, which only performs its operation when a real TUI invokes the
  * component factory. Its decisions — the bound, the write ordering, the refusals —
  * are covered against `ReviewService` directly instead.
  */
@@ -32,12 +32,12 @@ import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService, type RunService } from "../../src/app/run-service.ts";
 import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
 import {
-	createGateBFlow,
+	createResultGateFlow,
 	formatReopenFailure,
 	formatReviewTurnFailure,
-	type GateBFlow,
-} from "../../src/commands/gate-b-flow.ts";
-import { gateBOptions } from "../../src/presentation/gate-b.ts";
+	type ResultGateFlow,
+} from "../../src/commands/result-gate-flow.ts";
+import { resultGateOptions } from "../../src/presentation/result-gate.ts";
 import type { LeftoversScopeInput } from "../../src/domain/draft/leftovers.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
@@ -72,7 +72,7 @@ const PROMPT_PATH = "/tmp/pi-handoff-add-retry-logic.md";
 const CWD = "/repo";
 
 interface Harness {
-	flow: GateBFlow;
+	flow: ResultGateFlow;
 	machine: HandoffMachine;
 	runService: RunService;
 	ctx: ExtensionContext;
@@ -92,7 +92,7 @@ interface Harness {
 }
 
 interface HarnessOptions {
-	/** Option ids resolved by successive Gate B renders, in order. */
+	/** Option ids resolved by successive result gate renders, in order. */
 	selections?: (string | undefined)[];
 	interrupted?: boolean;
 	/** Worker outcomes consumed in order: iteration 1, then feedback iterations. */
@@ -186,7 +186,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 			},
 			// Run widgets resolve their custom surface from their operation; gates wait for
 			// a choice. Invoking the factory lets feedback exercise its real restart path
-			// while counting only Gate B renders, which exposes an unwanted second gate.
+			// while counting only the result gate renders, which exposes an unwanted second gate.
 			custom: async (factory: unknown) => {
 				let resolved: { value: unknown } | undefined;
 				const build = factory as (
@@ -225,7 +225,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		},
 	} as unknown as ExtensionContext;
 
-	const flow = createGateBFlow({
+	const flow = createResultGateFlow({
 		machine,
 		runService,
 		reviewService,
@@ -256,7 +256,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	};
 }
 
-/** Drives the machine to a pending review, which is Gate B's precondition. */
+/** Drives the machine to a pending review, which is the result gate's precondition. */
 async function reachReview(harness: Harness, options: { autoReview?: boolean } = {}): Promise<void> {
 	harness.machine.beginDraft("add retries");
 	harness.machine.propose(DRAFT, CHOICE);
@@ -288,7 +288,7 @@ async function flush(): Promise<void> {
 	for (let tick = 0; tick < 3; tick += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-describe("GateBFlow.viewFromPendingReview", () => {
+describe("ResultGateFlow.viewFromPendingReview", () => {
 	it("builds a view from the review the machine holds", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
@@ -334,8 +334,8 @@ describe("GateBFlow.viewFromPendingReview", () => {
 	});
 });
 
-describe("GateBFlow.viewFromOutcome", () => {
-	/** The path a feedback iteration takes straight from the run outcome to Gate B. */
+describe("ResultGateFlow.viewFromOutcome", () => {
+	/** The path a feedback iteration takes straight from the run outcome to the result gate. */
 	it("carries an interrupted run's measured usage into the view", async () => {
 		const harness = createHarness({ interrupted: true });
 		harness.machine.beginDraft("add retries");
@@ -350,7 +350,7 @@ describe("GateBFlow.viewFromOutcome", () => {
 	});
 });
 
-describe("GateBFlow.run", () => {
+describe("ResultGateFlow.run", () => {
 	it("accepts the review and returns to idle", async () => {
 		const harness = createHarness({ selections: ["accept"] });
 		await reachReview(harness);
@@ -654,10 +654,10 @@ describe("GateBFlow.run", () => {
 		assert.equal(harness.machine.reviewing()?.iteration, 2);
 		assert.equal(harness.machine.reviewing()?.awaitingReviewTurn, true);
 		assert.equal(harness.messages.length, 1);
-		assert.equal(harness.overlays.length, 1, "the completed retry must not render Gate B before review");
+		assert.equal(harness.overlays.length, 1, "the completed retry must not render the result gate before review");
 	});
 
-	it("opens Gate B when an auto-review feedback iteration is interrupted", async () => {
+	it("opens the result gate when an auto-review feedback iteration is interrupted", async () => {
 		const harness = createHarness({
 			selections: ["feedback", "dismiss"],
 			editorResult: "Fix the timeout edge case.",
@@ -695,7 +695,7 @@ describe("GateBFlow.run", () => {
 		assert.equal(harness.overlays.length, 2);
 	});
 
-	it("opens Gate B after a completed feedback iteration from plain Run", async () => {
+	it("opens the result gate after a completed feedback iteration from plain Run", async () => {
 		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "Fix the timeout edge case." });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
@@ -709,7 +709,7 @@ describe("GateBFlow.run", () => {
 	});
 });
 
-describe("GateBFlow review-turn capture and reopen", () => {
+describe("ResultGateFlow review-turn capture and reopen", () => {
 	it("does nothing when no handoff is active", async () => {
 		const harness = createHarness();
 		await endReviewTurn(harness);
@@ -726,7 +726,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.deepEqual(harness.overlays, []);
 	});
 
-	it("reopens Gate B after the review turn it armed", async () => {
+	it("reopens the result gate after the review turn it armed", async () => {
 		const harness = createHarness({ selections: ["review", "dismiss"] });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
@@ -794,7 +794,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.equal(finished, true);
 	});
 
-	it("captures the final reviewer text and verdict before reopening Gate B", async () => {
+	it("captures the final reviewer text and verdict before reopening the result gate", async () => {
 		const harness = createHarness({ selections: ["review", "dismiss"] });
 		await reachReview(harness);
 		const view = await harness.flow.viewFromPendingReview(harness.ctx);
@@ -949,7 +949,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 
 	/**
 	 * The 402 case: the reviewer model failed, so the turn ended with an error stop
-	 * reason and no content. Persisting that as `review: { text: "" }` reopened Gate B as
+	 * reason and no content. Persisting that as `review: { text: "" }` reopened the result gate as
 	 * though the diff had been reviewed, with the failure never mentioned.
 	 */
 	it("records no review when the review turn failed, and names the failure", async () => {
@@ -986,7 +986,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.ok(reopened);
 		assert.equal(reopened.report, REPORT, "the completed run is untouched, so Review here remains available");
 		assert.equal(
-			gateBOptions(reopened).find((option) => option.id === "review")?.label,
+			resultGateOptions(reopened).find((option) => option.id === "review")?.label,
 			"Review here",
 			"a failed turn must not relabel the option as Review again",
 		);
@@ -1044,7 +1044,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.equal(harness.machine.reviewing()?.review?.text, "Findings.\n\nVerdict: fix", "the earlier review is kept");
 		const reopened = await harness.flow.viewFromPendingReview(harness.ctx);
 		assert.ok(reopened);
-		assert.equal(gateBOptions(reopened).find((option) => option.id === "review")?.label, "Review again");
+		assert.equal(resultGateOptions(reopened).find((option) => option.id === "review")?.label, "Review again");
 		const reported = harness.notifications.find((entry) => entry.message.startsWith("Review turn failed"));
 		assert.match(reported?.message ?? "", /Choose "Review again" to run it again\./);
 		assert.doesNotMatch(reported?.message ?? "", /Review here/);
@@ -1102,9 +1102,9 @@ describe("GateBFlow review-turn capture and reopen", () => {
 
 		const reported = harness.notifications.at(-1);
 		assert.equal(reported?.level, "error");
-		assert.match(reported?.message ?? "", /Gate B stopped with an error: the overlay could not be rendered/);
+		assert.match(reported?.message ?? "", /The result gate stopped with an error: the overlay could not be rendered/);
 		// The review still landed, and the message says how to get back to it.
-		assert.match(reported?.message ?? "", /still pending; run `\/handoff` to reopen Gate B/);
+		assert.match(reported?.message ?? "", /still pending; run `\/handoff` to reopen the result gate/);
 		assert.equal(harness.machine.reviewing()?.review?.verdict, "accept");
 	});
 
@@ -1128,8 +1128,8 @@ describe("GateBFlow review-turn capture and reopen", () => {
 		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 		const reported = harness.notifications.at(-1);
 		assert.equal(reported?.level, "error");
-		assert.match(reported?.message ?? "", /Gate B stopped with an error: the drafting call failed/);
-		assert.doesNotMatch(reported?.message ?? "", /still pending|to reopen Gate B/);
+		assert.match(reported?.message ?? "", /The result gate stopped with an error: the drafting call failed/);
+		assert.doesNotMatch(reported?.message ?? "", /still pending|to reopen the result gate/);
 		assert.match(reported?.message ?? "", /`\/handoff status`/);
 	});
 
@@ -1152,7 +1152,7 @@ describe("GateBFlow review-turn capture and reopen", () => {
  * "Run and review" reuses this seam rather than rebuilding the injection, so these
  * assert it arms and injects exactly as the gate's own Review here does.
  */
-describe("GateBFlow.startReviewTurn", () => {
+describe("ResultGateFlow.startReviewTurn", () => {
 	it("arms the review turn and injects the review message", async () => {
 		const harness = createHarness();
 		await reachReview(harness);
@@ -1198,7 +1198,7 @@ describe("GateBFlow.startReviewTurn", () => {
 		assert.equal(harness.flow.startReviewTurn(harness.ctx), false);
 	});
 
-	it("reopens Gate B once when the injected turn ends", async () => {
+	it("reopens the result gate once when the injected turn ends", async () => {
 		const harness = createHarness({ selections: ["dismiss"] });
 		await reachReview(harness);
 		harness.flow.startReviewTurn(harness.ctx);
@@ -1237,31 +1237,38 @@ describe("formatReopenFailure", () => {
 
 		assert.match(
 			pending,
-			/^Gate B stopped with an error: boom\nThe review is still pending; run `\/handoff` to reopen Gate B\./,
+			/^The result gate stopped with an error: boom\nThe review is still pending; run `\/handoff` to reopen the result gate\./,
 		);
-		assert.match(gone, /^Gate B stopped with an error: boom\nRun `\/handoff status` to see where the handoff stands\./);
+		assert.match(
+			gone,
+			/^The result gate stopped with an error: boom\nRun `\/handoff status` to see where the handoff stands\./,
+		);
 	});
 
 	/** The stack used to reach Pi's own extension-error display; now only this carries it. */
 	it("keeps the stack below the message, without repeating the message line", () => {
 		const error = new Error("boom");
-		error.stack = "Error: boom\n    at reopenGateB (gate-b-flow.ts:180:5)\n    at run (gate-b-flow.ts:400:9)";
+		error.stack =
+			"Error: boom\n    at reopenResultGate (result-gate-flow.ts:180:5)\n    at run (result-gate-flow.ts:400:9)";
 
 		const lines = formatReopenFailure(error, true).split("\n");
 
-		assert.deepEqual(lines.slice(2), ["  at reopenGateB (gate-b-flow.ts:180:5)", "  at run (gate-b-flow.ts:400:9)"]);
+		assert.deepEqual(lines.slice(2), [
+			"  at reopenResultGate (result-gate-flow.ts:180:5)",
+			"  at run (result-gate-flow.ts:400:9)",
+		]);
 		assert.equal(lines.filter((line) => line.includes("Error: boom")).length, 0);
 	});
 
 	it("reports a thrown non-Error without a stack", () => {
 		assert.equal(
 			formatReopenFailure("plain string", false),
-			"Gate B stopped with an error: plain string\nRun `/handoff status` to see where the handoff stands.",
+			"The result gate stopped with an error: plain string\nRun `/handoff status` to see where the handoff stands.",
 		);
 	});
 });
 
-describe("GateBFlow leftovers follow-up", () => {
+describe("ResultGateFlow leftovers follow-up", () => {
 	/** Captured before Accept, which resets the machine and takes the review with it. */
 	it("accepts, then requests a follow-up draft from the prompt and structured items only", async () => {
 		// The reopen after the review turn is what renders the gate here, and its single
@@ -1300,7 +1307,7 @@ describe("GateBFlow leftovers follow-up", () => {
 	});
 });
 
-describe("GateBFlow read-only viewers", () => {
+describe("ResultGateFlow read-only viewers", () => {
 	it("returns to the gate after viewing the full report", async () => {
 		const harness = createHarness({ selections: ["view_report", "dismiss"] });
 		await reachReview(harness);

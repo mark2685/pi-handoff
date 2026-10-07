@@ -1,6 +1,6 @@
 /**
  * End-to-end coverage for the checkpoint boundary: a real Git repository, the real
- * RunService and Gate B flow, and the shared fake Pi worker. No Pi process, model,
+ * RunService and the result gate flow, and the shared fake Pi worker. No Pi process, model,
  * credentials, or network access is involved.
  */
 
@@ -16,7 +16,7 @@ import { createExecGit } from "../../src/adapters/exec-git.ts";
 import { createHandoffMachine } from "../../src/app/handoff-machine.ts";
 import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService } from "../../src/app/run-service.ts";
-import { createGateBFlow } from "../../src/commands/gate-b-flow.ts";
+import { createResultGateFlow } from "../../src/commands/result-gate-flow.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Draft, ModelChoice } from "../../src/domain/types.ts";
 import type { ExecResult } from "../../src/ports/git.ts";
@@ -105,7 +105,7 @@ function isErrnoWithCode(error: unknown, code: string): error is NodeJS.ErrnoExc
 }
 
 describe("handoff scratch-repository end to end", () => {
-	it("runs through Gate B and discards only worker changes since the checkpoint", async () => {
+	it("runs through the result gate and discards only worker changes since the checkpoint", async () => {
 		scratchRepository = await mkdtemp(path.join(tmpdir(), "pi-handoff-e2e-"));
 		await runGit(["init", "--quiet"]);
 		await runGit(["config", "user.email", "pi-handoff-test@example.invalid"]);
@@ -151,7 +151,7 @@ describe("handoff scratch-repository end to end", () => {
 			hasUI: true,
 			cwd: scratchRepository,
 			ui: {
-				// The first custom surface is Gate B; the second is Discard's mandatory acknowledgement.
+				// The first custom surface is the result gate; the second is Discard's mandatory acknowledgement.
 				custom: async () => {
 					customCall += 1;
 					return customCall === 1 ? "discard" : undefined;
@@ -160,7 +160,7 @@ describe("handoff scratch-repository end to end", () => {
 				notify: (message: string) => notifications.push(message),
 			},
 		} as unknown as ExtensionContext;
-		const gateB = createGateBFlow({
+		const resultGate = createResultGateFlow({
 			machine,
 			runService,
 			reviewService,
@@ -172,7 +172,7 @@ describe("handoff scratch-repository end to end", () => {
 		const outcome = await runService.start({ promptPath, cwd: scratchRepository, isChoiceRunnable: () => true });
 		assert.equal(outcome.kind, "completed");
 		if (outcome.kind !== "completed") return;
-		assert.equal(machine.current().kind, "reviewing", "a completed worker must reach Gate B");
+		assert.equal(machine.current().kind, "reviewing", "a completed worker must reach the result gate");
 		assert.ok(
 			outcome.state.checkpoint.statuses.some((status) => status.path === "pre-existing.txt"),
 			"the checkpoint must record dirty work that predates the worker",
@@ -182,12 +182,12 @@ describe("handoff scratch-repository end to end", () => {
 		assert.equal(await readScratchFile("pre-existing.txt"), "user work before checkpoint\n");
 		assert.match(outcome.state.diffstat, /worker-edit\.txt/);
 
-		const gateBView = gateB.viewFromOutcome({ slug: DRAFT.slug, choice: CHOICE, promptPath }, outcome);
-		assert.notEqual(gateBView, undefined);
-		if (gateBView === undefined) return;
-		await gateB.run(ctx, gateBView);
+		const resultGateView = resultGate.viewFromOutcome({ slug: DRAFT.slug, choice: CHOICE, promptPath }, outcome);
+		assert.notEqual(resultGateView, undefined);
+		if (resultGateView === undefined) return;
+		await resultGate.run(ctx, resultGateView);
 
-		assert.equal(customCall, 2, "Gate B must show Discard and then require its acknowledgement");
+		assert.equal(customCall, 2, "the result gate must show Discard and then require its acknowledgement");
 		assert.equal(machine.current().kind, "idle", "successful Discard must close the handoff");
 		assert.equal(await readScratchFile("worker-edit.txt"), "checkpoint version\n");
 		assert.equal(await scratchFileExists("worker-created.txt"), false);

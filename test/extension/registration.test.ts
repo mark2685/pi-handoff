@@ -12,7 +12,7 @@
  *
  * Their split is asserted end to end here, because only the entry point wires it:
  * `agent_end` captures the review and opens nothing, and `agent_settled` reopens
- * Gate B without being awaited. The reopen is therefore observed after a flush
+ * The result gate without being awaited. The reopen is therefore observed after a flush
  * rather than on the handler's own promise. `agent_end` can also fire more than once
  * per prompt, since `_runAgentPrompt` loops on auto-retry, so the last capture is
  * the one that reaches the gate.
@@ -339,7 +339,7 @@ describe("session_start rehydration", () => {
 		await fireHook(recorder, "session_start", { type: "session_start", reason: "resume" }, ctx);
 		await command.handler("status", ctx);
 
-		assert.match(notifications[0]?.message ?? "", /review interrupted for add-retries/);
+		assert.match(notifications[0]?.message ?? "", /add-retries interrupted, waiting at the result gate/);
 	});
 
 	it("resets a new session even when the previous one held a handoff", async () => {
@@ -418,7 +418,7 @@ describe("review-turn capture and reopen", () => {
 		handoff(recorder.api);
 	});
 
-	/** Arms a review turn the way Review here does, leaving Gate B's first render behind. */
+	/** Arms a review turn the way Review here does, leaving the result gate's first render behind. */
 	async function armReviewTurn(options: { customResults: unknown[] }) {
 		const command = recorder.commands.get(HANDOFF_COMMAND_NAME);
 		assert.ok(command);
@@ -470,7 +470,7 @@ describe("review-turn capture and reopen", () => {
 	 * extension `agent_end` handlers before the listener that clears its `Working`
 	 * spinner runs, so a gate opened there would sit under a spinner that cannot clear.
 	 */
-	it("captures in agent_end and reopens Gate B from agent_settled, exactly once", async () => {
+	it("captures in agent_end and reopens the result gate from agent_settled, exactly once", async () => {
 		const { ctx, uiCalls } = await armReviewTurn({ customResults: ["review", "dismiss"] });
 
 		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [] }, ctx);

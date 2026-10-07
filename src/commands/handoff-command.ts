@@ -1,13 +1,13 @@
 /**
- * `/handoff` dispatch: drafting, Gate A, and the escape hatches.
+ * `/handoff` dispatch: drafting, the launch gate, and the escape hatches.
  *
- * The drafting flow and Gate A are extracted as `runDraftingFlow` and `runGateA`
+ * The drafting flow and the launch gate are extracted as `runDraftingFlow` and `runLaunchGate`
  * rather than inlined in the handler, because two entry points need them: the
- * command itself, and Gate B's "Accept and hand off leftovers", which drafts a
+ * command itself, and the result gate's "Accept and hand off leftovers", which drafts a
  * follow-up from an accepting review. A follow-up that skipped either would be a
  * second, less guarded way to reach a worker.
  *
- * `runGateA` is a loop because Edit prompt, Change model, and View full prompt
+ * `runLaunchGate` is a loop because Edit prompt, Change model, and View full prompt
  * change what the gate shows without deciding anything, so each must re-render it.
  * Every branch that ends the handoff routes through the service so the machine and
  * its session entries stay consistent.
@@ -20,10 +20,10 @@
  * too: the answered round is retained by the service, so the loop offers a retry of
  * the identical answered scope rather than returning to idle and discarding answers
  * the user has already spent real time on. `continueWithPrompt` on the
- * service is the only path from that draft to Gate A, so this gate can never be
+ * service is the only path from that draft to the launch gate, so this gate can never be
  * bypassed by construction.
  *
- * Gate B's own loop lives in `gate-b-flow.ts`, because the review-turn reopen and
+ * The result gate's own loop lives in `result-gate-flow.ts`, because the review-turn reopen and
  * `/handoff` while a review is pending both need it and neither goes through
  * drafting.
  *
@@ -50,14 +50,14 @@ import type { ModelChoice } from "../domain/types.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { Clipboard } from "../ports/clipboard.ts";
 import { withLoader } from "../presentation/drafting-loader.ts";
-import { openGateA } from "../presentation/gate-a.ts";
+import { openLaunchGate } from "../presentation/launch-gate.ts";
 import { describeGitFailure } from "../presentation/git-failure.ts";
 import { answeredRetryMenu, externalRunMenu, selectOption, unparseableMenu } from "../presentation/menus.ts";
 import { pickModel } from "../presentation/model-picker.ts";
-import { runWithWidget } from "../presentation/running-widget.ts";
+import { runWithMonitor } from "../presentation/run-monitor.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
-import type { GateBFlow } from "./gate-b-flow.ts";
-import { runNeedsInputFlow } from "./needs-input-flow.ts";
+import type { ResultGateFlow } from "./result-gate-flow.ts";
+import { runQuestionsGateFlow } from "./questions-gate-flow.ts";
 import { HANDOFF_COMMAND, parseHandoffCommand } from "./parse.ts";
 import { formatHandoffStatus } from "./status.ts";
 
@@ -68,7 +68,7 @@ export interface HandoffCommandDeps {
 	/** Session-scoped, so a reopened gate and the shutdown hook reach the same run. */
 	runService: RunService;
 	/** Session-scoped for the same reason: the review-turn hooks have no invocation to build one in. */
-	gateBFlow: GateBFlow;
+	resultGateFlow: ResultGateFlow;
 	/** Re-checked at every click, so a vanished provider blocks the spawn. */
 	isChoiceRunnable: (ctx: ExtensionContext, choice: ModelChoice | undefined) => boolean;
 	clipboard: Clipboard;
@@ -82,13 +82,13 @@ export interface HandoffCommand {
 	/**
 	 * Drafts the follow-up handoff for an accepting review's leftover items.
 	 *
-	 * Exposed so Gate B's "Accept and hand off leftovers" reaches the same drafting,
-	 * NEEDS INPUT, and Gate A path as `/handoff` itself, rather than a parallel one.
+	 * Exposed so the result gate's "Accept and hand off leftovers" reaches the same drafting,
+	 * questions-gate, and launch-gate path as `/handoff` itself, rather than a parallel one.
 	 */
 	draftLeftovers: (ctx: ExtensionContext, input: LeftoversScopeInput) => Promise<void>;
 }
 
-/** Renders a draft outcome that ends the flow before Gate A. */
+/** Renders a draft outcome that ends the flow before the launch gate. */
 function reportTerminalOutcome(ctx: ExtensionContext, outcome: DraftOutcome): void {
 	switch (outcome.kind) {
 		case "empty_session":
@@ -142,14 +142,14 @@ async function copyLaunchCommand(ctx: ExtensionContext, clipboard: Clipboard, vi
 
 /** Creates the `/handoff` handler and its reusable drafting entry point. */
 export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCommand {
-	const { machine, createService, runService, gateBFlow, isChoiceRunnable, clipboard, clock } = deps;
+	const { machine, createService, runService, resultGateFlow, isChoiceRunnable, clipboard, clock } = deps;
 
 	/**
-	 * Runs the drafting-to-Gate-A flow for an already-built service and initial scope.
+	 * Runs the drafting-to-launch-gate flow for an already-built service and initial scope.
 	 *
 	 * Extracted from the command body so "Accept and hand off leftovers" reaches the
-	 * identical path: the same retry loop, the same NEEDS INPUT gate, and the same
-	 * Gate A. A follow-up handoff that bypassed any of that would be a second, less
+	 * identical path: the same retry loop, the same questions gate, and the same
+	 * launch gate. A follow-up handoff that bypassed any of that would be a second, less
 	 * guarded way to start a worker.
 	 *
 	 * The two sources differ in exactly one way, and it holds for the whole loop rather
@@ -173,7 +173,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		let scope = leftovers ? buildLeftoversScope(initial.leftovers) : initial.scope;
 
 		while (view === undefined) {
-			// Drafting is bound to the reviewing session's current model, not Gate A's
+			// Drafting is bound to the reviewing session's current model, not the launch gate's
 			// worker choice. It is available here at the loader call site, so name it while
 			// the potentially long side-call is in progress.
 			const draftingModel = ctx.model === undefined ? undefined : `${ctx.model.provider}/${ctx.model.id}`;
@@ -223,7 +223,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			}
 
 			if (outcome.value.kind === "needs_input") {
-				const flowResult = await runNeedsInputFlow(ctx, service, outcome.value, scope);
+				const flowResult = await runQuestionsGateFlow(ctx, service, outcome.value, scope);
 				if (flowResult.kind === "cancelled") return;
 				if (flowResult.kind === "rescoped") {
 					scope = flowResult.scope;
@@ -267,16 +267,16 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			view = outcome.value;
 		}
 
-		await runGateA(ctx, service, view, leftovers ? initial.leftovers.slug : undefined);
+		await runLaunchGate(ctx, service, view, leftovers ? initial.leftovers.slug : undefined);
 	}
 
 	/**
-	 * Keeps Gate A open across Edit prompt, Change model, and View full prompt.
+	 * Keeps the launch gate open across Edit prompt, Change model, and View full prompt.
 	 *
 	 * A loop rather than a chain of returns because those three options change what
 	 * the gate shows without deciding anything, so each has to re-render it.
 	 */
-	async function runGateA(
+	async function runLaunchGate(
 		ctx: ExtensionContext,
 		service: DraftService,
 		ready: DraftReady,
@@ -286,7 +286,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 
 		for (;;) {
 			const runnable = isChoiceRunnable(ctx, view.choice);
-			const selected = await openGateA(ctx, {
+			const selected = await openLaunchGate(ctx, {
 				...view,
 				runnable,
 				...(leftoversOf === undefined ? {} : { leftovers: { acceptedSlug: leftoversOf } }),
@@ -317,7 +317,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				const settled = await settleRun(ctx, base, outcome, autoReview);
 				if (settled === "settled") return;
 
-				// The run never started. Gate A stays open so the user can fix the cause, unless
+				// The run never started. The launch gate stays open so the user can fix the cause, unless
 				// the machine refused the transition, which no amount of retrying at this gate
 				// will change.
 				if (outcome.kind === "refused") return;
@@ -325,8 +325,8 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			}
 
 			if (selected === "view") {
-				// The gate previews twelve lines of prompts that run to well over a hundred;
-				// this is the surface that shows the rest without displacing the options.
+				// The gate shows only the rows of the prompt that fit below its menu, and
+				// prompts run to well over a hundred lines; this surface shows the rest.
 				await openTextViewer(ctx, `Handoff prompt — ${view.draft.slug} (read-only)`, view.draft.prompt);
 				continue;
 			}
@@ -387,11 +387,11 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 	}
 
 	/**
-	 * Runs the worker behind the live widget and returns its outcome.
+	 * Runs the worker behind the run monitor and returns its outcome.
 	 *
-	 * The widget's Escape handler calls the run service's kill seam rather than
-	 * resolving the overlay, so the overlay closes only once the child is actually
-	 * gone. See `running-widget.ts` for why that ordering matters.
+	 * The monitor's Escape handler calls the run service's kill seam rather than
+	 * resolving the surface, so the surface closes only once the child is actually
+	 * gone. See `run-monitor.ts` for why that ordering matters.
 	 */
 	async function runWorker(
 		ctx: ExtensionContext,
@@ -399,7 +399,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		choice: ModelChoice,
 		autoReview: boolean,
 	): Promise<RunOutcome | undefined> {
-		const rendered = await runWithWidget<RunOutcome>(
+		const rendered = await runWithMonitor<RunOutcome>(
 			ctx,
 			{
 				slug: view.draft.slug,
@@ -455,11 +455,11 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 	}
 
 	/**
-	 * Sends a finished run to Gate B, or straight into the review turn.
+	 * Sends a finished run to the result gate, or straight into the review turn.
 	 *
 	 * `autoReview` is honoured only for a completed run. An interrupted one has no
 	 * report to review, and injecting a review turn for it would spend reviewing
-	 * context on a crash the user has not yet seen — Gate B, which explains what
+	 * context on a crash the user has not yet seen — the result gate, which explains what
 	 * happened and offers Discard, is the right surface for that.
 	 */
 	async function settleRun(
@@ -468,17 +468,17 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		outcome: RunOutcome,
 		autoReview: boolean,
 	): Promise<"settled" | "never_started"> {
-		const gateB = gateBFlow.viewFromOutcome(base, outcome);
-		if (gateB === undefined) {
+		const resultGate = resultGateFlow.viewFromOutcome(base, outcome);
+		if (resultGate === undefined) {
 			// The run never started, so there is nothing to review; the caller decides whether
-			// to reopen Gate A or give up, since only it knows which surface it came from.
+			// to reopen the launch gate or give up, since only it knows which surface it came from.
 			reportRunRefusal(ctx, outcome);
 			return "never_started";
 		}
 
-		if (autoReview && outcome.kind === "completed" && gateBFlow.startReviewTurn(ctx)) return "settled";
+		if (autoReview && outcome.kind === "completed" && resultGateFlow.startReviewTurn(ctx)) return "settled";
 
-		await gateBFlow.run(ctx, gateB);
+		await resultGateFlow.run(ctx, resultGate);
 		return "settled";
 	}
 
@@ -486,7 +486,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 	 * Runs the external-run gate until the user reviews, discards, or defers.
 	 *
 	 * Reached from `/handoff` while an external run is recorded. Discard is offered
-	 * here as well as at Gate B, because a user who abandons a run in the other
+	 * here as well as at the result gate, because a user who abandons a run in the other
 	 * terminal has changes to undo and no report coming.
 	 */
 	async function runExternalGate(ctx: ExtensionContext): Promise<void> {
@@ -589,12 +589,12 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			}
 
 			// A pending review is reopened rather than drafted over. Drafting would be refused
-			// by the machine anyway, and Gate B already carries Discard and Accept, so there is
+			// by the machine anyway, and the result gate already carries Discard and Accept, so there is
 			// nothing to ask the user first.
 			if (machine.reviewing() !== undefined) {
-				const pending = await gateBFlow.viewFromPendingReview(ctx);
+				const pending = await resultGateFlow.viewFromPendingReview(ctx);
 				if (pending !== undefined) {
-					await gateBFlow.run(ctx, pending);
+					await resultGateFlow.run(ctx, pending);
 					return;
 				}
 			}
@@ -634,7 +634,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 					const pendingDescription =
 						drafting.answeredRetryPending === true
 							? "A saved re-draft with answers is pending"
-							: "Pending NEEDS INPUT questions are being reopened";
+							: "The pending questions gate is being reopened";
 					ctx.ui.notify(
 						`${pendingDescription}; ${ignored.join(" and ")} ${ignored.length === 1 ? "was" : "were"} not used. Cancel the pending handoff, then re-run the command to start fresh with it.`,
 						"warning",
@@ -646,7 +646,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 					await runDraftingFlow(ctx, service, { scope: drafting.scope });
 					return;
 				}
-				const resumed = await runNeedsInputFlow(
+				const resumed = await runQuestionsGateFlow(
 					ctx,
 					service,
 					{ kind: "needs_input", ...drafting.pendingDraft },
@@ -655,7 +655,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				if (resumed.kind === "cancelled") return;
 				if (resumed.kind === "rescoped") scope = resumed.scope;
 				if (resumed.kind === "ready") {
-					await runGateA(ctx, service, resumed.view);
+					await runLaunchGate(ctx, service, resumed.view);
 					return;
 				}
 			}
@@ -664,7 +664,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 		},
 
 		async draftLeftovers(ctx: ExtensionContext, input: LeftoversScopeInput): Promise<void> {
-			// A gate is a TUI overlay, and drafting needs one; there is nothing to open elsewhere.
+			// A gate takes the TUI's focus, and drafting needs one; there is nothing to open elsewhere.
 			if (ctx.mode !== "tui") return;
 
 			const service = createService(ctx);

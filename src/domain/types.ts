@@ -45,7 +45,7 @@ export interface DraftQuestion {
 	recommended?: number;
 }
 
-/** A validated drafting-model envelope ready for rubric resolution and Gate A. */
+/** A validated drafting-model envelope ready for rubric resolution and the launch gate. */
 export interface Draft {
 	/** Model-provided filename hint; callers normalize it before using a path. */
 	slug: string;
@@ -57,7 +57,7 @@ export interface Draft {
 	rationale: string;
 	/** Open decisions kept out of prompt prose; absent for a ready draft. */
 	questions?: DraftQuestion[];
-	/** One-line bottom line shown at Gate A and while the worker runs. */
+	/** One-line bottom line shown at the launch gate and while the worker runs. */
 	bluf?: string;
 	/** A bounded, checkable completion checklist shown separately from the full prompt. */
 	definitionOfDone?: string[];

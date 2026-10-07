@@ -1,5 +1,5 @@
 /**
- * Runs an approved handoff in an isolated worker and prepares Gate B.
+ * Runs an approved handoff in an isolated worker and prepares the result gate.
  *
  * This service owns the ordering that makes a run safe, and the order is the
  * point. The model is re-checked against the live registry, then the checkpoint
@@ -12,7 +12,7 @@
  * streaming, which is exactly the case here, since the command awaits the child
  * directly), so nothing external can stop the worker. This service therefore
  * creates the `AbortController` for each run and exposes `abortActiveRun`, which
- * is the single mechanism that stops a worker: the running widget calls it on
+ * is the single mechanism that stops a worker: the run monitor calls it on
  * Escape, and `session_shutdown` calls it so a child can never outlive the
  * reviewing session. Because a kill is SIGTERM then SIGKILL after a grace period,
  * `abortActiveRun` only requests the death; `whenSettled` is the seam a shutdown
@@ -20,7 +20,7 @@
  *
  * The live-registry check is a per-call option rather than a constructor
  * dependency. This service is built once per session so `session_shutdown` and a
- * reopened Gate B can reach it, while the registry must still be read at the
+ * reopened the result gate can reach it, while the registry must still be read at the
  * moment of a click; passing the check in keeps the session-scoped object from
  * capturing a stale view of which models exist.
  *
@@ -41,14 +41,14 @@
  * message, or a non-zero exit as interrupted **even when earlier assistant text
  * exists**, because the adapter's report is "the last assistant text seen", not
  * "the worker's conclusion". A two-hour run whose final message was an error once
- * reached Gate B as a completed handoff whose entire report was a mid-task
+ * reached the result gate as a completed handoff whose entire report was a mid-task
  * sentence about terminal width, shown next to a 2,816-line diff. That text is
- * retained as `partialReport` and labelled as pre-crash output rather than
+ * retained as `partialReport` and labelled as partial output rather than
  * dropped, since the user watched it appear, but it is never promoted to a report.
  *
  * A restart reuses the checkpoint taken before iteration 1 rather than taking a
  * new one. That is what keeps Discard able to undo every iteration at once and
- * keeps Gate B's diffstat cumulative; a fresh checkpoint per iteration would
+ * keeps the result gate's diffstat cumulative; a fresh checkpoint per iteration would
  * silently strand earlier iterations' edits outside Discard's reach.
  */
 
@@ -66,13 +66,13 @@ import type {
 } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
 
-/** The worker finished and produced a report for Gate B. */
+/** The worker finished and produced a report for the result gate. */
 export interface RunCompleted {
 	kind: "completed";
 	state: HandoffCompletedReviewingState;
 	/** Undefined when the worker was killed by a signal rather than exiting. */
 	exitCode: number | undefined;
-	/** Present when the diffstat could not be read, so Gate B can say so. */
+	/** Present when the diffstat could not be read, so the result gate can say so. */
 	diffstatFailure: GitFailure | undefined;
 }
 
@@ -109,7 +109,7 @@ export interface RunRefused {
 
 export type RunOutcome = RunCompleted | RunInterrupted | RunModelUnavailable | RunCheckpointFailed | RunRefused;
 
-/** Progress forwarded to the running widget, with the elapsed reading it displays. */
+/** Progress forwarded to the run monitor, with the elapsed reading it displays. */
 export interface RunProgress extends WorkerRunProgress {
 	/** Milliseconds since the run started, measured on the injected clock. */
 	elapsedMs: number;
@@ -127,7 +127,7 @@ export interface StartRunOptions {
 	 * captured registry view could approve a provider that has since disappeared.
 	 */
 	isChoiceRunnable: (choice: ModelChoice | undefined) => boolean;
-	/** Receives incremental worker progress for the running widget. */
+	/** Receives incremental worker progress for the run monitor. */
 	onProgress?: (progress: RunProgress) => void;
 	/**
 	 * Records that a completed run should go straight into the review turn.
@@ -172,7 +172,7 @@ export interface ExternalRunStarted {
 
 export type ExternalStartOutcome = ExternalRunStarted | RunCheckpointFailed | RunRefused;
 
-/** Input for bringing a finished external run to Gate B. */
+/** Input for bringing a finished external run to the result gate. */
 export interface CompleteExternalRunOptions {
 	cwd: string;
 	/**
@@ -180,7 +180,7 @@ export interface CompleteExternalRunOptions {
 	 *
 	 * An external worker's report lives in another terminal's scrollback, so demanding
 	 * it would block review on a copy-paste. Empty means "no report supplied", and the
-	 * run is recorded as interrupted so Gate B never presents an empty string as a
+	 * run is recorded as interrupted so the result gate never presents an empty string as a
 	 * result.
 	 */
 	report: string;
@@ -193,7 +193,7 @@ export interface RunServiceDeps {
 	clock: Clock;
 	recorder: HandoffStateRecorder;
 	/**
-	 * Quiet interval passed to the child adapter and shown by the running overlay.
+	 * Quiet interval passed to the child adapter and shown by the run monitor.
 	 *
 	 * This never kills a child. It only makes an otherwise silent worker actionable
 	 * for the reviewing user, who remains the sole authority to abort it.
@@ -202,7 +202,7 @@ export interface RunServiceDeps {
 }
 
 export interface RunService {
-	/** Re-checks the model, checkpoints, spawns the worker, and prepares Gate B. */
+	/** Re-checks the model, checkpoints, spawns the worker, and prepares the result gate. */
 	start(options: StartRunOptions): Promise<RunOutcome>;
 	/**
 	 * Checkpoints and records a run the user will launch in another terminal.
@@ -214,7 +214,7 @@ export interface RunService {
 	 * `isRunning` stays false and `session_shutdown` has nothing to kill.
 	 */
 	startExternal(options: StartExternalRunOptions): Promise<ExternalStartOutcome>;
-	/** Moves an external run to Gate B, reading the diffstat against its checkpoint. */
+	/** Moves an external run to the result gate, reading the diffstat against its checkpoint. */
 	completeExternal(options: CompleteExternalRunOptions): Promise<RunOutcome>;
 	/**
 	 * Runs another iteration against the review's existing checkpoint.
@@ -231,7 +231,7 @@ export interface RunService {
 	 * period, so a caller that needs the child to be gone must await `whenSettled`.
 	 */
 	abortActiveRun(): boolean;
-	/** Returns the quiet interval used by the current run and its running overlay. */
+	/** Returns the quiet interval used by the current run and its run monitor. */
 	noProgressThresholdMs(): number;
 	/** True while a child is running, so a shutdown hook can decide to wait. */
 	isRunning(): boolean;
@@ -252,7 +252,7 @@ export interface RunService {
  * Builds the note recorded when a run ends without a usable report.
  *
  * A partial report is called out rather than silently dropped, because the user
- * saw text appear in the widget and would otherwise wonder where it went.
+ * saw text appear in the monitor and would otherwise wonder where it went.
  */
 function interruptionNote(reason: {
 	aborted: boolean;
@@ -266,10 +266,10 @@ function interruptionNote(reason: {
 			? "The worker was stopped mid-run. Its partial output is not treated as a report."
 			: "The worker was stopped before it reported a result.";
 	}
-	// Stated explicitly, because the user watched this text stream into the widget and
+	// Stated explicitly, because the user watched this text stream into the monitor and
 	// would otherwise read its demotion as the extension having lost the report.
 	const partialSuffix = reason.hadPartialReport
-		? " The text it had already produced is kept as pre-crash output, not as a report."
+		? " The text it had already produced is kept as partial output, not as a report."
 		: "";
 	if (reason.errorMessage !== undefined) return `The worker failed: ${reason.errorMessage}${partialSuffix}`;
 	if (reason.stopReason === WORKER_ERROR_STOP_REASON) {
@@ -374,7 +374,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 		return machine.running()?.checkpoint ?? machine.reviewing()?.checkpoint;
 	}
 
-	/** Reads the diffstat, treating a failure as data so a run still reaches Gate B. */
+	/** Reads the diffstat, treating a failure as data so a run still reaches the result gate. */
 	async function readDiffstat(
 		cwd: string,
 		checkpoint: Checkpoint,
@@ -384,7 +384,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 	}
 
 	/**
-	 * Spawns the worker for an already-running machine state and resolves Gate B's outcome.
+	 * Spawns the worker for an already-running machine state and resolves the result gate's outcome.
 	 *
 	 * Shared by `start` and `restart` so an iteration reached through feedback gets
 	 * exactly the same completion, abort, and failure handling as the first run. It
@@ -419,9 +419,9 @@ export function createRunService(deps: RunServiceDeps): RunService {
 
 			const classified = classifyOutcome(outcome);
 
-			// An aborted or crashed run is interrupted even if the worker emitted text first:
+			// A stopped or crashed run is interrupted even if the worker emitted text first:
 			// partial output is not a result, and presenting it as one would let a killed or
-			// failed worker reach Gate B as a finished report. An empty report is likewise
+			// failed worker reach the result gate as a finished report. An empty report is likewise
 			// never dressed up as a completed review.
 			if (classified.kind === "interrupted") {
 				const tail = stderrTail(outcome.stderr);
@@ -491,7 +491,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 				};
 			}
 
-			// Re-checked here, not at Gate A: a provider can disappear while the gate sits open.
+			// Re-checked here, not at the launch gate: a provider can disappear while the gate sits open.
 			const choice = proposed.choice;
 			if (!options.isChoiceRunnable(choice)) return { kind: "model_unavailable", choice };
 
@@ -568,7 +568,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 			const { diffstat, failure } = await readDiffstat(options.cwd, checkpoint);
 			const report = options.report.trim();
 
-			// An empty paste is interrupted rather than completed. Gate B's completed branch
+			// An empty paste is interrupted rather than completed. The result gate's completed branch
 			// promises a report, and an empty string there would render as a worker that
 			// reported nothing instead of one whose report was never supplied.
 			if (report === "") {

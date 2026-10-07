@@ -12,13 +12,15 @@
  * The instructions push the reviewer at the diff rather than the report. A report
  * is a claim; the diff is the evidence. The closing verdict line is required so the
  * end of the review turn can capture the recommendation and show it inside the
- * reopened Gate B overlay, which otherwise obscures the transcript.
+ * reopened result gate, which otherwise obscures the transcript.
  *
  * The reviewer is told not to edit files. Fixes belong to the worker through the
  * feedback loop, where they land inside the checkpoint that Discard can undo; a
  * reviewing session that edited the tree itself would put changes outside that
  * boundary and quietly break Discard's guarantee.
  */
+
+import { PARTIAL_OUTPUT } from "../domain/vocabulary.ts";
 
 /** The structured leftovers block required immediately before the review verdict. */
 export const REVIEW_LEFTOVERS_INSTRUCTION =
@@ -99,7 +101,7 @@ function reportBlock(input: ReviewMessageInput): string {
 		if (partial !== undefined && partial !== "") {
 			sections.push(
 				"",
-				"### Partial output before it died",
+				`### ${PARTIAL_OUTPUT} before it died`,
 				"",
 				"This is the last thing the worker said, not a report of finished work. Do not read it as a summary of what was done; the changes in the tree may be far ahead of or behind it.",
 				"",

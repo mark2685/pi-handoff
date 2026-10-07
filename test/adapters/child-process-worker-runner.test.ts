@@ -279,8 +279,8 @@ describe("child-process worker runner", () => {
 		const outcome = await createTestRunner().run(request(await createPrompt("retry-recovered")));
 
 		// The failed attempt is superseded rather than remembered: a worker that recovered
-		// and wrote its report must not reach Gate B as an interrupted run whose report was
-		// demoted to pre-crash text.
+		// and wrote its report must not reach the result gate as an interrupted run whose report was
+		// demoted to partial output.
 		assert.equal(outcome.errorMessage, undefined);
 		assert.equal(outcome.stopReason, "stop");
 		assert.equal(outcome.report, "Done. Final report: the work is complete.");
@@ -293,7 +293,7 @@ describe("child-process worker runner", () => {
 
 		assert.equal(outcome.errorMessage, "529 overloaded again");
 		assert.equal(outcome.stopReason, "error");
-		// Whatever the worker had already said is retained, but only as pre-crash output.
+		// Whatever the worker had already said is retained, but only as partial output.
 		assert.equal(outcome.report, "Reading the files.");
 		const classified = classifyOutcome(outcome);
 		assert.equal(classified.kind, "interrupted");

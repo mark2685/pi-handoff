@@ -67,7 +67,7 @@ describe("parseDraft", () => {
 	});
 
 	it("tolerates trailing prose after the fenced envelope", () => {
-		const response = `${fencedJson(DRAFT)}\n\nUse this draft for Gate A.\n\n\`\`\`text\nignored fence\n\`\`\``;
+		const response = `${fencedJson(DRAFT)}\n\nUse this draft for the launch gate.\n\n\`\`\`text\nignored fence\n\`\`\``;
 		assert.deepEqual(parseDraft(response, validateDraft), { ok: true, value: DRAFT });
 	});
 
@@ -252,8 +252,7 @@ describe("normalizeReviewFeedback", () => {
 });
 
 describe("buildInterruptedResumeFeedback", () => {
-	const NOTE =
-		"The worker failed: Internal server error. The text it had already produced is kept as pre-crash output.";
+	const NOTE = "The worker failed: Internal server error. The text it had already produced is kept as partial output.";
 
 	/**
 	 * That the iteration did not finish and was not reviewed belongs to the `resume`
@@ -391,7 +390,7 @@ describe("formatNeedsInputAnswers", () => {
 /**
  * Backs "Proceed with recommended answers", the escape hatch from a drafting model
  * that keeps asking rather than converging — four rounds and thirty-five minutes
- * before Gate A, in the case that motivated it.
+ * before the launch gate, in the case that motivated it.
  */
 describe("buildRecommendedAnswers", () => {
 	it("takes the recommended choice as the answer", () => {

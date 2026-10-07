@@ -31,7 +31,7 @@ export interface HandoffDraftingState {
 	/** Retained only while user decisions are open, so a resumed session can reopen their gate. */
 	readonly pendingDraft?: { draft: Draft; promptPath: string };
 	/**
-	 * Which NEEDS INPUT round this is, counted from 1.
+	 * Which questions round this is, counted from 1.
 	 *
 	 * Persisted so the count survives a restart, and optional so entries written
 	 * before it existed still decode as the first round. It exists to make repeated
@@ -39,7 +39,7 @@ export interface HandoffDraftingState {
 	 * once this reaches `PROCEED_WITH_RECOMMENDED_ROUND`.
 	 */
 	readonly needsInputRound?: number;
-	/** A resolved `--model` choice retained until a pending draft can reach Gate A. */
+	/** A resolved `--model` choice retained until a pending draft can reach the launch gate. */
 	readonly modelOverride?: ModelChoice;
 	/** A failed re-draft has saved answers that `/handoff` must retry without re-asking. */
 	readonly answeredRetryPending?: boolean;
@@ -83,7 +83,7 @@ export interface HandoffRunningState {
 	readonly autoReview?: boolean;
 }
 
-/** A worker completed normally, so Gate B may render its report and metrics. */
+/** A worker completed normally, so the result gate may render its report and metrics. */
 export interface HandoffCompletedReviewingState {
 	readonly kind: "reviewing";
 	readonly completion: "completed";
@@ -96,7 +96,7 @@ export interface HandoffCompletedReviewingState {
 	/**
 	 * Null when the run had no child process to measure — an external run.
 	 *
-	 * Distinct from zeroed usage, which would claim a worker ran for free. Gate B and
+	 * Distinct from zeroed usage, which would claim a worker ran for free. The result gate and
 	 * the usage formatter both render the absence as a sentence instead.
 	 */
 	readonly usage: WorkerUsage | null;
@@ -123,8 +123,8 @@ export interface HandoffCompletedReviewingState {
  * `partialReport` and `stderrTail` are the crash evidence. A worker that dies
  * mid-task has usually already streamed assistant text, and that text is not a
  * report: showing it as one is how a mid-task sentence once reached a reviewer as
- * though it were a finished result. It is retained here so Gate B and the review
- * turn can show it *labelled as pre-crash output*, which is a different claim from
+ * though it were a finished result. It is retained here so the result gate and the review
+ * turn can show it *labelled as partial output*, which is a different claim from
  * `report`. Both fields are optional so older entries still decode.
  */
 export interface HandoffInterruptedReviewingState {
@@ -145,7 +145,7 @@ export interface HandoffInterruptedReviewingState {
 	readonly stderrTail?: string;
 	/**
 	 * Carried from the interrupted run so a feedback retry preserves Run and review's
-	 * whole-loop intent, while this interrupted iteration still stops at Gate B.
+	 * whole-loop intent, while this interrupted iteration still stops at the result gate.
 	 */
 	readonly autoReview?: boolean;
 	/** Present only if a reviewer response was captured before the interrupted review was reopened. */
@@ -193,7 +193,7 @@ export interface CompleteRunInput {
 
 /** Why a run ended without a usable report, plus whatever evidence it left behind. */
 export interface InterruptRunInput {
-	/** Human-readable reason, shown at Gate B and in the review turn. */
+	/** Human-readable reason, shown at the result gate and in the review turn. */
 	note: string;
 	/**
 	 * Usage accumulated before the run ended.
@@ -223,35 +223,35 @@ export interface HandoffMachine {
 	current(): HandoffState;
 	/** The active draft, or undefined while idle or only drafting. */
 	draft(): Draft | undefined;
-	/** The selected model, or undefined before Gate A has proposed one. */
+	/** The selected model, or undefined before the launch gate has proposed one. */
 	choice(): ModelChoice | undefined;
 	/** The active worker run, or undefined unless the worker is running. */
 	running(): HandoffRunningState | undefined;
-	/** The pending Gate B state, or undefined outside review. */
+	/** The pending result-gate state, or undefined outside review. */
 	reviewing(): HandoffReviewingState | undefined;
 	/** Begins drafting from an idle session, optionally retaining a command-line worker choice. */
 	beginDraft(scope: string, modelOverride?: ModelChoice): Result<HandoffDraftingState, HandoffConflict>;
 	/** Replaces the scope while a retry remains in the drafting phase. */
 	replaceDraftScope(scope: string): Result<HandoffDraftingState, HandoffConflict>;
-	/** Persists a NEEDS INPUT draft while the user decides how to resolve it. */
+	/** Persists a draft with open questions while the user decides how to resolve them. */
 	setPendingDraft(pendingDraft: { draft: Draft; promptPath: string }): Result<HandoffDraftingState, HandoffConflict>;
-	/** Records that another NEEDS INPUT round has opened, so the gate can offer to end it. */
-	beginNeedsInputRound(): Result<HandoffDraftingState, HandoffConflict>;
+	/** Records that another questions round has opened, so the gate can offer to end it. */
+	beginQuestionsRound(): Result<HandoffDraftingState, HandoffConflict>;
 	/** Marks a failed answered re-draft for direct retry by a later `/handoff`. */
 	markAnsweredRetryPending(): Result<HandoffDraftingState, HandoffConflict>;
-	/** The current NEEDS INPUT round, counted from 1. */
+	/** The current questions round, counted from 1. */
 	needsInputRound(): number;
-	/** Clears a prior needs-input round before a re-draft resolves it. */
+	/** Clears a prior questions round before a re-draft resolves it. */
 	clearPendingDraft(): Result<HandoffDraftingState, HandoffConflict>;
-	/** Records Gate A's draft and chosen worker model. */
+	/** Records the launch gate's draft and chosen worker model. */
 	propose(draft: Draft, choice: ModelChoice): Result<HandoffProposedState, HandoffConflict>;
-	/** Replaces the editable draft before Gate A runs it. */
+	/** Replaces the editable draft before the launch gate runs it. */
 	updateProposal(draft: Draft, choice: ModelChoice): Result<HandoffProposedState, HandoffConflict>;
 	/** Captures a checkpoint and begins the first approved worker run. */
 	startRun(input: StartRunInput): Result<HandoffRunningState, HandoffConflict>;
-	/** Returns from Gate B to a worker run after feedback changed the prompt. */
+	/** Returns from the result gate to a worker run after feedback changed the prompt. */
 	restartRun(input: RestartRunInput): Result<HandoffRunningState, HandoffConflict>;
-	/** Records the completed worker result for Gate B. */
+	/** Records the completed worker result for the result gate. */
 	completeRun(input: CompleteRunInput): Result<HandoffCompletedReviewingState, HandoffConflict>;
 	/**
 	 * Ends a run that produced no usable report, preserving the checkpoint.
@@ -262,12 +262,12 @@ export interface HandoffMachine {
 	 * no safe way to revert them.
 	 *
 	 * Accepts a plain note for callers that have only a reason, or an input object
-	 * when crash evidence (pre-crash text, stderr) is available to retain.
+	 * when crash evidence (partial output, stderr) is available to retain.
 	 */
 	interruptRun(input: string | InterruptRunInput): Result<HandoffInterruptedReviewingState, HandoffConflict>;
 	/** Arms the one review turn caused by Review here. */
 	beginReviewTurn(): Result<HandoffCompletedReviewingState, HandoffConflict>;
-	/** Clears the Review here arm and records the response that caused Gate B to reopen. */
+	/** Clears the Review here arm and records the response that caused the result gate to reopen. */
 	clearReviewTurn(review?: CapturedReview): Result<HandoffReviewingState, HandoffConflict>;
 	/** Replaces in-memory state with decoded, rehydrated persisted state. */
 	restore(state: HandoffState): void;
@@ -361,9 +361,9 @@ export function createHandoffMachine(): HandoffMachine {
 			return ok(drafting);
 		},
 
-		beginNeedsInputRound(): Result<HandoffDraftingState, HandoffConflict> {
+		beginQuestionsRound(): Result<HandoffDraftingState, HandoffConflict> {
 			if (state.kind !== "drafting") {
-				return conflict(state, "beginNeedsInputRound", "A needs-input round can open only while drafting");
+				return conflict(state, "beginQuestionsRound", "A questions round can open only while drafting");
 			}
 			// An older entry carries no counter, but a retained envelope is itself evidence that
 			// a round was already asked, so resuming one continues the count instead of
@@ -474,7 +474,7 @@ export function createHandoffMachine(): HandoffMachine {
 				iteration: state.iteration,
 				checkpoint: state.checkpoint,
 				...input,
-				// Carried across the transition: Gate B needs to know the report was pasted in,
+				// Carried across the transition: the result gate needs to know the report was pasted in,
 				// and Run and review's intent has to outlive the run it was chosen on.
 				...(state.external === true ? { external: true } : {}),
 				...(state.autoReview === true ? { autoReview: true } : {}),
@@ -506,7 +506,7 @@ export function createHandoffMachine(): HandoffMachine {
 				// Omitted rather than stored empty, so "absent" and "the worker said nothing" stay distinct.
 				...(partialReport === undefined || partialReport === "" ? {} : { partialReport }),
 				...(stderrTail === undefined || stderrTail === "" ? {} : { stderrTail }),
-				// An interrupted iteration still opens Gate B, but a later feedback retry keeps
+				// An interrupted iteration still opens the result gate, but a later feedback retry keeps
 				// the original Run and review intent.
 				...(state.autoReview === true ? { autoReview: true } : {}),
 				awaitingReviewTurn: false,

@@ -311,7 +311,7 @@ describe("validateHandoffState", () => {
 
 /**
  * Every field added for crashed workers, external runs, Run and review, and the
- * NEEDS INPUT round counter is optional, so a session recorded by an older build
+ * questions round counter is optional, so a session recorded by an older build
  * still decodes. These are the tests that keep that promise honest: each new shape
  * is asserted alongside the old shape it has to coexist with.
  */
@@ -320,7 +320,7 @@ describe("validateHandoffState compatibility", () => {
 		assert.equal(validateHandoffState({ kind: "drafting", scope: "old session" }).ok, true);
 	});
 
-	it("accepts a drafting entry carrying a NEEDS INPUT round counter", () => {
+	it("accepts a drafting entry carrying a questions round counter", () => {
 		const state = {
 			kind: "drafting",
 			scope: "scope",
@@ -439,7 +439,7 @@ describe("validateHandoffState compatibility", () => {
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});
 
-	it("accepts an interrupted review carrying pre-crash text and a stderr tail", () => {
+	it("accepts an interrupted review carrying partial output and a stderr tail", () => {
 		const state = {
 			...validCompletedState,
 			completion: "interrupted",

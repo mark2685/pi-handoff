@@ -1,7 +1,7 @@
 /**
- * The Gate B loop, shared by `/handoff` and the review-turn reopen.
+ * The result gate loop, shared by `/handoff` and the review-turn reopen.
  *
- * Gate B is reached three ways — a run finishing, `/handoff` while a review is
+ * The result gate is reached three ways — a run finishing, `/handoff` while a review is
  * pending, and the end of a Review here turn — and all three must offer the same
  * options with the same guarantees. Keeping the loop here means the third path
  * cannot drift from the first, which matters because the reopen runs from a
@@ -14,7 +14,7 @@
  * handlers before its own interactive listener runs, and that listener is what
  * clears the `Working` spinner. A handler that held the gate open would therefore
  * leave Pi claiming to be working underneath it, and alongside the running
- * overlay of any worker the gate started. The capture is overwritten on every
+ * run monitor of any worker the gate started. The capture is overwritten on every
  * event, since `_runAgentPrompt` loops on auto-retry and more than one `agent_end`
  * per prompt is normal — the last one is the review.
  *
@@ -38,7 +38,7 @@ import type { ReviewService } from "../app/review-service.ts";
 import type { RunOutcome, RunService } from "../app/run-service.ts";
 import { normalizeReviewFeedback } from "../domain/draft/feedback.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
-import { formatDiscardHeadline, formatDiscardSummary } from "../domain/report/discard.ts";
+import { formatDiscardHeadline, formatDiscardPaths } from "../domain/report/discard.ts";
 import { buildPromptPath } from "../domain/draft/slug.ts";
 import type { LeftoversScopeInput } from "../domain/draft/leftovers.ts";
 import { hasReviewEvidence, parseReviewLeftovers } from "../domain/review.ts";
@@ -47,13 +47,14 @@ import type { Clock } from "../ports/clock.ts";
 import {
 	buildFeedbackEditorRequest,
 	feedbackDraftAdvice,
-	openAcknowledgement,
-	openGateB,
-	type GateBView,
-} from "../presentation/gate-b.ts";
+	openDiscardSummary,
+	openResultGate,
+	type ResultGateView,
+} from "../presentation/result-gate.ts";
 import { describeGitFailure, describeGitOrConflict } from "../presentation/git-failure.ts";
-import { confirmDiscardMenu, reviewOptionLabel, selectOption, type ReviewOptionLabel } from "../presentation/menus.ts";
-import { runWithWidget } from "../presentation/running-widget.ts";
+import { NOT_A_REPORT, PARTIAL_OUTPUT, reviewOptionLabel, type ReviewOptionLabel } from "../domain/vocabulary.ts";
+import { confirmDiscardMenu, selectOption } from "../presentation/menus.ts";
+import { runWithMonitor } from "../presentation/run-monitor.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
 import { HANDOFF_COMMAND } from "./parse.ts";
 import type { ReviewTurnOutcome } from "./review-turn.ts";
@@ -76,8 +77,8 @@ export function formatReviewTurnFailure(errorMessage: string | undefined, review
  *
  * The option to name is passed in because it is not always "Review here": a Review again
  * turn that fails keeps the earlier review, so the reopened gate still offers
- * "Review again", and a notice pointing at an option that is not on screen is the dead end
- * `feedbackDraftAdvice` in gate-b.ts already guards against.
+ * "Review again", and a notification pointing at an option that is not on screen is the dead end
+ * `feedbackDraftAdvice` in result-gate.ts already guards against.
  */
 export function describeUnrecordedReviewTurn(
 	captured: ReviewTurnOutcome,
@@ -102,7 +103,7 @@ export function describeUnrecordedReviewTurn(
 }
 
 /**
- * Describes a failure inside the detached Gate B reopen.
+ * Describes a failure inside the detached result-gate reopen.
  *
  * The failure can land anywhere in the loop, not just at the first render: Accept
  * and hand off leftovers resets the machine before its draft runs, and Discard
@@ -118,7 +119,7 @@ export function describeUnrecordedReviewTurn(
 export function formatReopenFailure(error: unknown, reviewPending: boolean): string {
 	const detail = error instanceof Error ? error.message : String(error);
 	const recovery = reviewPending
-		? `The review is still pending; run \`${HANDOFF_COMMAND}\` to reopen Gate B.`
+		? `The review is still pending; run \`${HANDOFF_COMMAND}\` to reopen the result gate.`
 		: `Run \`${HANDOFF_COMMAND} status\` to see where the handoff stands.`;
 	// Pi's own extension-error display drops the first stack line for the same reason:
 	// it repeats the message already shown above it.
@@ -130,10 +131,10 @@ export function formatReopenFailure(error: unknown, reviewPending: boolean): str
 					.map((line) => `  ${line.trim()}`)
 					.join("\n")
 			: "";
-	return `Gate B stopped with an error: ${detail}\n${recovery}${stack === "" ? "" : `\n${stack}`}`;
+	return `The result gate stopped with an error: ${detail}\n${recovery}${stack === "" ? "" : `\n${stack}`}`;
 }
 
-export interface GateBFlowDeps {
+export interface ResultGateFlowDeps {
 	machine: HandoffMachine;
 	runService: RunService;
 	reviewService: ReviewService;
@@ -157,18 +158,18 @@ export interface GateBFlowDeps {
 	draftLeftovers?: (ctx: ExtensionContext, input: LeftoversScopeInput) => Promise<void>;
 }
 
-export interface GateBFlow {
-	/** Builds Gate B's view from a run outcome, or nothing if the run never started. */
+export interface ResultGateFlow {
+	/** Builds the result gate's view from a run outcome, or nothing if the run never started. */
 	viewFromOutcome(
 		base: { slug: string; choice: ModelChoice; promptPath: string },
 		outcome: RunOutcome,
-	): GateBView | undefined;
-	/** Builds Gate B's view from the pending review the machine already holds. */
-	viewFromPendingReview(ctx: ExtensionContext): Promise<GateBView | undefined>;
-	/** Keeps Gate B open until the user accepts, discards, reviews, or defers. */
-	run(ctx: ExtensionContext, view: GateBView): Promise<void>;
+	): ResultGateView | undefined;
+	/** Builds the result gate's view from the pending review the machine already holds. */
+	viewFromPendingReview(ctx: ExtensionContext): Promise<ResultGateView | undefined>;
+	/** Keeps the result gate open until the user accepts, discards, reviews, or defers. */
+	run(ctx: ExtensionContext, view: ResultGateView): Promise<void>;
 	/**
-	 * Injects the review turn directly, as Review here does, without opening Gate B.
+	 * Injects the review turn directly, as Review here does, without opening the result gate.
 	 *
 	 * This is "Run and review": the same arming, the same message, and the same
 	 * post-settle reopen, reached without the intervening click. Returns false when
@@ -185,7 +186,7 @@ export interface GateBFlow {
 	 */
 	captureReviewTurn(outcome: ReviewTurnOutcome): void;
 	/**
-	 * The `agent_settled` body: reopens Gate B once for a captured review turn.
+	 * The `agent_settled` body: reopens the result gate once for a captured review turn.
 	 *
 	 * Returns as soon as the loop is launched rather than when the gate closes, so
 	 * neither review-turn hook waits on a gate, a worker run, or a leftovers draft.
@@ -207,8 +208,8 @@ export interface GateBFlow {
 	forgetReviewTurn(): void;
 }
 
-/** Wires Gate B's surfaces to the machine and the two session-scoped services. */
-export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
+/** Wires the result gate's surfaces to the machine and the two session-scoped services. */
+export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 	const { machine, runService, reviewService, clock, isChoiceRunnable, sendUserMessage, draftLeftovers } = deps;
 
 	/**
@@ -225,14 +226,14 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 	let reopen: Promise<void> | undefined;
 
 	/**
-	 * Persists the captured review and reopens Gate B, reporting its own failures.
+	 * Persists the captured review and reopens the result gate, reporting its own failures.
 	 *
 	 * Nothing awaits this from Pi's side, so an escaping error would be an unhandled
 	 * rejection with no user-visible trace. The catch covers the whole loop, including
 	 * the runs, drafts, and dialogs the gate starts, so the report is worded from the
 	 * machine's state afterwards rather than assuming the gate never opened.
 	 */
-	async function reopenGateB(ctx: ExtensionContext, captured: ReviewTurnOutcome): Promise<void> {
+	async function reopenResultGate(ctx: ExtensionContext, captured: ReviewTurnOutcome): Promise<void> {
 		try {
 			// Re-read rather than trusted: the session can be replaced between the capture and
 			// the settle, and a stale capture must not reopen a gate against another handoff.
@@ -240,7 +241,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 			// Disarms the turn and persists its verdict and findings, so a dismissed gate
 			// leaves the review pending rather than armed. A turn that failed or said nothing
-			// records no review at all: Gate B's labels, its action order, and the feedback
+			// records no review at all: the result gate's labels, its action order, and the feedback
 			// editor all read the presence of a review as "this iteration was reviewed", and a
 			// 402 on the reviewer model is not a review.
 			const cleared = reviewService.clearReview(captured.kind === "review" ? captured.text : undefined);
@@ -254,7 +255,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			const unrecorded = describeUnrecordedReviewTurn(captured, reviewOptionLabel(reviewed));
 			if (unrecorded !== undefined) ctx.ui.notify(unrecorded.message, unrecorded.level);
 
-			// A gate is a TUI overlay; there is nothing to open elsewhere.
+			// A gate takes the TUI's focus; there is nothing to open elsewhere.
 			if (ctx.mode !== "tui") return;
 
 			const view = await flow.viewFromPendingReview(ctx);
@@ -284,19 +285,21 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			return false;
 		}
 
-		// Always acknowledged, never a transient notify: skipped paths are the one thing
-		// here a user cannot afford to scroll past.
-		await openAcknowledgement(ctx, formatDiscardHeadline(discarded.value), formatDiscardSummary(discarded.value), {
-			warning: discarded.value.skippedPaths.length > 0,
-		});
-		return true;
+		// Always a gate, never a transient notify: skipped paths are the one thing here a
+		// user cannot afford to scroll past. The gate offers a viewer when it could not
+		// show every path, and comes back once the viewer closes.
+		for (;;) {
+			const selected = await openDiscardSummary(ctx, discarded.value);
+			if (selected !== "view_paths") return true;
+			await openTextViewer(ctx, formatDiscardHeadline(discarded.value), formatDiscardPaths(discarded.value).join("\n"));
+		}
 	}
 
-	const flow: GateBFlow = {
+	const flow: ResultGateFlow = {
 		viewFromOutcome(
 			base: { slug: string; choice: ModelChoice; promptPath: string },
 			outcome: RunOutcome,
-		): GateBView | undefined {
+		): ResultGateView | undefined {
 			// Read after the transition so the label reflects the iteration just finished.
 			const allowance = reviewService.feedbackAllowance();
 			const feedback = allowance === undefined ? {} : { feedback: allowance };
@@ -337,7 +340,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			return undefined;
 		},
 
-		async viewFromPendingReview(ctx: ExtensionContext): Promise<GateBView | undefined> {
+		async viewFromPendingReview(ctx: ExtensionContext): Promise<ResultGateView | undefined> {
 			const reviewing = machine.reviewing();
 			if (reviewing === undefined) return undefined;
 
@@ -385,11 +388,11 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 			};
 		},
 
-		async run(ctx: ExtensionContext, view: GateBView): Promise<void> {
+		async run(ctx: ExtensionContext, view: ResultGateView): Promise<void> {
 			let current = view;
 
 			for (;;) {
-				const selected = await openGateB(ctx, current);
+				const selected = await openResultGate(ctx, current);
 
 				if (selected === undefined || selected === "dismiss") {
 					ctx.ui.notify(
@@ -451,7 +454,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					const report = current.report ?? current.partialReport ?? "";
 					const title =
 						current.report === null
-							? `Partial output — ${current.slug} (NOT a report)`
+							? `${PARTIAL_OUTPUT} — ${current.slug} (${NOT_A_REPORT})`
 							: `Worker report — ${current.slug}`;
 					await openTextViewer(ctx, title, report);
 					continue;
@@ -493,7 +496,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					return;
 				}
 
-				// Send feedback to worker: bounded, then a full iteration behind the widget.
+				// Send feedback to worker: bounded, then a full iteration behind the run monitor.
 				const allowance = reviewService.feedbackAllowance();
 				if (allowance !== undefined && !allowance.allowed) {
 					ctx.ui.notify(
@@ -522,7 +525,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 					continue;
 				}
 
-				const rendered = await runWithWidget(
+				const rendered = await runWithMonitor(
 					ctx,
 					{
 						slug: current.slug,
@@ -570,7 +573,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 				// Run and review is latched when feedback restarts a worker. A completed retry
 				// therefore arms the same review turn as iteration 1 and returns so Pi can run
-				// it; an interrupted retry still falls through to Gate B below.
+				// it; an interrupted retry still falls through to the result gate below.
 				if (sent.value.kind === "completed" && sent.value.state.autoReview === true && flow.startReviewTurn(ctx)) {
 					return;
 				}
@@ -632,7 +635,7 @@ export function createGateBFlow(deps: GateBFlowDeps): GateBFlow {
 
 			// The launch reports its own failure, and the outer catch keeps even a notify that
 			// threw from becoming an unhandled rejection in a handler that already returned.
-			reopen = reopenGateB(ctx, captured).catch(() => undefined);
+			reopen = reopenResultGate(ctx, captured).catch(() => undefined);
 		},
 
 		async whenReopenSettled(): Promise<void> {

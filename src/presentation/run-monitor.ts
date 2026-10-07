@@ -1,22 +1,22 @@
 /**
- * The live widget shown while a worker runs.
+ * The run monitor shown while a worker runs.
  *
  * This is the first live-updating component in the package, so two mechanics are
  * worth stating. Updates are pushed with `tui.requestRender()` — once per second
  * from a timer so elapsed time advances even when the worker is silent, and again
  * on every progress event so turns, tokens, cost, and recent tool calls track the
- * child. And the overlay owns the abort, following `drafting-loader.ts`: Pi's
+ * child. And the monitor owns the abort, following `drafting-loader.ts`: Pi's
  * command context exposes no abort signal for this phase, so Escape here is the
  * only thing that can stop the worker.
  *
- * Escape does not resolve the overlay. The child dies through SIGTERM and then
- * SIGKILL, which takes time, and closing the overlay at the keypress would hand
+ * Escape does not resolve the monitor. The child dies through SIGTERM and then
+ * SIGKILL, which takes time, and closing the monitor at the keypress would hand
  * the session back while a process was still writing to the working tree. Instead
- * the widget switches to a stopping state and the run's own completion resolves
- * it, so the overlay closes only once the worker is actually gone.
+ * the monitor switches to a stopping state and the run's own completion resolves
+ * it, so the monitor closes only once the worker is actually gone.
  *
  * `ctx.ui.custom` is used rather than `ctx.ui.setWidget` because §5.4 requires the
- * user to be able to stop the worker: an overlay takes keyboard focus, and
+ * user to be able to stop the worker: a custom surface takes keyboard focus, and
  * `setWidget` renders without focus, leaving no key to bind Escape to. Blocking
  * also matches the design's decision that the reviewing session waits at a gate.
  */
@@ -26,26 +26,27 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatCost, formatElapsed, formatTokenCount, formatTokenSummary } from "../domain/report/format.ts";
 import type { ModelChoice } from "../domain/types.ts";
+import { RUN_MONITOR_TITLE } from "../domain/vocabulary.ts";
 import type { RunProgress } from "../app/run-service.ts";
 
-/** How many recent tool calls the widget lists. */
+/** How many recent tool calls the monitor lists. */
 const RECENT_TOOL_CALLS = 5;
 
 /** The minimum completion checklist still useful on the 24-row minimum target. */
-const MIN_WIDGET_DEFINITION_OF_DONE_ITEMS = 2;
+const MIN_MONITOR_DEFINITION_OF_DONE_ITEMS = 2;
 
-/** Never duplicate the full Gate A checklist in the running overlay. */
-const MAX_WIDGET_DEFINITION_OF_DONE_ITEMS = 5;
+/** Never duplicate the full launch-gate checklist in the run monitor. */
+const MAX_MONITOR_DEFINITION_OF_DONE_ITEMS = 5;
 
 /**
  * Rows occupied with the goal line, the definition heading, two completion bullets, five recent
  * calls, metrics, title, spacer, and the abort hint. Keep this conservative budget so
  * the hint stays visible at the 24-row minimum target.
  */
-const WIDGET_FIXED_ROWS = 22;
+const MONITOR_FIXED_ROWS = 22;
 
 /** Horizontal padding Text adds on either side of the live body. */
-const WIDGET_BODY_PADDING_X = 1;
+const MONITOR_BODY_PADDING_X = 1;
 
 /** How often the worker pulse and elapsed-time/status age are refreshed while the worker is quiet. */
 const TICK_INTERVAL_MS = 120;
@@ -53,7 +54,7 @@ const TICK_INTERVAL_MS = 120;
 /** The same dim-to-accent-to-terminal-foreground pulse used by the Hadrian theme's working indicator. */
 const STATUS_INDICATOR_FRAMES = ["·", "•", "●", "●", "●", "•"] as const;
 
-export interface RunningWidgetView {
+export interface RunMonitorView {
 	slug: string;
 	choice: ModelChoice;
 	promptPath: string;
@@ -65,19 +66,19 @@ export interface RunningWidgetView {
 
 /** Returns the width available to a Text body after its left and right margins. */
 function bodyContentWidth(terminalWidth: number): number {
-	return Math.max(1, Math.floor(terminalWidth) - WIDGET_BODY_PADDING_X * 2);
+	return Math.max(1, Math.floor(terminalWidth) - MONITOR_BODY_PADDING_X * 2);
 }
 
 /**
  * Chooses a row-aware checklist cap while reserving the live status and abort hint.
  *
  * Two conditions fit at the 24-row minimum target; a taller terminal gets up to all
- * five conditions without giving the fixed Gate A detail block a second full rendering.
+ * five conditions without giving the fixed launch-gate detail block a second full rendering.
  */
 export function definitionOfDoneLimit(terminalRows: number): number {
 	return Math.max(
-		MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
-		Math.min(MAX_WIDGET_DEFINITION_OF_DONE_ITEMS, Math.floor(terminalRows) - WIDGET_FIXED_ROWS),
+		MIN_MONITOR_DEFINITION_OF_DONE_ITEMS,
+		Math.min(MAX_MONITOR_DEFINITION_OF_DONE_ITEMS, Math.floor(terminalRows) - MONITOR_FIXED_ROWS),
 	);
 }
 
@@ -85,13 +86,13 @@ export function definitionOfDoneLimit(terminalRows: number): number {
  * Formats fixed header metadata without displacing live status in a 24-row terminal.
  *
  * `width` is the Text content width, excluding its horizontal padding. The full
- * definition remains at Gate A; the running overlay shows the goal and a row-aware
+ * definition remains at the launch gate; the run monitor shows the goal and a row-aware
  * subset of conditions.
  */
 export function formatRunningHeaderLines(
-	view: RunningWidgetView,
+	view: RunMonitorView,
 	width = Number.POSITIVE_INFINITY,
-	definitionOfDoneItems = MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
+	definitionOfDoneItems = MIN_MONITOR_DEFINITION_OF_DONE_ITEMS,
 ): string[] {
 	const lines = [
 		`Handoff:   ${view.slug}`,
@@ -177,16 +178,16 @@ export function formatWorkerStatusLine(state: {
 }
 
 /**
- * Builds the live body of the widget.
+ * Builds the live body of the monitor.
  *
  * Kept pure and exported so the content is testable without a TUI, which is the
- * same split Gate A and Gate B use.
+ * same split launch gate and the result gate use.
  */
 export function formatRunningLines(
-	view: RunningWidgetView,
+	view: RunMonitorView,
 	state: { elapsedMs: number; progress: RunProgress | undefined; stopping: boolean },
 	width = Number.POSITIVE_INFINITY,
-	definitionOfDoneItems = MIN_WIDGET_DEFINITION_OF_DONE_ITEMS,
+	definitionOfDoneItems = MIN_MONITOR_DEFINITION_OF_DONE_ITEMS,
 ): string[] {
 	const usage = state.progress?.usage;
 	const lines = [
@@ -217,12 +218,12 @@ export function formatRunningLines(
 	// Tool names originate outside the extension and can be arbitrarily long. Every
 	// body line therefore needs the same visible-width cap as the metadata header:
 	// otherwise one long name wraps, consumes the abort hint's reserved row, and
-	// defeats the widget's fixed-height budget.
+	// defeats the monitor's fixed-height budget.
 	const maximum = Math.max(1, Math.floor(width));
 	return lines.map((line) => truncateToWidth(line, maximum, "…"));
 }
 
-/** A running widget with the handles the run flow drives it through. */
+/** A run monitor with the handles the run flow drives it through. */
 /** True when a key means "stop the running worker". */
 export function isAbortKey(data: string): boolean {
 	// Parsed matching recognizes both the legacy Escape byte and Kitty's `\x1b[27u`
@@ -230,32 +231,32 @@ export function isAbortKey(data: string): boolean {
 	return matchesKey(data, Key.escape);
 }
 
-export interface RunningWidget extends Container {
+export interface RunMonitor extends Container {
 	/** Applies a progress event and repaints. */
 	update(progress: RunProgress): void;
 	/** Switches to the stopping state, shown until the child actually exits. */
 	markStopping(): void;
-	/** Stops the repaint timer. Called by Pi when the overlay closes. */
+	/** Stops the repaint timer. Called by Pi when the monitor closes. */
 	dispose(): void;
 	/** Escape requests the worker's death; other keys are ignored. */
 	handleInput(data: string): void;
 }
 
 /**
- * Builds the widget component.
+ * Builds the monitor component.
  *
  * `onAbort` is invoked on Escape and is expected to request the worker's death;
- * it deliberately does not resolve the overlay.
+ * it deliberately does not resolve the monitor.
  */
-export function createRunningWidget(
+export function createRunMonitor(
 	tui: TUI,
 	theme: Theme,
-	view: RunningWidgetView,
+	view: RunMonitorView,
 	options: { nowMs: () => number; startedAtMs: number; onAbort: () => void },
-): RunningWidget {
-	const container = new Container() as RunningWidget;
+): RunMonitor {
+	const container = new Container() as RunMonitor;
 	const title = new Text("", 1, 0);
-	const body = new Text("", WIDGET_BODY_PADDING_X, 0);
+	const body = new Text("", MONITOR_BODY_PADDING_X, 0);
 	container.addChild(title);
 	container.addChild(new Spacer(1));
 	container.addChild(body);
@@ -286,7 +287,7 @@ export function createRunningWidget(
 			bodyContentWidth(tui.terminal.columns),
 			definitionOfDoneLimit(tui.terminal.rows),
 		);
-		title.setText(`${indicator()} ${theme.fg("text", theme.bold("Worker running"))}`);
+		title.setText(`${indicator()} ${theme.fg("text", theme.bold(RUN_MONITOR_TITLE))}`);
 		body.setText(
 			lines
 				.map((line) => {
@@ -323,7 +324,7 @@ export function createRunningWidget(
 
 	container.handleInput = (data: string) => {
 		if (!isAbortKey(data) || stopping) return;
-		// Requests the kill; the run's completion closes the overlay.
+		// Requests the kill; the run's completion closes the monitor.
 		options.onAbort();
 		container.markStopping();
 	};
@@ -332,37 +333,37 @@ export function createRunningWidget(
 	return container;
 }
 
-/** Distinguishes a completed run from a widget that failed to render. */
+/** Distinguishes a completed run from a monitor that failed to render. */
 export type RunningOutcome<T> = { kind: "completed"; value: T } | { kind: "failed"; detail: string };
 
 /**
- * Runs an operation behind the live widget, forwarding progress into it.
+ * Runs an operation behind the run monitor, forwarding progress into it.
  *
  * A rejection is reported as a failure rather than converted into a cancellation.
  * T7's `withLoader` maps a rejection to an abort, which makes a genuine bug inside
- * the overlay indistinguishable from the user pressing Escape; here the worker's
+ * the monitor indistinguishable from the user pressing Escape; here the worker's
  * own abort is already represented in the run outcome, so a rejection is only ever
  * a defect and is surfaced as one.
  */
-export async function runWithWidget<T>(
+export async function runWithMonitor<T>(
 	ctx: ExtensionContext,
-	view: RunningWidgetView,
+	view: RunMonitorView,
 	options: { nowMs: () => number; onAbort: () => void },
 	operation: (onProgress: (progress: RunProgress) => void) => Promise<T>,
 ): Promise<RunningOutcome<T>> {
 	return ctx.ui.custom<RunningOutcome<T>>((tui, theme, _keybindings, done) => {
-		const widget = createRunningWidget(tui, theme, view, {
+		const monitor = createRunMonitor(tui, theme, view, {
 			nowMs: options.nowMs,
 			startedAtMs: options.nowMs(),
 			onAbort: options.onAbort,
 		});
 
-		operation((progress) => widget.update(progress))
+		operation((progress) => monitor.update(progress))
 			.then((value) => done({ kind: "completed", value }))
 			.catch((error: unknown) => {
 				done({ kind: "failed", detail: error instanceof Error ? error.message : String(error) });
 			});
 
-		return widget;
+		return monitor;
 	});
 }

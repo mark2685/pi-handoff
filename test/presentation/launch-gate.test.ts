@@ -1,9 +1,9 @@
 /**
  * Tests for the pure parts of the handoff command surface.
  *
- * Argument parsing, status rendering, Gate A's summary, and menu resolution are
+ * Argument parsing, status rendering, the launch gate's summary, and menu resolution are
  * all pure, so the decisions they encode are asserted here rather than through an
- * overlay. Gate A's blocked-Run presentation is included because "Run is visibly
+ * overlay. The launch gate's blocked-Run presentation is included because "Run is visibly
  * blocked" is a design requirement, not a cosmetic detail.
  */
 
@@ -13,13 +13,10 @@ import type { HandoffState } from "../../src/app/handoff-machine.ts";
 import { parseHandoffCommand } from "../../src/commands/parse.ts";
 import { formatHandoffStatus } from "../../src/commands/status.ts";
 import type { Checkpoint, Draft, ModelChoice } from "../../src/domain/types.ts";
-import {
-	GATE_A_COMMON_FIXED_ROWS,
-	GATE_A_LARGEST_FIXED_ROWS,
-	formatGateASummary,
-	promptPreviewLimit,
-} from "../../src/presentation/gate-a.ts";
-import { gateAMenu, selectOption, unparseableMenu } from "../../src/presentation/menus.ts";
+import { formatLaunchGateSummary, launchGateSpec, type LaunchGateView } from "../../src/presentation/launch-gate.ts";
+import { fitGate } from "../../src/presentation/gate-frame.ts";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { launchGateMenu, selectOption, unparseableMenu } from "../../src/presentation/menus.ts";
 
 const DRAFT: Draft = {
 	slug: "add-retry-logic",
@@ -102,11 +99,11 @@ describe("formatHandoffStatus", () => {
 		assert.equal(formatHandoffStatus({ kind: "drafting", scope: "" }), "Handoff: drafting");
 	});
 
-	it("reports a proposal with its model and prompt path", () => {
+	it("reports a draft waiting at the launch gate with its model and prompt path", () => {
 		const state: HandoffState = { kind: "proposed", draft: DRAFT, choice: CHOICE };
 		assert.equal(
 			formatHandoffStatus(state),
-			"Handoff: proposed add-retry-logic on bifrost-openai/gpt-5.6-terra:high (/tmp/pi-handoff-add-retry-logic.md)",
+			"Handoff: add-retry-logic waiting at the launch gate on bifrost-openai/gpt-5.6-terra:high (/tmp/pi-handoff-add-retry-logic.md)",
 		);
 	});
 
@@ -160,16 +157,16 @@ describe("formatHandoffStatus", () => {
 		};
 		assert.equal(
 			formatHandoffStatus(state),
-			"Handoff: review interrupted for add-retry-logic — The worker was interrupted.",
+			"Handoff: add-retry-logic interrupted, waiting at the result gate — The worker was interrupted.",
 		);
 	});
 });
 
-describe("formatGateASummary", () => {
+describe("formatLaunchGateSummary", () => {
 	const view = { draft: DRAFT, choice: CHOICE, promptPath: "/tmp/pi-handoff-add-retry-logic.md", runnable: true };
 
 	it("shows the resolved model, its change-model hint, and the exact launch command", () => {
-		const lines = formatGateASummary(view);
+		const lines = formatLaunchGateSummary(view);
 		assert.ok(lines.includes('Model:     bifrost-openai/gpt-5.6-terra:high — change with "Change model" below'));
 		assert.ok(
 			lines.includes('Command:   pi --model "bifrost-openai/gpt-5.6-terra:high" @/tmp/pi-handoff-add-retry-logic.md'),
@@ -177,14 +174,14 @@ describe("formatGateASummary", () => {
 	});
 
 	it("shows the tier, rationale, and prompt path", () => {
-		const lines = formatGateASummary(view);
+		const lines = formatLaunchGateSummary(view);
 		assert.ok(lines.includes("Tier:      standard"));
 		assert.ok(lines.includes("Rationale: Two files, fully specified."));
 		assert.ok(lines.includes("Prompt:    /tmp/pi-handoff-add-retry-logic.md"));
 	});
 
 	it("includes the prompt body as a preview", () => {
-		const lines = formatGateASummary(view);
+		const lines = formatLaunchGateSummary(view);
 		assert.ok(lines.includes("Line 1"));
 		assert.ok(lines.includes("Line 2"));
 	});
@@ -195,7 +192,7 @@ describe("formatGateASummary", () => {
 			bluf: "Add retries so transient failures recover.",
 			definitionOfDone: ["Retries are bounded", "Focused tests pass"],
 		};
-		const lines = formatGateASummary({ ...view, draft });
+		const lines = formatLaunchGateSummary({ ...view, draft });
 		const blufIndex = lines.indexOf("Goal: Add retries so transient failures recover.");
 		const previewIndex = lines.indexOf("Prompt preview:");
 		assert.deepEqual(lines.slice(blufIndex, previewIndex), [
@@ -209,63 +206,81 @@ describe("formatGateASummary", () => {
 	});
 
 	it("renders stable fallbacks when an older draft has no metadata", () => {
-		const lines = formatGateASummary(view);
+		const lines = formatLaunchGateSummary(view);
 		assert.ok(lines.includes("Goal: (not provided by the drafting model)"));
 		assert.ok(lines.includes("Definition of done: (not provided by the drafting model)"));
 	});
 
 	it("marks a command-line model override", () => {
-		const lines = formatGateASummary({ ...view, choice: { ...CHOICE, overrideSource: "command_line" } });
+		const lines = formatLaunchGateSummary({ ...view, choice: { ...CHOICE, overrideSource: "command_line" } });
 		assert.ok(
 			lines.includes('Model:     bifrost-openai/gpt-5.6-terra:high (from --model) — change with "Change model" below'),
 		);
 	});
 
-	it("truncates a long prompt and points at the option that shows the rest", () => {
+	/** Rows the non-shrinkable part of a layout paints; the menu is on screen only if this fits. */
+	const fixedRowsOf = (layout: ReturnType<typeof fitGate>) =>
+		layout.titleRows.length +
+		1 +
+		(layout.headerRows.length + layout.headerSignpostRows.length === 0
+			? 0
+			: layout.headerRows.length + layout.headerSignpostRows.length + 1) +
+		layout.menuRows +
+		1 +
+		layout.hintRows.length;
+
+	/** Fits the gate as the frame would at the given terminal size. */
+	const fitLaunchGate = (gateView: LaunchGateView, rows: number, columns = 120) => {
+		const spec = launchGateSpec(gateView);
+		return fitGate(spec, spec.menu, rows, (line) => wrapTextWithAnsi(line, columns - 2));
+	};
+
+	it("includes the whole prompt in the untruncated summary", () => {
 		const long: Draft = { ...DRAFT, prompt: Array.from({ length: 20 }, (_, i) => `L${i}`).join("\n") };
-		const lines = formatGateASummary({ ...view, draft: long });
-		assert.ok(lines.includes('… 8 more lines — choose "View full prompt" to read all of it'));
-		assert.equal(lines.includes("L19"), false);
+		const lines = formatLaunchGateSummary({ ...view, draft: long });
+		assert.ok(lines.includes("L0") && lines.includes("L19"));
 	});
 
-	it("uses the available rows for the prompt preview while retaining its signpost", () => {
+	it("shortens a long prompt to the rows available and points at the option that shows the rest", () => {
 		const long: Draft = {
 			...DRAFT,
 			prompt: Array.from({ length: 100 }, (_, index) => `L${index}`).join("\n"),
 			bluf: "Keep the gate action visible.",
 			definitionOfDone: ["One", "Two", "Three"],
 		};
-		const lines = formatGateASummary({ ...view, draft: long }, 30);
-		assert.ok(lines.includes('… 98 more lines — choose "View full prompt" to read all of it'));
-		assert.ok(lines.length + gateAMenu(true).length + 5 <= 30);
+		const layout = fitLaunchGate({ ...view, draft: long }, 30);
+		assert.ok(layout.rows <= 30, `${layout.rows} rows into 30`);
+		assert.ok(fixedRowsOf(layout) <= 30, "the menu section fits");
+		const prompt = layout.blocks[0];
+		assert.ok(prompt?.shortened);
+		assert.match(prompt.signpost ?? "", /^… \d+ more lines — choose "View full prompt" to read all of it$/);
+		assert.equal(prompt.rows.includes("L99"), false);
 	});
 
-	it("uses the three-row floor at short heights and restores the historical cap when it fits", () => {
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => promptPreviewLimit(rows, GATE_A_COMMON_FIXED_ROWS)),
-			[3, 3, 12],
-		);
-		assert.deepEqual(
-			[24, 30, 40].map((rows) => promptPreviewLimit(rows, GATE_A_LARGEST_FIXED_ROWS)),
-			[3, 3, 10],
-		);
-	});
-
-	it("preserves the historical formatter output when terminal rows are omitted", () => {
-		const long: Draft = { ...DRAFT, prompt: Array.from({ length: 20 }, (_, index) => `L${index}`).join("\n") };
-		assert.deepEqual(
-			formatGateASummary({ ...view, draft: long }),
-			formatGateASummary({ ...view, draft: long }, undefined),
-		);
+	/** Observed prompts are paragraphs that wrap; the fit must count rows, not lines. */
+	it("fits a prompt of wrapped paragraphs at every common terminal size", () => {
+		const paragraph =
+			"Implement retries for the provider client with exponential backoff, keep the existing timeout semantics, and add a regression test for the path where the second attempt succeeds after the first times out.";
+		const long: Draft = { ...DRAFT, prompt: Array.from({ length: 30 }, () => paragraph).join("\n\n") };
+		for (const [rows, columns] of [
+			[24, 80],
+			[40, 100],
+			[50, 120],
+			[70, 120],
+		] as const) {
+			const layout = fitLaunchGate({ ...view, draft: long }, rows, columns);
+			assert.ok(layout.rows <= rows, `${layout.rows} rows into ${columns}x${rows}`);
+			assert.ok(fixedRowsOf(layout) <= rows, `the menu section fits at ${columns}x${rows}`);
+		}
 	});
 
 	it("explains the missing model instead of leaving the field blank", () => {
-		const lines = formatGateASummary({ ...view, choice: undefined, runnable: false });
+		const lines = formatLaunchGateSummary({ ...view, choice: undefined, runnable: false });
 		assert.ok(lines.includes('Model:     none available for tier "standard" — choose one to enable Run'));
 	});
 
 	it("offers no launch command when no model is chosen", () => {
-		const lines = formatGateASummary({ ...view, choice: undefined, runnable: false });
+		const lines = formatLaunchGateSummary({ ...view, choice: undefined, runnable: false });
 		assert.ok(lines.includes("Command:   available once a model is chosen"));
 		assert.equal(
 			lines.some((line) => line.includes("pi --model")),
@@ -275,50 +290,50 @@ describe("formatGateASummary", () => {
 
 	it("labels a leftovers-originated draft and keeps its rationale above metadata", () => {
 		const draft: Draft = { ...DRAFT, bluf: "Fix the remaining nits.", definitionOfDone: ["Nits are fixed"] };
-		const lines = formatGateASummary({ ...view, draft, leftovers: { acceptedSlug: "add-retry-logic" } });
+		const lines = formatLaunchGateSummary({ ...view, draft, leftovers: { acceptedSlug: "add-retry-logic" } });
 		assert.ok(lines.includes("Follow-up: leftovers of `add-retry-logic`"));
 		assert.ok(lines.indexOf("Rationale: Two files, fully specified.") < lines.indexOf("Goal: Fix the remaining nits."));
 	});
 });
 
-describe("gateAMenu", () => {
+describe("launchGateMenu", () => {
 	it("offers the designed options in order, with Run and review beside Run", () => {
 		assert.deepEqual(
-			gateAMenu(true).map((option) => option.id),
+			launchGateMenu(true).map((option) => option.id),
 			["run", "run_and_review", "view", "edit", "model", "external", "cancel"],
 		);
 	});
 
 	it("marks Run and review as blocked whenever Run is", () => {
-		assert.equal(gateAMenu(false)[1]?.label, "Run and review (blocked: choose an available model first)");
+		assert.equal(launchGateMenu(false)[1]?.label, "Run and review (blocked: choose an available model first)");
 	});
 
 	it("labels Run plainly when a model is available", () => {
-		assert.equal(gateAMenu(true)[0]?.label, "Run");
+		assert.equal(launchGateMenu(true)[0]?.label, "Run");
 	});
 
 	it("marks Run as blocked when no model is available", () => {
-		assert.equal(gateAMenu(false)[0]?.label, "Run (blocked: choose an available model first)");
+		assert.equal(launchGateMenu(false)[0]?.label, "Run (blocked: choose an available model first)");
 	});
 
 	it("puts Cancel first for a leftovers draft with no definition of done", () => {
-		assert.equal(gateAMenu(true, { cancelFirst: true })[0]?.id, "cancel");
+		assert.equal(launchGateMenu(true, { cancelFirst: true })[0]?.id, "cancel");
 	});
 });
 
 describe("selectOption", () => {
 	it("resolves a chosen label back to its stable id", async () => {
-		const chosen = await selectOption(async (_title, options) => options[5], "Gate A", gateAMenu(true));
+		const chosen = await selectOption(async (_title, options) => options[5], "the launch gate", launchGateMenu(true));
 		assert.equal(chosen, "external");
 	});
 
 	it("returns undefined when the user cancels", async () => {
-		const chosen = await selectOption(async () => undefined, "Gate A", gateAMenu(true));
+		const chosen = await selectOption(async () => undefined, "the launch gate", launchGateMenu(true));
 		assert.equal(chosen, undefined);
 	});
 
 	it("returns undefined for an unrecognized label", async () => {
-		const chosen = await selectOption(async () => "Not a real option", "Gate A", unparseableMenu());
+		const chosen = await selectOption(async () => "Not a real option", "the launch gate", unparseableMenu());
 		assert.equal(chosen, undefined);
 	});
 

@@ -25,7 +25,7 @@ import { createHandoffMachine, rehydrateHandoffState, type HandoffState } from "
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
 import type { RunService } from "../../src/app/run-service.ts";
 import { createHandoffCommandHandler, type HandoffCommand } from "../../src/commands/handoff-command.ts";
-import type { GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import type { ResultGateFlow } from "../../src/commands/result-gate-flow.ts";
 import { LEFTOVERS_PROMPT_HEADING, LEFTOVERS_REVIEW_HEADING } from "../../src/domain/draft/leftovers.ts";
 import { err, ok, type Result } from "../../src/domain/result.ts";
 import { DEFAULT_RUBRIC } from "../../src/domain/rubric/defaults.ts";
@@ -189,18 +189,18 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		abortActiveRun: () => {},
 	} as unknown as RunService;
 
-	const gateBFlow = {
+	const resultGateFlow = {
 		run: async () => {},
 		viewFromOutcome: () => undefined,
 		viewFromPendingReview: async () => undefined,
 		startReviewTurn: () => false,
-	} as unknown as GateBFlow;
+	} as unknown as ResultGateFlow;
 
 	const command = createHandoffCommandHandler({
 		machine,
 		createService: (): DraftService => service,
 		runService,
-		gateBFlow,
+		resultGateFlow,
 		isChoiceRunnable: () => true,
 		clipboard: { copy: async () => ok(undefined) } as unknown as Clipboard,
 		clock: { nowMs: () => 0 } as unknown as Clock,
@@ -251,7 +251,7 @@ describe("draftLeftovers", () => {
 	 * conversation and replaced the machine's scope with nothing, so the second attempt
 	 * was drafted from the transcript with no scope at all.
 	 */
-	it("returns to idle and never opens Gate A when the leftovers drafter reports no work", async () => {
+	it("returns to idle and never opens the launch gate when the leftovers drafter reports no work", async () => {
 		const harness = createHarness({
 			responses: [ok(JSON.stringify({ noLeftovers: true, rationale: "Everything listed was already completed." }))],
 		});
@@ -409,7 +409,7 @@ describe("handle", () => {
 		assert.ok(retry !== undefined);
 		assert.match(retry.userMessage, /A: In the README\./, "the retry must not ask the questions again");
 		assert.match(harness.selectCalls[0]?.title ?? "", /re-draft with your answers failed/);
-		// The retry reached Gate A, whose Cancel is the last scripted selection.
+		// The retry reached the launch gate, whose Cancel is the last scripted selection.
 		assert.deepEqual(harness.machine.current(), { kind: "idle" });
 	});
 
@@ -469,7 +469,7 @@ describe("handle", () => {
 		);
 	});
 
-	it("warns when a pending NEEDS INPUT draft retains a different command-line override", async () => {
+	it("warns when a pending questions-gate draft retains a different command-line override", async () => {
 		const harness = createHarness({ gateSelections: ["cancel"] });
 		const retained = harness.machine.beginDraft("existing scope", {
 			provider: "bifrost-openai",

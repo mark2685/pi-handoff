@@ -1,5 +1,5 @@
 /**
- * Behavioral tests for Gate B's decisions.
+ * Behavioral tests for the result gate's decisions.
  *
  * Three of these exist because of specific ways this can go wrong rather than to
  * cover the happy path.
@@ -153,7 +153,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	return { service, runService, machine, recorded, reports, writes, events };
 }
 
-/** Drives the machine to a pending review, which is Gate B's precondition. */
+/** Drives the machine to a pending review, which is the result gate's precondition. */
 async function reachReview(harness: Harness): Promise<void> {
 	harness.machine.beginDraft("add retries");
 	harness.machine.propose(DRAFT, CHOICE);

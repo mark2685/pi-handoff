@@ -1,7 +1,7 @@
 /**
  * Pi event-boundary helpers for the Review here turn.
  *
- * `agent_end` includes every message emitted by the low-level run. Gate B needs
+ * `agent_end` includes every message emitted by the low-level run. The result gate needs
  * only the final assistant text, not tool output or earlier assistant messages.
  *
  * It also needs to know when that final message is not a review at all. Pi's
@@ -9,7 +9,7 @@
  * `stopReason: "error"`, an `errorMessage`, and no content, so a reviewer model
  * that hit a 402 budget error ended a turn that looked, to a text-only reader,
  * exactly like a reviewer with nothing to say. That was persisted as
- * `review: { iteration: 2, text: "" }` and reopened Gate B as though the work had
+ * `review: { iteration: 2, text: "" }` and reopened the result gate as though the work had
  * been reviewed. Classifying the turn here keeps that distinction at the event
  * boundary, where the stop reason actually is.
  */
@@ -25,7 +25,7 @@ export type ReviewTurnOutcome =
 	/**
 	 * The turn was stopped before it finished, typically by Escape. Whatever the reviewer
 	 * had streamed is a truncated review, and saving it would prefill the feedback editor
-	 * and relabel Gate B as though the diff had been fully reviewed.
+	 * and relabel the result gate as though the diff had been fully reviewed.
 	 */
 	| { kind: "stopped" }
 	/** The turn produced no assistant text at all, which is not a review either. */
@@ -68,7 +68,7 @@ export function classifyReviewTurn(messages: AgentEndEvent["messages"]): ReviewT
 	const message = finalAssistantMessage(messages);
 	if (message === undefined) return { kind: "empty" };
 	if (message.stopReason === "error") return { kind: "failed", errorMessage: message.errorMessage };
-	// Pi ends an aborted run with `agent_end` carrying the partial message, and providers keep
+	// Pi ends a stopped turn with `agent_end` carrying the partial message, and providers keep
 	// the text streamed so far, so an abort is only distinguishable here by its stop reason.
 	if (message.stopReason === "aborted") return { kind: "stopped" };
 	const text = assistantText(message);

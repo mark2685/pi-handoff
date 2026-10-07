@@ -1,7 +1,7 @@
 /**
  * Pure review-turn data helpers.
  *
- * The Gate B loop stores the final reviewer response verbatim, but it needs a
+ * The result gate loop stores the final reviewer response verbatim, but it needs a
  * small, deliberately strict parser for the one-line recommendation the review
  * prompt requests. Keeping this here lets the application layer persist a
  * recommendation without depending on Pi message types or presentation code.

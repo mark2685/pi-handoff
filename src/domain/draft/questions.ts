@@ -51,7 +51,7 @@ export const USE_BEST_JUDGEMENT_ANSWER = "Use your best judgement; do not ask ag
  * Folds every open question into an answer without asking the user.
  *
  * Reached from "Proceed with recommended answers" once a drafting model has spent
- * three rounds asking (four rounds and thirty-five minutes to Gate A, in the case
+ * three rounds asking (four rounds and thirty-five minutes to the launch gate, in the case
  * that motivated this). A recommendation is taken as the answer; a question with
  * no usable recommendation — free text, or choices the model would not rank — is
  * delegated back with `USE_BEST_JUDGEMENT_ANSWER`.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DraftNeedsInput, DraftService } from "../../src/app/draft-service.ts";
-import { runNeedsInputFlow } from "../../src/commands/needs-input-flow.ts";
+import { runQuestionsGateFlow } from "../../src/commands/questions-gate-flow.ts";
 import { ok } from "../../src/domain/result.ts";
 import type { Draft, DraftQuestion, ModelChoice } from "../../src/domain/types.ts";
 
@@ -26,7 +26,7 @@ interface HarnessOptions {
 	selectResults?: (string | undefined)[];
 	inputResults?: (string | undefined)[];
 	editorResults?: (string | undefined)[];
-	/** The NEEDS INPUT round the fake service reports, for the Proceed option. */
+	/** The questions round the fake service reports, for the Proceed option. */
 	round?: number;
 }
 
@@ -112,13 +112,13 @@ function initialDraft(questions?: DraftQuestion[], prompt = DRAFT.prompt): Draft
 	};
 }
 
-describe("runNeedsInputFlow", () => {
+describe("runQuestionsGateFlow", () => {
 	it("answers a choice question and puts the recommended choice first and marked", async () => {
 		const harness = createHarness({
 			gateSelections: ["answer"],
 			selectResults: ["Exponential (recommended)"],
 		});
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([{ question: "Which policy?", choices: ["Fixed", "Exponential"], recommended: 1 }]),
@@ -138,7 +138,7 @@ describe("runNeedsInputFlow", () => {
 			selectResults: ["Other (type an answer)"],
 			inputResults: ["Jittered backoff"],
 		});
-		const choiceResult = await runNeedsInputFlow(
+		const choiceResult = await runQuestionsGateFlow(
 			choiceHarness.ctx,
 			choiceHarness.service,
 			initialDraft([{ question: "Which policy?", choices: ["Fixed"] }]),
@@ -148,7 +148,7 @@ describe("runNeedsInputFlow", () => {
 		assert.equal(choiceHarness.inputCalls.length, 1);
 
 		const textHarness = createHarness({ gateSelections: ["answer"], inputResults: ["Only retry reads"] });
-		await runNeedsInputFlow(
+		await runQuestionsGateFlow(
 			textHarness.ctx,
 			textHarness.service,
 			initialDraft([{ question: "What retries?" }]),
@@ -163,7 +163,7 @@ describe("runNeedsInputFlow", () => {
 			gateSelections: ["answer", "cancel"],
 			selectResults: ["Fixed", undefined],
 		});
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([
@@ -180,7 +180,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("notifies and reopens the gate for an empty answer", async () => {
 		const harness = createHarness({ gateSelections: ["answer", "cancel"], inputResults: ["", undefined] });
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([{ question: "What?" }]),
@@ -195,7 +195,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("turns the prose marker fallback into one question", async () => {
 		const harness = createHarness({ gateSelections: ["answer"], inputResults: ["Streaming only"] });
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft(undefined, "## NEEDS INPUT\n\nWhich calls?"),
@@ -209,7 +209,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("views the full draft read-only and returns to the gate", async () => {
 		const harness = createHarness({ gateSelections: ["view", "cancel"] });
-		const result = await runNeedsInputFlow(harness.ctx, harness.service, initialDraft(), "scope");
+		const result = await runQuestionsGateFlow(harness.ctx, harness.service, initialDraft(), "scope");
 
 		assert.deepEqual(result, { kind: "cancelled" });
 		// The viewer is its own overlay now, not an editor whose edits are silently dropped,
@@ -220,7 +220,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("folds in recommendations and delegated judgement when proceeding", async () => {
 		const harness = createHarness({ gateSelections: ["proceed"], round: 3 });
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([
@@ -238,7 +238,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("asks nothing when proceeding, since that is the point of the option", async () => {
 		const harness = createHarness({ gateSelections: ["proceed"], round: 3 });
-		await runNeedsInputFlow(
+		await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([{ question: "Which policy?", choices: ["Fixed"], recommended: 0 }]),
@@ -251,7 +251,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("cancels and abandons the handoff", async () => {
 		const harness = createHarness({ gateSelections: ["cancel"] });
-		const result = await runNeedsInputFlow(harness.ctx, harness.service, initialDraft(), "scope");
+		const result = await runQuestionsGateFlow(harness.ctx, harness.service, initialDraft(), "scope");
 
 		assert.deepEqual(result, { kind: "cancelled" });
 		assert.equal(harness.abandoned.length, 1);
@@ -259,7 +259,7 @@ describe("runNeedsInputFlow", () => {
 
 	it("returns deterministic Q/A pairs in the rescoped result", async () => {
 		const harness = createHarness({ gateSelections: ["answer"], inputResults: ["Exponential backoff"] });
-		const result = await runNeedsInputFlow(
+		const result = await runQuestionsGateFlow(
 			harness.ctx,
 			harness.service,
 			initialDraft([{ question: "Which policy?", context: "This affects streaming." }]),
@@ -273,9 +273,9 @@ describe("runNeedsInputFlow", () => {
 		});
 	});
 
-	it("edits the prompt and continues to Gate A", async () => {
+	it("edits the prompt and continues to the launch gate", async () => {
 		const harness = createHarness({ gateSelections: ["edit"], editorResults: ["finished prompt"] });
-		const result = await runNeedsInputFlow(harness.ctx, harness.service, initialDraft(), "scope");
+		const result = await runQuestionsGateFlow(harness.ctx, harness.service, initialDraft(), "scope");
 
 		assert.deepEqual(result, { kind: "ready", view: READY });
 	});

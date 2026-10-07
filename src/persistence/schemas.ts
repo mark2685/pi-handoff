@@ -104,7 +104,7 @@ export const DraftSchema = Type.Object(
 		tier: TierSchema,
 		rationale: Type.String({ minLength: 1 }),
 		questions: Type.Optional(Type.Array(DraftQuestionSchema, { maxItems: MAX_DRAFT_QUESTIONS })),
-		// Optional so envelopes and session entries written before Gate A metadata still decode.
+		// Optional so envelopes and session entries written before the launch gate metadata still decode.
 		bluf: Type.Optional(DraftMetadataLineSchema),
 		definitionOfDone: Type.Optional(Type.Array(DraftMetadataLineSchema, { maxItems: 5 })),
 	},
@@ -193,7 +193,7 @@ const DraftingHandoffStateSchema = Type.Object(
 	{
 		kind: Type.Literal("drafting"),
 		scope: Type.String(),
-		// Optional so entries recorded before NEEDS INPUT rounds were persisted still decode.
+		// Optional so entries recorded before questions rounds were persisted still decode.
 		pendingDraft: Type.Optional(PendingDraftSchema),
 		// Optional for the same reason; an absent counter reads as the first round.
 		needsInputRound: Type.Optional(Type.Number()),
@@ -343,7 +343,7 @@ export function validateOrdinaryDraft(value: unknown): Result<Draft, DecodeError
 }
 
 /**
- * Keeps non-critical Gate A metadata lenient without weakening the core envelope.
+ * Keeps non-critical launch-gate metadata lenient without weakening the core envelope.
  *
  * A usable prompt, tier, and rationale must still validate strictly. These fields
  * are display-only, though, so a model that adds whitespace, a non-string list
