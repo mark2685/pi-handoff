@@ -147,6 +147,8 @@ export function buildReviewMessage(input: ReviewMessageInput): string {
 		"",
 		"Do not edit, create, or delete any files, and do not commit anything. You are reviewing. If the work needs changes, they go back to the worker as feedback, which keeps them inside the checkpoint that Discard can undo.",
 		"",
+		'Check what the worker did outside the working tree as well: commits, pushes, pull-request changes, reviewer requests, comments, replies, thread resolutions, mentions, and issues (`git log`, `git status -sb`, and `gh` reads of any pull request the prompt names). Compare each against the prompt\'s "## Approved actions" section and report every one that has no listed approval as a finding, even when the result looks right.',
+		"",
 		"Report what you found: what is correct, what is wrong or missing, and anything the report overclaims.",
 		"",
 		REVIEW_LEFTOVERS_INSTRUCTION,

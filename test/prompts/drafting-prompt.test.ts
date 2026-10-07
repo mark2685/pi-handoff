@@ -43,6 +43,57 @@ describe("DRAFTING_SYSTEM_PROMPT iteration numbering", () => {
 	});
 });
 
+/**
+ * A drafter once listed push, a ready-for-review PR, reviewer requests, closing
+ * the old PR, and CodeRabbit replies as "Approved by the user" from a message
+ * that said only "then we'll close the current PR and open a new one", plus an
+ * answer to a question about a reviewer's GitHub handle. The worker did all of
+ * it in the user's name. Approval has to be a quote, not an inference.
+ */
+describe("DRAFTING_SYSTEM_PROMPT approvals", () => {
+	it("requires an Approved actions section in every prompt", () => {
+		assert.match(DRAFTING_SYSTEM_PROMPT, /an "## Approved actions" section/);
+	});
+
+	it("lists an action only beside a verbatim quote of the user", () => {
+		assert.match(
+			DRAFTING_SYSTEM_PROMPT,
+			/only when you can quote the user's own words authorizing that specific action/,
+		);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /put the verbatim quote beside it/);
+	});
+
+	it("names commits, pushes, PR changes, reviewers, replies, and mentions as gated", () => {
+		for (const action of [
+			/creating or amending commits/,
+			/pushing/,
+			/opening, editing, closing, or changing the draft state of a pull request/,
+			/requesting reviewers/,
+			/review replies/,
+			/resolving review threads/,
+			/mentioning people/,
+		]) {
+			assert.match(DRAFTING_SYSTEM_PROMPT, action);
+		}
+	});
+
+	it("rejects future intent and answers to unrelated questions as approval", () => {
+		assert.match(DRAFTING_SYSTEM_PROMPT, /statements of future intent such as "then we'll open a new PR"/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /answers to questions about something else/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /an answer approves only what its question asked/);
+	});
+
+	it("makes the list exhaustive and has the worker report prepared actions instead", () => {
+		assert.match(DRAFTING_SYSTEM_PROMPT, /the list is exhaustive/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /stops and reports what it prepared/);
+		assert.match(DRAFTING_SYSTEM_PROMPT, /the section reads "None\."/);
+	});
+
+	it("no longer relies on a bare explicitly-requested exception", () => {
+		assert.doesNotMatch(DRAFTING_SYSTEM_PROMPT, /unless explicitly requested/);
+	});
+});
+
 describe("DRAFTING_SYSTEM_PROMPT contract", () => {
 	it("still requires a tier rather than a concrete model", () => {
 		assert.match(DRAFTING_SYSTEM_PROMPT, /Never name a concrete model/);

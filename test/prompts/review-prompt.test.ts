@@ -57,6 +57,13 @@ describe("buildReviewMessage", () => {
 		assert.ok(buildReviewMessage(INPUT).includes(INPUT.report));
 	});
 
+	it("checks actions outside the working tree against the approved list", () => {
+		const message = buildReviewMessage(INPUT);
+		assert.match(message, /Check what the worker did outside the working tree/);
+		assert.match(message, /"## Approved actions" section/);
+		assert.match(message, /every one that has no listed approval as a finding/);
+	});
+
 	it("includes the diffstat", () => {
 		assert.ok(buildReviewMessage(INPUT).includes("src/client.ts | 12 +++++--"));
 	});
