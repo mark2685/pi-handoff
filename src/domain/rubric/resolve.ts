@@ -58,7 +58,7 @@ const DEFAULT_OVERRIDE_THINKING: ThinkingLevel = "high";
 /**
  * Resolves Pi's `provider/model-id[:thinking]` shorthand against the live registry.
  *
- * An omitted thinking suffix uses the same high default as Gate A's picker. The
+ * An omitted thinking suffix uses the same high default as the launch gate's picker. The
  * model portion may contain slashes; only the final colon is treated as the
  * optional thinking separator.
  */
@@ -87,7 +87,7 @@ export function resolveModelOverride(
  * Resolves the first non-excluded, currently available candidate for a tier.
  *
  * A missing candidate is expected while providers are disabled or catalogs
- * change, so it is represented as a value for Gate A rather than an error.
+ * change, so it is represented as a value for the launch gate rather than an error.
  */
 export function resolveTier(rubric: Rubric, tier: Tier, availableModels: readonly AvailableModel[]): TierResolution {
 	for (const candidate of rubric.tiers[tier]) {

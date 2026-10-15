@@ -40,7 +40,7 @@ export interface DiscardOutcome {
 	skippedPaths: string[];
 }
 
-/** Git capabilities needed by RunService and Gate B. */
+/** Git capabilities needed by RunService and the result gate. */
 export interface Git {
 	/** Resolves the repository root or reports a non-repository as ordinary data. */
 	repositoryRoot(cwd: string): Promise<Result<string, GitFailure>>;

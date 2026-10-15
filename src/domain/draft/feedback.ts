@@ -1,5 +1,5 @@
 /**
- * Prompt text transformations for the bounded Gate B feedback loop.
+ * Prompt text transformations for the bounded result-gate feedback loop.
  *
  * The caller owns iteration limits and file IO; this pure helper only preserves
  * the approved prompt and appends a clearly delimited instruction for the next
@@ -32,7 +32,7 @@ export function normalizeReviewFeedback(feedback: string): string {
  * clean endings — so Send feedback would otherwise open an empty editor after the
  * one outcome where the user has the least idea what to type. The template is a
  * draft, not a decision: it is prefilled into the editor and the user can rewrite
- * or delete it, and nothing here treats the dead run's pre-crash text as a report.
+ * or delete it, and nothing here treats the dead run's partial output as a report.
  *
  * The note is quoted verbatim because it is the only evidence of what ended the
  * run, and paraphrasing a provider error would cost the worker the detail that

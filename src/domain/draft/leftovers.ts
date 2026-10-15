@@ -5,7 +5,7 @@
  * with a list of minor items ("fix the nits", "the remaining weaknesses", "fold
  * the four deferred nits in"), the user accepts, and then starts a fresh
  * `/handoff` for those items — paying a full drafting call over the entire
- * session transcript, plus another trip through Gate A, to restate findings that
+ * session transcript, plus another trip through the launch gate, to restate findings that
  * were already written down.
  *
  * The scope here is deliberately built from **only the accepted prompt and the

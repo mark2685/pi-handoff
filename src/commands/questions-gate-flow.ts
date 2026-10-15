@@ -1,12 +1,12 @@
 /**
- * The NEEDS INPUT gate loop, kept separate from command dispatch so its answer
+ * The questions gate loop, kept separate from command dispatch so its answer
  * sequence can be exercised with a scripted UI. It never submits a partial
  * sequence: scope is assembled only after every dialog returns an answer.
  *
  * From the third round the gate also offers to end the questioning outright,
  * folding in every recommendation at once. That exists because the questioning is
  * not always convergent — one observed handoff spent four rounds and thirty-five
- * minutes before reaching Gate A, one round of it taking twenty-two minutes — and
+ * minutes before reaching the launch gate, one round of it taking twenty-two minutes — and
  * past a couple of rounds the model's own recommendations are worth more than
  * another dialog.
  */
@@ -17,12 +17,12 @@ import { buildRecommendedAnswers, formatNeedsInputAnswers } from "../domain/draf
 import { extractNeedsInput } from "../domain/draft/parse.ts";
 import { appendNeedsInputAnswers } from "../domain/draft/scope.ts";
 import type { DraftQuestion } from "../domain/types.ts";
-import { openNeedsInputGate } from "../presentation/needs-input-gate.ts";
+import { openQuestionsGate } from "../presentation/questions-gate.ts";
 import { openTextViewer } from "../presentation/text-viewer.ts";
 import { NEEDS_INPUT_ANSWERS_HEADING } from "../prompts/drafting-prompt.ts";
 
 /** Outcome resolved once the gate loop cannot act on the current draft itself. */
-export type NeedsInputFlowResult =
+export type QuestionsGateFlowResult =
 	{ kind: "cancelled" } | { kind: "rescoped"; scope: string } | { kind: "ready"; view: DraftReady };
 
 /** The old prose signal is represented as one question so the interaction remains uniform. */
@@ -79,19 +79,19 @@ function reportTerminalOutcome(ctx: ExtensionContext, outcome: DraftOutcome): vo
 	}
 }
 
-/** Drives the gate until answers re-scope, an edit reaches Gate A, or the user cancels. */
-export async function runNeedsInputFlow(
+/** Drives the gate until answers re-scope, an edit reaches the launch gate, or the user cancels. */
+export async function runQuestionsGateFlow(
 	ctx: ExtensionContext,
 	service: DraftService,
 	initial: DraftNeedsInput,
 	scope: string,
-): Promise<NeedsInputFlowResult> {
+): Promise<QuestionsGateFlowResult> {
 	let current = initial;
 
 	for (;;) {
 		const questions = questionsFor(current.draft);
 		const round = service.needsInputRound();
-		const selected = await openNeedsInputGate(ctx, {
+		const selected = await openQuestionsGate(ctx, {
 			slug: current.draft.slug,
 			promptPath: current.promptPath,
 			questions,
@@ -99,7 +99,7 @@ export async function runNeedsInputFlow(
 		});
 
 		if (selected === undefined || selected === "cancel") {
-			service.abandon();
+			service.abandon("cancelled");
 			ctx.ui.notify(`Handoff cancelled. Prompt left at ${current.promptPath}`, "info");
 			return { kind: "cancelled" };
 		}

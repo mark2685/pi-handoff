@@ -131,7 +131,7 @@ function hasNeedsInputMarkerLine(line: string): boolean {
  * line, optionally after indentation, a Markdown heading, or opening emphasis.
  *
  * Word boundaries prevent near-matches such as `NEEDS INPUTS`; lowercase prose
- * and mid-sentence references deliberately do not divert Gate A.
+ * and mid-sentence references deliberately do not divert the launch gate.
  */
 export function hasNeedsInputMarker(prompt: string): boolean {
 	return prompt.split("\n").some(hasNeedsInputMarkerLine);

@@ -12,13 +12,15 @@
  * The instructions push the reviewer at the diff rather than the report. A report
  * is a claim; the diff is the evidence. The closing verdict line is required so the
  * end of the review turn can capture the recommendation and show it inside the
- * reopened Gate B overlay, which otherwise obscures the transcript.
+ * reopened result gate, which otherwise obscures the transcript.
  *
  * The reviewer is told not to edit files. Fixes belong to the worker through the
  * feedback loop, where they land inside the checkpoint that Discard can undo; a
  * reviewing session that edited the tree itself would put changes outside that
  * boundary and quietly break Discard's guarantee.
  */
+
+import { PARTIAL_OUTPUT } from "../domain/vocabulary.ts";
 
 /** The structured leftovers block required immediately before the review verdict. */
 export const REVIEW_LEFTOVERS_INSTRUCTION =
@@ -99,7 +101,7 @@ function reportBlock(input: ReviewMessageInput): string {
 		if (partial !== undefined && partial !== "") {
 			sections.push(
 				"",
-				"### Partial output before it died",
+				`### ${PARTIAL_OUTPUT} before it died`,
 				"",
 				"This is the last thing the worker said, not a report of finished work. Do not read it as a summary of what was done; the changes in the tree may be far ahead of or behind it.",
 				"",
@@ -144,6 +146,8 @@ export function buildReviewMessage(input: ReviewMessageInput): string {
 		"Review the actual changes, not the report. Use the read and bash tools to inspect the diff (`git diff`, `git status`) and the files it touches, and check the work against the acceptance criteria in the handoff prompt. Verify the claims in the report rather than accepting them: a validation command the report says passed is worth running.",
 		"",
 		"Do not edit, create, or delete any files, and do not commit anything. You are reviewing. If the work needs changes, they go back to the worker as feedback, which keeps them inside the checkpoint that Discard can undo.",
+		"",
+		'Check what the worker did outside the working tree as well: commits, pushes, pull-request changes, reviewer requests, comments, replies, thread resolutions, mentions, and issues (`git log`, `git status -sb`, and `gh` reads of any pull request the prompt names). Compare each against the prompt\'s "## Approved actions" section and report every one that has no listed approval as a finding, even when the result looks right.',
 		"",
 		"Report what you found: what is correct, what is wrong or missing, and anything the report overclaims.",
 		"",

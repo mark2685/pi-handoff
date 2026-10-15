@@ -311,7 +311,7 @@ describe("validateHandoffState", () => {
 
 /**
  * Every field added for crashed workers, external runs, Run and review, and the
- * NEEDS INPUT round counter is optional, so a session recorded by an older build
+ * questions round counter is optional, so a session recorded by an older build
  * still decodes. These are the tests that keep that promise honest: each new shape
  * is asserted alongside the old shape it has to coexist with.
  */
@@ -320,7 +320,7 @@ describe("validateHandoffState compatibility", () => {
 		assert.equal(validateHandoffState({ kind: "drafting", scope: "old session" }).ok, true);
 	});
 
-	it("accepts a drafting entry carrying a NEEDS INPUT round counter", () => {
+	it("accepts a drafting entry carrying a questions round counter", () => {
 		const state = {
 			kind: "drafting",
 			scope: "scope",
@@ -439,7 +439,7 @@ describe("validateHandoffState compatibility", () => {
 		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
 	});
 
-	it("accepts an interrupted review carrying pre-crash text and a stderr tail", () => {
+	it("accepts an interrupted review carrying partial output and a stderr tail", () => {
 		const state = {
 			...validCompletedState,
 			completion: "interrupted",
@@ -470,6 +470,78 @@ describe("validateHandoffState compatibility", () => {
 		});
 		if (!interrupted.ok) throw new Error(interrupted.error.message);
 		assert.equal(interrupted.value.autoReview, true);
+		assert.deepEqual(validateHandoffState(serializeHandoffState(interrupted.value)), {
+			ok: true,
+			value: interrupted.value,
+		});
+	});
+
+	it("accepts an idle entry written before the reason was recorded", () => {
+		assert.deepEqual(validateHandoffState({ kind: "idle" }), { ok: true, value: { kind: "idle" } });
+	});
+
+	it("accepts every idle reason and rejects an unknown one", () => {
+		for (const reason of ["cancelled", "draft-failed", "no-leftovers", "launch-failed", "discarded", "accepted"]) {
+			assert.equal(validateHandoffState({ kind: "idle", reason }).ok, true, reason);
+		}
+		assert.equal(validateHandoffState({ kind: "idle", reason: "bored" }).ok, false);
+	});
+
+	it("accepts an interrupted review written before the interruption reason was recorded", () => {
+		const state = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			usage: null,
+			interruptionNote: "The worker was stopped before it reported a result.",
+		};
+		assert.deepEqual(validateHandoffState(state), { ok: true, value: state });
+	});
+
+	it("accepts every interruption reason and rejects an unknown one", () => {
+		const base = {
+			...validCompletedState,
+			completion: "interrupted",
+			report: null,
+			diffstat: null,
+			usage: null,
+			interruptionNote: "note",
+		};
+		const reasons = [
+			"user-stopped",
+			"worker-error",
+			"error-stop",
+			"nonzero-exit",
+			"other-stop",
+			"no-report",
+			"session-restarted",
+			"external-no-report",
+		];
+		for (const interruptionReason of reasons) {
+			assert.equal(validateHandoffState({ ...base, interruptionReason }).ok, true, interruptionReason);
+		}
+		assert.equal(validateHandoffState({ ...base, interruptionReason: "gremlins" }).ok, false);
+	});
+
+	it("round-trips an idle reason through the machine", () => {
+		const machine = createHandoffMachine();
+		machine.beginDraft("cancel test");
+		machine.reset("cancelled");
+		assert.deepEqual(validateHandoffState(serializeHandoffState(machine.current())), {
+			ok: true,
+			value: { kind: "idle", reason: "cancelled" },
+		});
+	});
+
+	it("round-trips an interruption reason through the machine", () => {
+		const machine = createHandoffMachine();
+		machine.beginDraft("reason test");
+		machine.propose(validHandoffDraft, validChoice);
+		machine.startRun({ iteration: 1, startedAt: "2026-03-16T12:00:00.000Z", checkpoint: validCheckpoint });
+		const interrupted = machine.interruptRun({ note: "The worker failed: Connection error.", reason: "worker-error" });
+		if (!interrupted.ok) throw new Error(interrupted.error.message);
+		assert.equal(interrupted.value.interruptionReason, "worker-error");
 		assert.deepEqual(validateHandoffState(serializeHandoffState(interrupted.value)), {
 			ok: true,
 			value: interrupted.value,

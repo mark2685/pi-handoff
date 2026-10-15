@@ -1,7 +1,7 @@
 /**
  * Turns a reviewing session into an approved-ready handoff proposal.
  *
- * This service owns every step between `/handoff` and Gate A: serialize the
+ * This service owns every step between `/handoff` and the launch gate: serialize the
  * session, make the drafting side-call, parse the strict envelope, resolve the
  * tier against the live registry, write the prompt file, and drive the machine.
  * Presentation code above it only renders outcomes and collects choices, so the
@@ -10,16 +10,16 @@
  * Three behaviors here are correctness requirements rather than conveniences.
  * The prompt file is written before any outcome that can open a gate, so the
  * external fallback survives a later failure. A draft carrying the explicit
- * structured questions or the fallback `NEEDS INPUT` marker never reach Gate A — they are retained so the NEEDS INPUT
+ * structured questions or the fallback `NEEDS INPUT` marker never reach the launch gate — they are retained so the questions
  * gate's Answer and Edit options can finish them later, rather than abandoned. And
  * a tier that resolves to no available model yields a ready outcome with an
- * undefined choice rather than a fabricated one, which is what lets Gate A open
+ * undefined choice rather than a fabricated one, which is what lets the launch gate open
  * with Run blocked.
  *
  * The machine stays in `drafting` until a real `ModelChoice` exists, because
  * `propose` requires one. That is deliberate: there is no representable
  * `proposed` state with a missing model or an open question, so neither an
- * unresolved tier nor a NEEDS INPUT draft can be mistaken for an approved
+ * unresolved tier nor a draft with open questions can be mistaken for an approved
  * proposal.
  */
 
@@ -36,19 +36,22 @@ import {
 	buildLeftoversUserMessage,
 	DRAFTING_SYSTEM_PROMPT,
 } from "../prompts/drafting-prompt.ts";
-import type { HandoffConflict, HandoffMachine } from "./handoff-machine.ts";
+import type { HandoffConflict, HandoffMachine, IdleReason } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
+
+/** The idle reasons a drafting flow can end with; Accept and Discard end at the result gate instead. */
+export type AbandonReason = Exclude<IdleReason, "accepted" | "discarded">;
 
 /** Structured questions win over prose; the marker remains a safety net for older model behavior. */
 function needsInput(draft: Draft): boolean {
 	return (draft.questions?.length ?? 0) > 0 || hasNeedsInputMarker(draft.prompt);
 }
 
-/** A draft that is ready for Gate A, including an unresolved-model case. */
+/** A draft that is ready for the launch gate, including an unresolved-model case. */
 export interface DraftReady {
 	kind: "ready";
 	draft: Draft;
-	/** Undefined when the tier resolved to no available model; Gate A must block Run. */
+	/** Undefined when the tier resolved to no available model; the launch gate must block Run. */
 	choice: ModelChoice | undefined;
 	promptPath: string;
 }
@@ -83,7 +86,7 @@ export interface DraftFailed {
 	kind: "failed";
 	failure: DraftingFailure;
 	/**
-	 * True when the answered NEEDS INPUT round survived the failure, so the caller may
+	 * True when the answered questions round survived the failure, so the caller may
 	 * re-run the identical call without asking the questions again.
 	 *
 	 * The state kept is the whole round: the pending envelope, the round counter, and the
@@ -122,7 +125,7 @@ export interface DraftServiceDeps {
 }
 
 export interface DraftService {
-	/** Runs or retries the drafting call for a scope and returns the Gate A outcome. */
+	/** Runs or retries the drafting call for a scope and returns the launch gate outcome. */
 	draft(
 		scope: string,
 		signal: AbortSignal | undefined,
@@ -133,7 +136,7 @@ export interface DraftService {
 	 *
 	 * Takes an already-built scope — `buildLeftoversScope`'s output — rather than the
 	 * raw documents, because this is called again for every retry and every answered
-	 * NEEDS INPUT round, and each of those must re-send the same accepted prompt and
+	 * questions round, and each of those must re-send the same accepted prompt and
 	 * parsed leftovers (or the explicit legacy full-review fallback) with the round's answers appended. Building the scope here instead
 	 * would make the caller choose between rebuilding it (losing the answers) and
 	 * falling back to `draft` (which reads the transcript).
@@ -142,19 +145,19 @@ export interface DraftService {
 	 * the scope — because both documents that define the leftovers are already in hand
 	 * and the accepted work has just superseded the history. Enters `drafting` from
 	 * `idle`, where Accept has just left the machine, and replaces the scope on a
-	 * re-entry exactly as `draft` does. The result goes through the ordinary NEEDS
-	 * INPUT and Gate A path, so a follow-up is never launched without the same
-	 * approval as any other handoff.
+	 * re-entry exactly as `draft` does. The result goes through the ordinary
+	 * questions-gate and launch-gate path, so a follow-up is never launched without the
+	 * same approval as any other handoff.
 	 */
 	draftLeftovers(scope: string, signal: AbortSignal | undefined): Promise<Result<DraftOutcome, HandoffConflict>>;
-	/** The current NEEDS INPUT round, counted from 1, for the gate's escape hatch. */
+	/** The current questions round, counted from 1, for the gate's escape hatch. */
 	needsInputRound(): number;
 	/** Records a user-selected model, overriding the tier's recommendation. */
 	chooseModel(choice: ModelChoice): Result<DraftReady, HandoffConflict>;
 	/** Rewrites the prompt file and the retained draft after Edit prompt. */
 	revisePrompt(prompt: string): Promise<Result<DraftReady, HandoffConflict | PromptWriteFailure>>;
 	/**
-	 * Finishes a retained draft with replacement prompt text, from the NEEDS INPUT
+	 * Finishes a retained draft with replacement prompt text, from the questions
 	 * gate's Answer (re-drafted prompt) or Edit (hand-edited prompt) options.
 	 * Refuses with a conflict when no draft is retained; returns `needs_input`
 	 * again, rather than a conflict, when the replacement prompt still carries the
@@ -163,8 +166,11 @@ export interface DraftService {
 	continueWithPrompt(prompt: string): Promise<Result<DraftOutcome, HandoffConflict>>;
 	/** Re-checks a choice against the live registry immediately before Run. */
 	isChoiceRunnable(choice: ModelChoice | undefined): boolean;
-	/** Returns to idle after Cancel, Run externally, or a terminal failure. */
-	abandon(): void;
+	/**
+	 * Returns to idle after Cancel, a failed Run externally, or a terminal failure,
+	 * recording why so a session reader can tell them apart.
+	 */
+	abandon(reason: AbandonReason): void;
 }
 
 /** Wires the drafting flow to the machine, its ports, and the shipped rubric. */
@@ -173,11 +179,11 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 
 	/**
 	 * The draft retained while the machine cannot expose one: an unresolved tier
-	 * awaiting a model, or a NEEDS INPUT draft awaiting an answer or an edit.
+	 * awaiting a model, or a draft with open questions awaiting an answer or an edit.
 	 *
 	 * `machine.draft()` is undefined in the `drafting` state, which is exactly the
-	 * state both of those outcomes leave behind, so Change model and the NEEDS
-	 * INPUT gate need the draft that the pending outcome carried. It is retained
+	 * state both of those outcomes leave behind, so Change model and the questions
+	 * gate need the draft that the pending outcome carried. It is retained
 	 * here rather than pushed into the machine so no state can hold a draft
 	 * without a model or with an unanswered question. Cleared on every terminal
 	 * outcome so a later handoff can never inherit a stale draft, and replaced
@@ -194,26 +200,27 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	 * Returns to idle and records the reset, used by every terminal drafting outcome.
 	 *
 	 * Idempotent, and that is load-bearing rather than defensive. Abandonment is
-	 * genuinely racy: cancelling the drafting loader resolves the overlay at the
+	 * genuinely racy: cancelling the drafting loader resolves the surface at the
 	 * keypress, while the side-call it abandoned settles separately and reports
 	 * `aborted`, so both the command layer and `draft()` legitimately call this for
 	 * the same cancellation. Recording unconditionally appended two consecutive
 	 * `idle` entries within the same second, which reads in the session log as two
 	 * abandoned handoffs. Skipping an already-idle machine keeps one abandonment to
 	 * one record without making either caller responsible for guessing whether the
-	 * other already ran.
+	 * other already ran. Both callers of that race record `cancelled`, so the reason
+	 * does not depend on which one wins.
 	 */
-	function abandon(): void {
+	function abandon(reason: AbandonReason): void {
 		retainedDraft = undefined;
 		if (machine.current().kind === "idle") return;
-		machine.reset();
+		machine.reset(reason);
 		record();
 	}
 
 	/**
 	 * Writes the prompt before any outcome that can open a gate.
 	 *
-	 * A write failure abandons the handoff rather than continuing, because Gate A
+	 * A write failure abandons the handoff rather than continuing, because the launch gate
 	 * would otherwise offer a Run externally command for a file that is missing.
 	 */
 	async function writePrompt(draft: Draft): Promise<Result<string, PromptWriteFailure>> {
@@ -241,12 +248,12 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	}
 
 	/** Persists the open round without making a draft with unanswered questions look proposed. */
-	function retainNeedsInputDraft(draft: Draft, promptPath: string): Result<void, HandoffConflict> {
+	function retainQuestionsDraft(draft: Draft, promptPath: string): Result<void, HandoffConflict> {
 		retainedDraft = draft;
 		// Counted before the envelope is retained, because the machine infers an implicit
 		// round from a retained envelope when no counter exists (an older entry). Counting
 		// afterwards would make this round look like the second one.
-		const counted = machine.beginNeedsInputRound();
+		const counted = machine.beginQuestionsRound();
 		if (!counted.ok) return err(counted.error);
 		const retained = machine.setPendingDraft({ draft, promptPath });
 		if (!retained.ok) return err(retained.error);
@@ -255,8 +262,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	}
 
 	/**
-	 * Finishes a parsed draft envelope: write the prompt, divert to NEEDS INPUT if
-	 * the marker survives, otherwise resolve the tier and propose.
+	 * Finishes a parsed draft envelope: write the prompt, divert to the questions gate if
+	 * open questions or the `NEEDS INPUT` marker survive, otherwise resolve the tier and propose.
 	 *
 	 * Shared by `draft()` and `continueWithPrompt()`, the two paths that produce a
 	 * draft envelope ready to finalize, so the write-before-gate and
@@ -265,13 +272,13 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	async function finishDraft(draft: Draft): Promise<Result<DraftOutcome, HandoffConflict>> {
 		const written = await writePrompt(draft);
 		if (!written.ok) {
-			abandon();
+			abandon("draft-failed");
 			return ok({ kind: "write_failed", failure: written.error });
 		}
 
 		// Structured questions are the primary signal; the prose marker survives as a non-compliant-model fallback.
 		if (needsInput(draft)) {
-			const retained = retainNeedsInputDraft(draft, written.value);
+			const retained = retainQuestionsDraft(draft, written.value);
 			if (!retained.ok) return err(retained.error);
 			return ok({ kind: "needs_input", draft, promptPath: written.value });
 		}
@@ -303,7 +310,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	 *
 	 * Both drafting entry points re-enter: `draft` on a retry after an unparseable
 	 * envelope or an answered question round, `draftLeftovers` for the same two reasons.
-	 * Replacing rather than ignoring the scope is what makes answered NEEDS INPUT
+	 * Replacing rather than ignoring the scope is what makes answered questions-gate
 	 * decisions — and, for a leftovers follow-up, the accepted prompt and parsed leftovers
 	 * the scope carries — survive another round and a session restart.
 	 */
@@ -350,7 +357,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			const drafting = machine.current();
 			const pending = drafting.kind === "drafting" ? drafting.pendingDraft : undefined;
 			if (response.error.kind === "aborted" || pending === undefined) {
-				abandon();
+				// An abort is the user's cancel of the loader; anything else is a failed draft.
+				abandon(response.error.kind === "aborted" ? "cancelled" : "draft-failed");
 				return ok({ kind: "failed", failure: response.error, answersRetained: false });
 			}
 			// Mark and record this separately from the scope update before the call. A later
@@ -373,7 +381,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 		if ("noLeftovers" in parsed.value) {
 			// This envelope is legal only on the transcript-free leftovers path. It has no
 			// prompt to write or approve, so abandon before returning to the command loop.
-			abandon();
+			abandon("no-leftovers");
 			return ok({ kind: "no_leftovers", rationale: parsed.value.rationale });
 		}
 
@@ -400,7 +408,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			// hands off a conversation, so it is the only one an empty session can refuse.
 			const session = transcript.read();
 			if (session.kind === "empty") {
-				abandon();
+				abandon("draft-failed");
 				return ok({ kind: "empty_session" });
 			}
 
@@ -440,7 +448,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					kind: "conflict",
 					current: machine.current().kind,
 					attempted: "chooseModel",
-					message: "Answer the NEEDS INPUT questions, or remove the marker, before choosing a model",
+					message:
+						"Answer the open questions, or remove the NEEDS INPUT marker from the prompt, before choosing a model",
 				});
 			}
 
@@ -465,7 +474,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 					kind: "conflict",
 					current: machine.current().kind,
 					attempted: "revisePrompt",
-					message: "Answer the NEEDS INPUT questions, or remove the marker, before editing the prompt",
+					message:
+						"Answer the open questions, or remove the NEEDS INPUT marker from the prompt, before editing the prompt",
 				});
 			}
 
@@ -495,7 +505,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 				});
 			}
 
-			// Edit is the manual escape hatch: its explicit Gate A intent resolves the retained questions.
+			// Edit is the manual escape hatch: its explicit the launch gate intent resolves the retained questions.
 			const revised: Draft = {
 				slug: existing.slug,
 				prompt,

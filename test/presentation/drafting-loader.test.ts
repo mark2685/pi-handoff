@@ -11,7 +11,7 @@ describe("formatDraftingLoaderMessage", () => {
 		);
 	});
 
-	it("uses the running widget's elapsed-time format for minutes", () => {
+	it("uses the run monitor's elapsed-time format for minutes", () => {
 		assert.equal(
 			formatDraftingLoaderMessage({ message: "Drafting handoff…", elapsedMs: 125_000 }),
 			"Drafting handoff… · Elapsed: 2m 05s",

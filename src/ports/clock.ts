@@ -2,7 +2,7 @@
  * Boundary for reading the current time.
  *
  * A worker run records when it started and shows how long it has been going, so
- * time is an input to persisted state and to a live widget rather than an
+ * time is an input to persisted state and to a run monitor rather than an
  * incidental detail. Injecting it keeps `Date.now()` out of the app layer, where
  * a direct call would make a run service test depend on wall-clock timing and
  * turn an elapsed-time assertion into a flake.

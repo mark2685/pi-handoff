@@ -1,7 +1,7 @@
 /**
  * Pure formatting for worker metrics.
  *
- * The running widget and Gate B both show the same usage figures, so formatting
+ * The run monitor and the result gate both show the same usage figures, so formatting
  * them once here keeps a token count from being rendered two different ways in
  * two places. These live in the domain because they are pure text transforms
  * with no IO, which also makes the awkward cases testable: a provider that omits
@@ -56,7 +56,7 @@ export function formatElapsed(elapsedMs: number): string {
 	return `${seconds}s`;
 }
 
-/** Formats the one-line token summary shared by the widget and Gate B. */
+/** Formats the one-line token summary shared by the run monitor and the result gate. */
 export function formatTokenSummary(usage: UsageTotals): string {
 	const parts = [`in ${formatTokenCount(usage.inputTokens)}`, `out ${formatTokenCount(usage.outputTokens)}`];
 	if (usage.cacheReadTokens > 0) parts.push(`cache read ${formatTokenCount(usage.cacheReadTokens)}`);
@@ -64,7 +64,7 @@ export function formatTokenSummary(usage: UsageTotals): string {
 	return parts.join(", ");
 }
 
-/** Builds the labelled usage block shown at Gate B. */
+/** Builds the labelled usage block shown at the result gate. */
 export function formatUsageLines(usage: UsageTotals): string[] {
 	return [
 		`Turns:     ${usage.turns}`,

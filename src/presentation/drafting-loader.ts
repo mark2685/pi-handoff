@@ -3,7 +3,7 @@
  *
  * This exists so the drafting call is cancellable: `CancellableLoader` owns an
  * abort signal, and the reference extension's pattern is to pass that signal into
- * `complete()` and resolve the overlay from `onAbort`. The stock `BorderedLoader`
+ * `complete()` and resolve the surface from `onAbort`. The stock `BorderedLoader`
  * does not expose a message updater, so this equivalent shell owns its inner loader
  * directly. That lets elapsed time advance without changing cancellation behavior.
  */
@@ -118,7 +118,7 @@ export function formatDraftingLoaderMessage(view: DraftingLoaderMessage, width =
  * Runs an operation behind a cancellable, live-updating bordered loader.
  *
  * A rejection is converted to an abort rather than propagated, because a failure
- * inside the overlay would otherwise leave the TUI holding a component with no
+ * inside the surface would otherwise leave the TUI holding a component with no
  * resolution path. Callers see an ordinary aborted outcome and report it.
  */
 export async function withLoader<T>(

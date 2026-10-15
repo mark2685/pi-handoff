@@ -1,7 +1,7 @@
 /**
  * Renders Git and handoff failures as sentences a user can act on.
  *
- * This lives on its own because both `/handoff`'s Gate A dispatch and Gate B's
+ * This lives on its own because both `/handoff`'s launch-gate dispatch and the result gate's
  * flow need it, and having either import the other would make the two modules
  * mutually dependent. It is pure text, so it is asserted directly.
  */

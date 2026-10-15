@@ -2,7 +2,7 @@
  * Tests for the single launch-command builder.
  *
  * The exact command string is a contract: the user pastes it into a terminal,
- * and a later Gate B must offer the identical command. These assert the whole
+ * and a later result gate must offer the identical command. These assert the whole
  * string rather than its parts so a quoting or flag change cannot pass quietly.
  */
 

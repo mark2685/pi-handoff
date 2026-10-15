@@ -52,7 +52,7 @@ export function stripIterationSuffix(slug: string): string {
 	}
 }
 
-/** Directory where later adapters write prompts before Gate A. */
+/** Directory where later adapters write prompts before the launch gate. */
 export const HANDOFF_TEMP_DIR = "/tmp";
 
 /** Stable filename prefix shared by prompt creation and external fallback. */

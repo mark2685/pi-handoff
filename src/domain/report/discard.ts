@@ -35,24 +35,32 @@ export function hasSkippedPaths(outcome: DiscardPaths): boolean {
 }
 
 /**
- * Builds the lines shown after a discard.
+ * Builds the warning that leads the summary, or nothing when every path was reverted.
  *
- * The skipped-path warning leads because it is the only part of this summary that
+ * Kept apart from the path lists so the gate can hold it in a region that is never
+ * cut while the lists, which can be long, give way and get a viewer.
+ */
+export function formatDiscardWarning(outcome: DiscardPaths): string[] {
+	if (!hasSkippedPaths(outcome)) return [];
+	const count = outcome.skippedPaths.length;
+	return [
+		`Warning: ${count} path${count === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} NOT reverted.`,
+		`${count === 1 ? "It was" : "They were"} already modified before the worker started, so Discard left`,
+		`${count === 1 ? "it" : "them"} alone. Any worker change to ${count === 1 ? "this path" : "these paths"} is still present.`,
+	];
+}
+
+/**
+ * Builds the path lists shown after a discard, skipped paths first.
+ *
+ * The skipped paths lead because they are the only part of this summary that
  * describes something still wrong with the tree.
  */
-export function formatDiscardSummary(outcome: DiscardPaths): string[] {
+export function formatDiscardPaths(outcome: DiscardPaths): string[] {
 	const lines: string[] = [];
 
 	if (hasSkippedPaths(outcome)) {
-		const count = outcome.skippedPaths.length;
-		lines.push(
-			`Warning: ${count} path${count === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} NOT reverted.`,
-			`${count === 1 ? "It was" : "They were"} already modified before the worker started, so Discard left`,
-			`${count === 1 ? "it" : "them"} alone. Any worker change to ${count === 1 ? "this path" : "these paths"} is still present.`,
-			"",
-			...pathSection("Left as they were (review these yourself):", outcome.skippedPaths),
-			"",
-		);
+		lines.push(...pathSection("Left as they were (review these yourself):", outcome.skippedPaths), "");
 	}
 
 	const restored = pathSection("Reverted to their checkpoint state:", outcome.restoredPaths);
@@ -68,6 +76,13 @@ export function formatDiscardSummary(outcome: DiscardPaths): string[] {
 	// Trailing blank lines are an artifact of section joining, not part of the content.
 	while (lines[lines.length - 1] === "") lines.pop();
 	return lines;
+}
+
+/** Builds the whole summary as one list of lines: the warning, if any, above the path lists. */
+export function formatDiscardSummary(outcome: DiscardPaths): string[] {
+	const warning = formatDiscardWarning(outcome);
+	const paths = formatDiscardPaths(outcome);
+	return warning.length === 0 ? paths : [...warning, "", ...paths];
 }
 
 /** Builds the one-line notification shown when a discard completes. */

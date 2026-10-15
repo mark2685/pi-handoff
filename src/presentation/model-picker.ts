@@ -1,5 +1,5 @@
 /**
- * Model selection for Gate A's Change model option.
+ * Model selection for the launch gate's Change model option.
  *
  * Adapted from Phase Runner's picker: labels are only ever labels, and the
  * selection is resolved by index in the list that produced it rather than by

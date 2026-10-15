@@ -1,7 +1,7 @@
 /**
  * Boundary for writing the temporary handoff prompt file.
  *
- * The prompt must exist on disk before Gate A opens so the external fallback
+ * The prompt must exist on disk before the launch gate opens so the external fallback
  * and manual inspection work even if the extension fails immediately
  * afterwards. That makes writing it a correctness step rather than a
  * convenience, so it gets a port the app layer can depend on and tests can

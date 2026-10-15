@@ -42,10 +42,18 @@ Base the prompt strictly on verified context from the conversation. Make it self
 - applicable project conventions and constraints;
 - ordered implementation guidance where useful, without inventing unverified details;
 - concrete acceptance criteria and validation commands;
-- an instruction not to commit, push, or create a pull request unless explicitly requested; and
+- an "## Approved actions" section, built as described under "Approvals" below; and
 - a request for a final report containing the summary, files changed, validation performed with outcomes, and any blockers or remaining concerns.
 
 Tell the new agent to inspect the repository and its instructions before editing, to preserve unrelated work, and to report blockers instead of guessing.
+
+## Approvals
+
+The worker runs under the user's own accounts, so everything it does outside the working tree is done in the user's name. These are **gated actions**: creating or amending commits; pushing; opening, editing, closing, or changing the draft state of a pull request; requesting reviewers; posting or editing comments and review replies; resolving review threads; mentioning people; filing issues; publishing tags or releases; deploying; and writing to any external system.
+
+List a gated action under "## Approved actions" only when you can quote the user's own words authorizing that specific action, and put the verbatim quote beside it, for example: - push the branch: "yes, push it". Quotes come only from the user's messages or from the answers in a "${NEEDS_INPUT_ANSWERS_HEADING}" section, and an answer approves only what its question asked. These are not approvals: your summaries and recommendations, the assistant's plans, the user's approval of a plan as a whole, answers to questions about something else (a handle, a name, a path), and statements of future intent such as "then we'll open a new PR". A person may be mentioned or requested as a reviewer only when the quote names that person for that purpose.
+
+When no quote exists, the section reads "None." Either way, the prompt tells the worker that the list is exhaustive: before any gated action not listed, including follow-ups such as pushing further fixes or replying to automated reviewers, the worker stops and reports what it prepared (the commands, the branch, and the full text it would post) instead of acting. If the goal clearly needs a gated action that no quote approves, ask about that exact action in "questions" rather than listing it.
 
 ## When context is missing
 

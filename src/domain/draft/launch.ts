@@ -1,7 +1,7 @@
 /**
  * The one place that builds the worker launch command.
  *
- * Run externally puts this string on the clipboard, and a later Gate B and any
+ * Run externally puts this string on the clipboard, and a later result gate and any
  * help text must offer the identical command. Formatting it in a single pure
  * function keeps the `provider/model:thinking` shorthand and the `@file` initial
  * message from drifting between the copied command and the spawned child.

@@ -25,7 +25,7 @@ import { createHandoffMachine, rehydrateHandoffState, type HandoffState } from "
 import type { HandoffStateRecorder } from "../../src/app/state-recorder.ts";
 import type { RunService } from "../../src/app/run-service.ts";
 import { createHandoffCommandHandler, type HandoffCommand } from "../../src/commands/handoff-command.ts";
-import type { GateBFlow } from "../../src/commands/gate-b-flow.ts";
+import type { ResultGateFlow } from "../../src/commands/result-gate-flow.ts";
 import { LEFTOVERS_PROMPT_HEADING, LEFTOVERS_REVIEW_HEADING } from "../../src/domain/draft/leftovers.ts";
 import { err, ok, type Result } from "../../src/domain/result.ts";
 import { DEFAULT_RUBRIC } from "../../src/domain/rubric/defaults.ts";
@@ -65,6 +65,8 @@ interface HarnessOptions {
 	selectResults?: (string | undefined)[];
 	/** Results returned by successive `ctx.ui.input` calls, in order. */
 	inputResults?: (string | undefined)[];
+	/** What Run externally's checkpoint attempt returns. */
+	startExternal?: () => Promise<unknown>;
 }
 
 interface Harness {
@@ -185,22 +187,22 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	} as unknown as ExtensionContext;
 
 	const runService = {
-		startExternal: async () => ok(undefined),
+		startExternal: options.startExternal ?? (async () => ok(undefined)),
 		abortActiveRun: () => {},
 	} as unknown as RunService;
 
-	const gateBFlow = {
+	const resultGateFlow = {
 		run: async () => {},
 		viewFromOutcome: () => undefined,
 		viewFromPendingReview: async () => undefined,
 		startReviewTurn: () => false,
-	} as unknown as GateBFlow;
+	} as unknown as ResultGateFlow;
 
 	const command = createHandoffCommandHandler({
 		machine,
 		createService: (): DraftService => service,
 		runService,
-		gateBFlow,
+		resultGateFlow,
 		isChoiceRunnable: () => true,
 		clipboard: { copy: async () => ok(undefined) } as unknown as Clipboard,
 		clock: { nowMs: () => 0 } as unknown as Clock,
@@ -251,7 +253,7 @@ describe("draftLeftovers", () => {
 	 * conversation and replaced the machine's scope with nothing, so the second attempt
 	 * was drafted from the transcript with no scope at all.
 	 */
-	it("returns to idle and never opens Gate A when the leftovers drafter reports no work", async () => {
+	it("returns to idle and never opens the launch gate when the leftovers drafter reports no work", async () => {
 		const harness = createHarness({
 			responses: [ok(JSON.stringify({ noLeftovers: true, rationale: "Everything listed was already completed." }))],
 		});
@@ -261,7 +263,7 @@ describe("draftLeftovers", () => {
 			items: ["Already-completed item"],
 		});
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "no-leftovers" });
 		assert.equal(harness.transcriptReads(), 0);
 		assert.ok(
 			harness.notifications.some(
@@ -409,8 +411,8 @@ describe("handle", () => {
 		assert.ok(retry !== undefined);
 		assert.match(retry.userMessage, /A: In the README\./, "the retry must not ask the questions again");
 		assert.match(harness.selectCalls[0]?.title ?? "", /re-draft with your answers failed/);
-		// The retry reached Gate A, whose Cancel is the last scripted selection.
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		// The retry reached the launch gate, whose Cancel is the last scripted selection.
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("keeps a dismissed retry prompt's answered state and resumes it with /handoff", async () => {
@@ -449,7 +451,7 @@ describe("handle", () => {
 			1,
 			"the resumed flow must re-draft directly instead of asking the question again",
 		);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("discards answers only when the retry prompt's explicit cancel is selected", async () => {
@@ -462,14 +464,14 @@ describe("handle", () => {
 
 		await harness.command.handle("fix the nits", harness.ctx);
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "draft-failed" });
 		assert.ok(
 			harness.notifications.some(({ message }) => message.includes("the answers were discarded")),
 			"expected the explicit discard to be stated",
 		);
 	});
 
-	it("warns when a pending NEEDS INPUT draft retains a different command-line override", async () => {
+	it("warns when a pending questions-gate draft retains a different command-line override", async () => {
 		const harness = createHarness({ gateSelections: ["cancel"] });
 		const retained = harness.machine.beginDraft("existing scope", {
 			provider: "bifrost-openai",
@@ -492,5 +494,42 @@ describe("handle", () => {
 				message.includes('the --model override "bifrost-openai/gpt-5.6-terra:medium" was not used'),
 			),
 		);
+	});
+});
+
+/**
+ * Each way `/handoff` returns to idle before a run records why, so a session reader can
+ * tell a cancel from a failed draft without guessing from what came before the entry.
+ */
+describe("idle reasons recorded by /handoff", () => {
+	it("records a launch gate Cancel as cancelled", async () => {
+		const harness = createHarness({ gateSelections: ["cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "cancelled" });
+	});
+
+	it("records a questions gate Cancel as cancelled", async () => {
+		const harness = createHarness({ responses: [ok(questioningDraft())], gateSelections: ["cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "cancelled" });
+	});
+
+	it("records declining to retry an unparseable draft as draft-failed", async () => {
+		const harness = createHarness({ responses: [ok("not json")], selectResults: ["Cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "draft-failed" });
+	});
+
+	it("records a Run externally that could not take a checkpoint as launch-failed", async () => {
+		const harness = createHarness({
+			gateSelections: ["external"],
+			startExternal: async () => ({
+				kind: "checkpoint_failed",
+				failure: { kind: "not_repository", detail: "not a git repository" },
+			}),
+		});
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "launch-failed" });
+		assert.ok(validateHandoffState(harness.recorded.at(-1)).ok);
 	});
 });

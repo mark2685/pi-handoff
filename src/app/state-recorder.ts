@@ -45,6 +45,43 @@ export interface HandoffReportRecorder {
 	record(entry: HandoffReportEntry): void;
 }
 
+/** Namespaced custom-session entry holding a decision that changes no handoff state by itself. */
+export const HANDOFF_EVENT_ENTRY_TYPE = "handoff-event";
+
+/**
+ * A result-gate decision, spelled as the gate's option id: Review here, Send feedback,
+ * Discard, Accept, Accept and hand off leftovers, or Leave this for later.
+ */
+export type ResultGateAction = "review" | "feedback" | "discard" | "accept" | "accept_leftovers" | "dismiss";
+
+/**
+ * Which result-gate action the user chose, for a session reader rather than for recovery.
+ *
+ * A separate entry rather than a field on `handoff-state`, because Leave this for later
+ * changes no state at all, and a field on the reviewing state would be carried, stale,
+ * into every later transition that spreads it. Rehydration reads only `handoff-state`,
+ * so this entry can never change what a resumed session restores.
+ *
+ * Recorded once the choice is final — after the discard confirmation and after
+ * non-empty feedback is entered — and before the transition it causes, so the action
+ * precedes the `handoff-state` entry it led to. The action that follows may still fail;
+ * this records what was chosen, not what succeeded.
+ */
+export interface ResultGateActionEvent {
+	kind: "result-gate-action";
+	action: ResultGateAction;
+	/** The iteration the gate was deciding. */
+	iteration: number;
+}
+
+/** Every handoff event entry; one kind today. */
+export type HandoffEvent = ResultGateActionEvent;
+
+/** Appends one handoff event to the session as a custom entry. */
+export interface HandoffEventRecorder {
+	record(event: HandoffEvent): void;
+}
+
 /** A recorder that drops every state, used in non-interactive paths and unit tests. */
 export const NULL_HANDOFF_STATE_RECORDER: HandoffStateRecorder = {
 	record: () => {},
@@ -52,5 +89,10 @@ export const NULL_HANDOFF_STATE_RECORDER: HandoffStateRecorder = {
 
 /** A report recorder that drops every entry, used in unit tests. */
 export const NULL_HANDOFF_REPORT_RECORDER: HandoffReportRecorder = {
+	record: () => {},
+};
+
+/** An event recorder that drops every entry, used in unit tests. */
+export const NULL_HANDOFF_EVENT_RECORDER: HandoffEventRecorder = {
 	record: () => {},
 };

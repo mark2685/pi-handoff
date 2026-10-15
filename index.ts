@@ -10,13 +10,13 @@
  *   src/adapters/     filesystem, shell, and child-process implementations
  *   src/persistence/  schemas and storage-boundary validation
  *   src/app/          handoff state machine and services
- *   src/presentation/ gates, widgets, and model picker
+ *   src/presentation/ gates, run monitor, viewer, and model picker
  *   src/prompts/      drafting and review prompt text
  *   src/commands/     /handoff argument parsing and dispatch
  *
  * Almost everything is built once per session, because a session owns at most one
  * handoff and three separate entry points have to reach the same one: the command,
- * the review-turn hooks that capture a review and reopen Gate B, and the
+ * the review-turn hooks that capture a review and reopen the result gate, and the
  * `session_shutdown` kill. In particular the run service is session-scoped so the
  * shutdown hook can stop a worker it never started, and the live-registry check it
  * needs is passed per call instead of captured, so a session-lived object cannot
@@ -38,6 +38,7 @@ import { createFsPromptFileWriter } from "./src/adapters/fs-prompt-file-writer.t
 import { createPbcopyClipboard } from "./src/adapters/pbcopy-clipboard.ts";
 import { createPiDraftingModel, createPiSessionTranscriptSource } from "./src/adapters/pi-drafting-model.ts";
 import {
+	createSessionHandoffEventRecorder,
 	createSessionHandoffReportRecorder,
 	createSessionHandoffStateRecorder,
 } from "./src/adapters/session-state-recorder.ts";
@@ -46,7 +47,7 @@ import { createDraftService, type DraftService } from "./src/app/draft-service.t
 import { createHandoffMachine, rehydrateLatestHandoffState } from "./src/app/handoff-machine.ts";
 import { createReviewService } from "./src/app/review-service.ts";
 import { createRunService } from "./src/app/run-service.ts";
-import { createGateBFlow } from "./src/commands/gate-b-flow.ts";
+import { createResultGateFlow } from "./src/commands/result-gate-flow.ts";
 import { createHandoffCommandHandler, type HandoffCommand } from "./src/commands/handoff-command.ts";
 import { classifyReviewTurn } from "./src/commands/review-turn.ts";
 import { HANDOFF_COMMAND_NAME } from "./src/commands/parse.ts";
@@ -58,6 +59,7 @@ export default function handoff(pi: ExtensionAPI) {
 	const machine = createHandoffMachine();
 	const recorder = createSessionHandoffStateRecorder(pi);
 	const reportRecorder = createSessionHandoffReportRecorder(pi);
+	const eventRecorder = createSessionHandoffEventRecorder(pi);
 	const promptWriter = createFsPromptFileWriter();
 	const clipboard = createPbcopyClipboard();
 	const clock = createSystemClock();
@@ -109,23 +111,24 @@ export default function handoff(pi: ExtensionAPI) {
 
 	/**
 	 * Assigned after both are built, because the two genuinely need each other:
-	 * Gate B's "Accept and hand off leftovers" starts a draft, and the drafting flow
-	 * ends at a run whose result Gate B renders. The command is built second and
-	 * patched in here rather than duplicating the drafting flow inside Gate B.
+	 * The result gate's "Accept and hand off leftovers" starts a draft, and the drafting flow
+	 * ends at a run whose result the result gate renders. The command is built second and
+	 * patched in here rather than duplicating the drafting flow inside the result gate.
 	 */
 	let command: HandoffCommand | undefined;
 
-	const gateBFlow = createGateBFlow({
+	const resultGateFlow = createResultGateFlow({
 		machine,
 		runService,
 		reviewService,
 		clock,
 		isChoiceRunnable,
+		eventRecorder,
 		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
 		// handler, so this is fire-and-forget by construction: the injected message
 		// starts an agent turn that the calling handler must return from, and the gate is
 		// reopened once that turn settles. `deliverAs: "followUp"` is kept as the safe
-		// case: Gate B now reopens from `agent_settled`, where the session reports idle and
+		// case: the result gate now reopens from `agent_settled`, where the session reports idle and
 		// the option is ignored, but a gate that outlives that idle window would otherwise
 		// have its message refused for being un-queued while the agent streams.
 		sendUserMessage: (content) => {
@@ -140,7 +143,7 @@ export default function handoff(pi: ExtensionAPI) {
 		machine,
 		createService,
 		runService,
-		gateBFlow,
+		resultGateFlow,
 		isChoiceRunnable,
 		clipboard,
 		clock,
@@ -163,7 +166,7 @@ export default function handoff(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		// Dropped with the state it belonged to: a review captured before the session was
 		// replaced has no gate to reopen here, and keeping it would offer one anyway.
-		gateBFlow.forgetReviewTurn();
+		resultGateFlow.forgetReviewTurn();
 		const restored = rehydrateLatestHandoffState(ctx.sessionManager.getBranch());
 		if (restored === undefined) machine.reset();
 		else machine.restore(restored);
@@ -187,7 +190,7 @@ export default function handoff(pi: ExtensionAPI) {
 		// A capture cannot be reopened into a session that is being torn down, so it is
 		// dropped before anything waits: a gate opening during shutdown would prompt a user
 		// who has already left.
-		gateBFlow.forgetReviewTurn();
+		resultGateFlow.forgetReviewTurn();
 		if (!runService.abortActiveRun()) return;
 		await runService.whenSettled();
 	});
@@ -208,11 +211,11 @@ export default function handoff(pi: ExtensionAPI) {
 	 * acts on the capture, fires only once no retry remains.
 	 */
 	pi.on("agent_end", (event) => {
-		gateBFlow.captureReviewTurn(classifyReviewTurn(event.messages));
+		resultGateFlow.captureReviewTurn(classifyReviewTurn(event.messages));
 	});
 
 	/**
-	 * Reopens Gate B once the review turn has fully settled.
+	 * Reopens the result gate once the review turn has fully settled.
 	 *
 	 * Pi emits this after retries, compaction, and queued continuations are ruled out,
 	 * with the session already reporting idle, so the gate and any run it starts happen
@@ -221,6 +224,6 @@ export default function handoff(pi: ExtensionAPI) {
 	 * up the other extensions' handlers and Pi's own idle bookkeeping behind a gate.
 	 */
 	pi.on("agent_settled", (_event, ctx) => {
-		gateBFlow.reopenAfterReviewTurn(ctx);
+		resultGateFlow.reopenAfterReviewTurn(ctx);
 	});
 }

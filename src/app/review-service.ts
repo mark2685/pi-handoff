@@ -1,7 +1,7 @@
 /**
- * Owns what happens at Gate B: accept, the review turn, and the bounded fix loop.
+ * Owns what happens at the result gate: accept, the review turn, and the bounded fix loop.
  *
- * These three live together because they are the decisions Gate B offers, and all
+ * These three live together because they are the decisions the result gate offers, and all
  * three have to be testable without a TUI. The command handler above this only
  * renders the gate and reports outcomes.
  *
@@ -65,7 +65,7 @@ export interface SendFeedbackOptions {
 	/** Raw editor text. Blank text is refused before any write. */
 	feedback: string;
 	cwd: string;
-	/** Receives incremental worker progress for the running widget. */
+	/** Receives incremental worker progress for the run monitor. */
 	onProgress?: (progress: RunProgress) => void;
 	/** Re-checked immediately before spawning, as on a first run. */
 	isChoiceRunnable: (choice: ModelChoice | undefined) => boolean;
@@ -89,7 +89,7 @@ export interface ReviewService {
 	beginReview(): Result<HandoffReviewingState, HandoffConflict>;
 	/**
 	 * Disarms the review turn and persists its final assistant response before reopening
-	 * Gate B. Blank or absent text records no review, so a turn that failed leaves the
+	 * The result gate. Blank or absent text records no review, so a turn that failed leaves the
 	 * iteration unreviewed rather than reviewed-with-nothing-to-say.
 	 */
 	clearReview(reviewText?: string): Result<HandoffReviewingState, HandoffConflict>;
@@ -101,7 +101,7 @@ export interface ReviewService {
 	sendFeedback(options: SendFeedbackOptions): Promise<Result<RunOutcome, FeedbackRefusal>>;
 }
 
-/** Wires Gate B's decisions to the machine, the run service, and their ports. */
+/** Wires the result gate's decisions to the machine, the run service, and their ports. */
 export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 	const { machine, runService, promptWriter, reportRecorder, recorder, clock, maxIterations } = deps;
 
@@ -141,7 +141,7 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 
 			// The record is not optional: see the module header on why an unrecorded
 			// reset would let a resumed session discard accepted work.
-			machine.reset();
+			machine.reset("accepted");
 			record();
 			return ok({ reportRecorded });
 		},

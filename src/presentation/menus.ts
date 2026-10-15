@@ -3,9 +3,11 @@
  *
  * Options pair a stable id with a display label and resolve selections back by
  * index, following Phase Runner's convention. Branching on the label itself
- * means rewording an entry silently changes behavior, and Gate A's labels carry
+ * means rewording an entry silently changes behavior, and the launch gate's labels carry
  * live data such as the model name, so index resolution is the only safe form.
  */
+
+import { reviewOptionLabel } from "../domain/vocabulary.ts";
 
 export interface MenuOption<Id extends string> {
 	id: Id;
@@ -26,10 +28,10 @@ export async function selectOption<Id extends string>(
 	return options[labels.indexOf(choice)]?.id;
 }
 
-export type GateAOptionId = "run" | "run_and_review" | "view" | "edit" | "model" | "external" | "cancel";
+export type LaunchGateOptionId = "run" | "run_and_review" | "view" | "edit" | "model" | "external" | "cancel";
 
 /**
- * Builds Gate A's options.
+ * Builds the launch gate's options.
  *
  * Run is present but disabled-looking when no registry-backed model exists, so
  * the blocked state is visible rather than silently missing; the caller refuses
@@ -42,11 +44,14 @@ export type GateAOptionId = "run" | "run_and_review" | "view" | "edit" | "model"
  * byte-for-byte what it was, for the case where the user wants to look at the
  * diffstat before spending reviewing context.
  *
- * View full prompt sits directly after the run options because the gate can only
- * preview twelve lines of a prompt that is routinely over a hundred, and
- * approving unseen text is the one thing this gate exists to prevent.
+ * View full prompt sits directly after the run options because the gate can show
+ * only the rows of a prompt that fit below its menu, prompts are routinely over a
+ * hundred lines, and approving unseen text is the one thing this gate exists to prevent.
  */
-export function gateAMenu(runnable: boolean, options: { cancelFirst?: boolean } = {}): MenuOption<GateAOptionId>[] {
+export function launchGateMenu(
+	runnable: boolean,
+	options: { cancelFirst?: boolean } = {},
+): MenuOption<LaunchGateOptionId>[] {
 	const cancel = { id: "cancel" as const, label: "Cancel" };
 	return [
 		...(options.cancelFirst === true ? [cancel] : []),
@@ -77,22 +82,10 @@ export function unparseableMenu(): MenuOption<UnparseableOptionId>[] {
 	];
 }
 
-export type ReviewOptionLabel = "Review here" | "Review again";
-
-/**
- * The label Gate B gives its review option.
- *
- * Shared so that text pointing the user at the option, such as a failed review turn's
- * notice, names exactly what the menu renders.
- */
-export function reviewOptionLabel(reviewed: boolean): ReviewOptionLabel {
-	return reviewed ? "Review again" : "Review here";
-}
-
 export type AnsweredRetryOptionId = "retry" | "cancel";
 
 /**
- * Builds the menu shown when a re-draft carrying answered NEEDS INPUT questions fails.
+ * Builds the menu shown when a re-draft carrying answered questions-gate questions fails.
  *
  * Retry re-sends the identical answered scope, because the answers are the expensive
  * part of this flow: one observed session spent fifty minutes on a single answer, and
@@ -107,7 +100,7 @@ export function answeredRetryMenu(): MenuOption<AnsweredRetryOptionId>[] {
 	];
 }
 
-export type NeedsInputOptionId = "answer" | "proceed" | "edit" | "view" | "cancel";
+export type QuestionsGateOptionId = "answer" | "proceed" | "edit" | "view" | "cancel";
 
 /**
  * Builds the menu shown when a draft contains open decisions.
@@ -118,12 +111,12 @@ export type NeedsInputOptionId = "answer" | "proceed" | "edit" | "view" | "cance
  *
  * `round` gates the Proceed option, which appears only from the third round. Two
  * rounds of questions is a model converging; four rounds and thirty-five minutes
- * before Gate A, as observed, is a model stalling, and at that point taking its
+ * before the launch gate, as observed, is a model stalling, and at that point taking its
  * own recommendations is strictly better than answering them one at a time. It is
  * withheld earlier because it is a blunt instrument — it answers every open
  * question at once, including the ones with no recommendation.
  */
-export function needsInputMenu(options: { round?: number } = {}): MenuOption<NeedsInputOptionId>[] {
+export function questionsGateMenu(options: { round?: number } = {}): MenuOption<QuestionsGateOptionId>[] {
 	const round = options.round ?? 1;
 	return [
 		{ id: "answer", label: "Answer the questions and re-draft" },
@@ -136,20 +129,20 @@ export function needsInputMenu(options: { round?: number } = {}): MenuOption<Nee
 					},
 				]
 			: []),
-		{ id: "edit", label: "Edit the prompt and continue to Gate A" },
+		{ id: "edit", label: "Edit the prompt and continue to the launch gate" },
 		{ id: "view", label: "View draft" },
 		{ id: "cancel", label: "Cancel" },
 	];
 }
 
-/** The NEEDS INPUT round from which "Proceed with recommended answers" is offered. */
+/** The questions round from which "Proceed with recommended answers" is offered. */
 export const PROCEED_WITH_RECOMMENDED_ROUND = 3;
 
-export type GateBOptionId =
+export type ResultGateOptionId =
 	"accept" | "accept_leftovers" | "discard" | "review" | "feedback" | "view_report" | "view_diffstat" | "dismiss";
 
 /**
- * Builds Gate B's options in the design's order.
+ * Builds the result gate's options in the design's order.
  *
  * `interrupted` drops Review here entirely rather than blocking it, because there
  * is no report to review; offering it at all would imply one exists. Send feedback
@@ -157,14 +150,14 @@ export type GateBOptionId =
  * what a user wants there — so it is shown as long as the bound allows it.
  *
  * When the iteration bound is reached, feedback is shown as explicitly blocked
- * rather than omitted, following the same convention as Gate A's blocked Run: a
+ * rather than omitted, following the same convention as the launch gate's blocked Run: a
  * silently missing option reads as a broken gate, while a blocked one states the
  * rule. The caller refuses it either way, because a label is a hint and the
  * service is the guarantee. A fix verdict moves feedback first and an accept
  * verdict moves Accept first; discard is the exception so the destructive action
  * stays in its normal position, with its label explaining the recommendation.
  */
-export function gateBMenu(options: {
+export function resultGateMenu(options: {
 	interrupted: boolean;
 	/** Present only when Review here captured a response for the current iteration. */
 	review?: { verdict?: "accept" | "fix" | "discard"; leftovers?: "none" | "items" | "missing" };
@@ -172,13 +165,13 @@ export function gateBMenu(options: {
 	feedback?: { allowed: boolean; iteration: number; maxIterations: number };
 	/** Whether a completed report preview hides text, so its full viewer is useful. */
 	hasReport?: boolean;
-	/** Whether pre-crash partial-output preview hides text, never a finished report. */
+	/** Whether the partial-output block hides text; it is never a finished report. */
 	hasPartialReport?: boolean;
 	/** Whether the diffstat view reveals hidden diffstat or stderr-tail text. Defaults to true for legacy callers. */
 	hasDiffstat?: boolean;
-}): MenuOption<GateBOptionId>[] {
+}): MenuOption<ResultGateOptionId>[] {
 	const reviewed = options.review !== undefined;
-	const reviewOptions: MenuOption<GateBOptionId>[] = options.interrupted
+	const reviewOptions: MenuOption<ResultGateOptionId>[] = options.interrupted
 		? []
 		: [{ id: "review", label: reviewOptionLabel(reviewed) }];
 
@@ -189,7 +182,7 @@ export function gateBMenu(options: {
 				? "Send review to worker"
 				: "Send feedback to worker";
 
-	const menu: MenuOption<GateBOptionId>[] = [
+	const menu: MenuOption<ResultGateOptionId>[] = [
 		...reviewOptions,
 		{ id: "feedback", label: feedbackLabel },
 		{
@@ -246,6 +239,22 @@ export function confirmDiscardMenu(): MenuOption<ConfirmDiscardOptionId>[] {
 	];
 }
 
+export type DiscardSummaryOptionId = "ok" | "view_paths";
+
+/**
+ * Builds the menu shown with the discard summary.
+ *
+ * "View all paths" is offered only when the gate could not show every path, for the
+ * same reason the result gate withholds a viewer for text it shows in full: the paths
+ * Discard left alone are the one list here a user must be able to read to the end.
+ */
+export function discardSummaryMenu(options: { pathsShortened: boolean }): MenuOption<DiscardSummaryOptionId>[] {
+	return [
+		{ id: "ok", label: "OK" },
+		...(options.pathsShortened ? [{ id: "view_paths" as const, label: "View all paths" }] : []),
+	];
+}
+
 export type ExternalRunOptionId = "review" | "discard" | "cancel";
 
 /**
@@ -255,14 +264,14 @@ export type ExternalRunOptionId = "review" | "discard" | "cancel";
  * the extension forgot the handoff entirely and the user pasted the worker's
  * report back as an ordinary message: no checkpoint, no diffstat, and no Discard.
  * Recording the external run means `/handoff` has something to offer here, and
- * Review now is what routes it into the same Gate B an internal run reaches.
+ * Review now is what routes it into the same result gate an internal run reaches.
  */
 export function externalRunMenu(): MenuOption<ExternalRunOptionId>[] {
 	return [
 		{
 			id: "review",
 			label: "I ran it — review now",
-			description: "Reads the diffstat against the checkpoint and opens the review gate",
+			description: "Reads the diffstat against the checkpoint and opens the result gate",
 		},
 		{ id: "discard", label: "Discard changes" },
 		{ id: "cancel", label: "Leave this for later" },

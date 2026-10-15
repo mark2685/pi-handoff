@@ -1,5 +1,5 @@
 /**
- * Prompt text transformations for the NEEDS INPUT gate's Answer flow.
+ * Prompt text transformations for the questions gate's Answer flow.
  *
  * Kept beside `feedback.ts` because it is the same shape of problem: append a
  * clearly delimited, heading-labelled section to accumulating text, so an
