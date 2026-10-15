@@ -38,6 +38,7 @@ import { createFsPromptFileWriter } from "./src/adapters/fs-prompt-file-writer.t
 import { createPbcopyClipboard } from "./src/adapters/pbcopy-clipboard.ts";
 import { createPiDraftingModel, createPiSessionTranscriptSource } from "./src/adapters/pi-drafting-model.ts";
 import {
+	createSessionHandoffEventRecorder,
 	createSessionHandoffReportRecorder,
 	createSessionHandoffStateRecorder,
 } from "./src/adapters/session-state-recorder.ts";
@@ -58,6 +59,7 @@ export default function handoff(pi: ExtensionAPI) {
 	const machine = createHandoffMachine();
 	const recorder = createSessionHandoffStateRecorder(pi);
 	const reportRecorder = createSessionHandoffReportRecorder(pi);
+	const eventRecorder = createSessionHandoffEventRecorder(pi);
 	const promptWriter = createFsPromptFileWriter();
 	const clipboard = createPbcopyClipboard();
 	const clock = createSystemClock();
@@ -121,6 +123,7 @@ export default function handoff(pi: ExtensionAPI) {
 		reviewService,
 		clock,
 		isChoiceRunnable,
+		eventRecorder,
 		// `pi.sendUserMessage` returns void and Pi's own runtime attaches the rejection
 		// handler, so this is fire-and-forget by construction: the injected message
 		// starts an agent turn that the calling handler must return from, and the gate is

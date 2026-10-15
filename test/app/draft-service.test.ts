@@ -392,7 +392,7 @@ describe("DraftService.draft when the draft asks for context", () => {
 
 		assert.ok(cancelled.ok);
 		assert.deepEqual(cancelled.value, { kind: "failed", failure: { kind: "aborted" }, answersRetained: false });
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("refuses chooseModel while the marker is still present", async () => {
@@ -571,7 +571,7 @@ describe("DraftService.draft failure paths", () => {
 	it("returns to idle after an empty session", async () => {
 		const harness = createHarness({ transcript: { read: () => ({ kind: "empty" }) } });
 		await draftOutcome(harness);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "draft-failed" });
 	});
 
 	it("reports a failed completion as a value", async () => {
@@ -587,7 +587,7 @@ describe("DraftService.draft failure paths", () => {
 	it("returns to idle after a failed completion", async () => {
 		const harness = createHarness({ response: err({ kind: "completion_failed", detail: "upstream 500" }) });
 		await draftOutcome(harness);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "draft-failed" });
 	});
 
 	it("refuses to open a gate when the prompt file cannot be written", async () => {
@@ -595,7 +595,7 @@ describe("DraftService.draft failure paths", () => {
 		const harness = createHarness({ writeFailure: failure });
 		const outcome = await draftOutcome(harness);
 		assert.deepEqual(outcome, { kind: "write_failed", failure });
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "draft-failed" });
 	});
 
 	it("refuses to start while a handoff is already running", async () => {
@@ -659,7 +659,7 @@ describe("DraftService.draftLeftovers", () => {
 		});
 		const outcome = await leftoversOutcome(harness);
 		assert.deepEqual(outcome, { kind: "no_leftovers", rationale: "All listed work was already accepted." });
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "no-leftovers" });
 		assert.equal(harness.transcriptReads(), 0);
 	});
 
@@ -865,15 +865,15 @@ describe("DraftService.abandon", () => {
 	it("returns to idle and records the reset", async () => {
 		const harness = createHarness();
 		await draftOutcome(harness);
-		harness.service.abandon();
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
-		assert.equal(harness.recorded.at(-1)?.kind, "idle");
+		harness.service.abandon("cancelled");
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("clears the retained draft so a later handoff cannot inherit it", async () => {
 		const harness = createHarness({ models: [] });
 		await draftOutcome(harness);
-		harness.service.abandon();
+		harness.service.abandon("cancelled");
 		const chosen = harness.service.chooseModel(EXPECTED_CHOICE);
 		assert.equal(chosen.ok, false);
 	});
@@ -890,8 +890,8 @@ describe("DraftService.abandon", () => {
 		await draftOutcome(harness);
 		const before = harness.recorded.length;
 
-		harness.service.abandon();
-		harness.service.abandon();
+		harness.service.abandon("cancelled");
+		harness.service.abandon("cancelled");
 
 		const idleEntries = harness.recorded.slice(before).filter((state) => state.kind === "idle");
 		assert.equal(idleEntries.length, 1);
@@ -899,7 +899,7 @@ describe("DraftService.abandon", () => {
 
 	it("records no idle entry at all when the machine was already idle", () => {
 		const harness = createHarness();
-		harness.service.abandon();
+		harness.service.abandon("cancelled");
 		assert.deepEqual(harness.recorded, []);
 	});
 
@@ -910,9 +910,9 @@ describe("DraftService.abandon", () => {
 		assert.equal(outcome.kind, "failed");
 
 		// The command layer's own abandon for the same cancellation.
-		harness.service.abandon();
+		harness.service.abandon("cancelled");
 
 		assert.equal(harness.recorded.filter((state) => state.kind === "idle").length, 1);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 });

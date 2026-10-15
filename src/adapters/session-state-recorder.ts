@@ -14,7 +14,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HANDOFF_STATE_ENTRY_TYPE, serializeHandoffState, type HandoffState } from "../app/handoff-machine.ts";
 import {
+	HANDOFF_EVENT_ENTRY_TYPE,
 	HANDOFF_REPORT_ENTRY_TYPE,
+	type HandoffEvent,
+	type HandoffEventRecorder,
 	type HandoffReportEntry,
 	type HandoffReportRecorder,
 	type HandoffStateRecorder,
@@ -61,6 +64,22 @@ export function createSessionHandoffReportRecorder(
 		record(entry: HandoffReportEntry): void {
 			try {
 				pi.appendEntry(HANDOFF_REPORT_ENTRY_TYPE, entry);
+			} catch (error) {
+				options.onError?.(error instanceof Error ? error.message : String(error));
+			}
+		},
+	};
+}
+
+/** Creates a recorder that appends handoff events, such as result-gate actions, to the session. */
+export function createSessionHandoffEventRecorder(
+	pi: ExtensionAPI,
+	options: SessionHandoffStateRecorderOptions = {},
+): HandoffEventRecorder {
+	return {
+		record(event: HandoffEvent): void {
+			try {
+				pi.appendEntry(HANDOFF_EVENT_ENTRY_TYPE, event);
 			} catch (error) {
 				options.onError?.(error instanceof Error ? error.message : String(error));
 			}

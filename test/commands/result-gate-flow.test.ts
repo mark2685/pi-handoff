@@ -30,7 +30,13 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHandoffMachine, type HandoffMachine } from "../../src/app/handoff-machine.ts";
 import { createReviewService } from "../../src/app/review-service.ts";
 import { createRunService, type RunService } from "../../src/app/run-service.ts";
-import type { HandoffStateRecorder, HandoffReportRecorder } from "../../src/app/state-recorder.ts";
+import type { HandoffState } from "../../src/app/handoff-machine.ts";
+import type {
+	HandoffEvent,
+	HandoffEventRecorder,
+	HandoffStateRecorder,
+	HandoffReportRecorder,
+} from "../../src/app/state-recorder.ts";
 import {
 	createResultGateFlow,
 	formatReopenFailure,
@@ -89,6 +95,10 @@ interface Harness {
 	viewerTitles: string[];
 	/** Prompt-file contents written by feedback iterations, which is where the sent text lands. */
 	promptWrites: string[];
+	/** Every recorded state and handoff event, in order, so a test can assert which came first. */
+	log: string[];
+	recorded: HandoffState[];
+	events: HandoffEvent[];
 }
 
 interface HarnessOptions {
@@ -114,6 +124,8 @@ interface HarnessOptions {
 	 * opened and Accept already reset the machine.
 	 */
 	draftLeftoversThrows?: boolean;
+	/** Labels returned by `ctx.ui.select`, consumed in order; undefined once exhausted. */
+	selectResults?: string[];
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -128,7 +140,22 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	const promptWrites: string[] = [];
 	const selections = [...(options.selections ?? [])];
 
-	const recorder: HandoffStateRecorder = { record: () => {} };
+	const log: string[] = [];
+	const recorded: HandoffState[] = [];
+	const events: HandoffEvent[] = [];
+	const selectResults = [...(options.selectResults ?? [])];
+	const recorder: HandoffStateRecorder = {
+		record: (state) => {
+			recorded.push(state);
+			log.push(`state:${state.kind}`);
+		},
+	};
+	const eventRecorder: HandoffEventRecorder = {
+		record: (event) => {
+			events.push(event);
+			log.push(`event:${event.action}`);
+		},
+	};
 	const reportRecorder: HandoffReportRecorder = { record: () => {} };
 	const promptWriter: PromptFileWriter = {
 		write: async (_path: string, contents: string) => {
@@ -216,7 +243,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 				if (hold !== undefined) await hold;
 				return selections.shift();
 			},
-			select: async () => undefined,
+			select: async () => selectResults.shift(),
 			editor: async (title: string, prefill?: string) => {
 				editorTitles.push(title);
 				editorPrefills.push(prefill ?? "");
@@ -231,6 +258,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		reviewService,
 		clock,
 		isChoiceRunnable: () => true,
+		eventRecorder,
 		sendUserMessage: (content) => {
 			messages.push(content);
 		},
@@ -253,6 +281,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
 		leftovers,
 		viewerTitles,
 		promptWrites,
+		log,
+		recorded,
+		events,
 	};
 }
 
@@ -1125,7 +1156,7 @@ describe("ResultGateFlow review-turn capture and reopen", () => {
 		harness.flow.reopenAfterReviewTurn(harness.ctx);
 		await harness.flow.whenReopenSettled();
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "accepted" });
 		const reported = harness.notifications.at(-1);
 		assert.equal(reported?.level, "error");
 		assert.match(reported?.message ?? "", /The result gate stopped with an error: the drafting call failed/);
@@ -1282,7 +1313,7 @@ describe("ResultGateFlow leftovers follow-up", () => {
 			"Correct.\n\nNote for you: schedule the rollout.\n\nLeftovers:\n- Update the stale comment on line 12\n- Rename the misleading test\nVerdict: accept",
 		);
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "accepted" });
 		assert.equal(harness.leftovers.length, 1);
 		assert.equal(harness.leftovers[0]?.slug, "add-retry-logic");
 		assert.equal(harness.leftovers[0]?.prompt, DRAFT.prompt);
@@ -1300,7 +1331,7 @@ describe("ResultGateFlow leftovers follow-up", () => {
 		assert.ok(view);
 		await harness.flow.run(harness.ctx, view);
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "accepted" });
 		assert.equal(harness.leftovers.length, 1);
 		assert.equal(harness.leftovers[0]?.reviewText, "");
 		assert.equal(harness.leftovers[0]?.items, undefined);
@@ -1362,5 +1393,103 @@ describe("ResultGateFlow read-only viewers", () => {
 		await harness.flow.run(harness.ctx, view);
 
 		assert.equal(harness.machine.current().kind, "reviewing");
+	});
+});
+
+/**
+ * Which result-gate action was chosen is recorded for session readers, because
+ * Leave this for later changes no state and Accept and its leftovers variant end
+ * in the same idle entry. Each event precedes the state it leads to, so a reader
+ * folding entries in order attributes it to the handoff it decided.
+ */
+describe("ResultGateFlow records the chosen action", () => {
+	async function runGate(harness: Harness): Promise<void> {
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		await harness.flow.run(harness.ctx, view);
+	}
+
+	it("records Accept before the accepted idle entry", async () => {
+		const harness = createHarness({ selections: ["accept"] });
+		await runGate(harness);
+
+		assert.deepEqual(harness.events, [{ kind: "result-gate-action", action: "accept", iteration: 1 }]);
+		assert.deepEqual(harness.log.slice(-2), ["event:accept", "state:idle"]);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "accepted" });
+	});
+
+	it("records Accept and hand off leftovers as its own action", async () => {
+		const harness = createHarness({ selections: ["accept_leftovers"] });
+		await reachReview(harness);
+		harness.flow.startReviewTurn(harness.ctx);
+		await endReviewTurn(harness, "Correct.\n\nLeftovers:\n- Rename the test\nVerdict: accept");
+
+		assert.deepEqual(
+			harness.events.map((event) => event.action),
+			["accept_leftovers"],
+		);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "accepted" });
+	});
+
+	it("records Discard only once the confirmation says discard", async () => {
+		const harness = createHarness({ selections: ["discard", "ok"], selectResults: ["Discard the worker's changes"] });
+		await runGate(harness);
+
+		assert.deepEqual(harness.events, [{ kind: "result-gate-action", action: "discard", iteration: 1 }]);
+		assert.deepEqual(harness.log.slice(-2), ["event:discard", "state:idle"]);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "discarded" });
+	});
+
+	it("records no Discard when the confirmation keeps the changes", async () => {
+		const harness = createHarness({ selections: ["discard", "dismiss"], selectResults: ["Keep the changes"] });
+		await runGate(harness);
+
+		assert.deepEqual(
+			harness.events.map((event) => event.action),
+			["dismiss"],
+		);
+	});
+
+	it("records Send feedback before the next iteration's running entry", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: "Handle the timeout too." });
+		await runGate(harness);
+
+		assert.deepEqual(harness.events, [
+			{ kind: "result-gate-action", action: "feedback", iteration: 1 },
+			{ kind: "result-gate-action", action: "dismiss", iteration: 2 },
+		]);
+		const feedback = harness.log.indexOf("event:feedback");
+		assert.equal(harness.log[feedback + 1], "state:running");
+	});
+
+	it("records no Send feedback when the editor is closed without sending", async () => {
+		const harness = createHarness({ selections: ["feedback", "dismiss"], editorResult: undefined });
+		await runGate(harness);
+
+		assert.deepEqual(
+			harness.events.map((event) => event.action),
+			["dismiss"],
+		);
+	});
+
+	it("records Review here before the armed review entry", async () => {
+		const harness = createHarness({ selections: ["review"] });
+		await runGate(harness);
+
+		assert.deepEqual(harness.events, [{ kind: "result-gate-action", action: "review", iteration: 1 }]);
+		assert.deepEqual(harness.log.slice(-2), ["event:review", "state:reviewing"]);
+	});
+
+	it("records Leave this for later, which changes no state", async () => {
+		const harness = createHarness({ selections: ["dismiss"] });
+		await reachReview(harness);
+		const view = await harness.flow.viewFromPendingReview(harness.ctx);
+		assert.ok(view);
+		const states = harness.recorded.length;
+		await harness.flow.run(harness.ctx, view);
+
+		assert.deepEqual(harness.events, [{ kind: "result-gate-action", action: "dismiss", iteration: 1 }]);
+		assert.equal(harness.recorded.length, states);
 	});
 });

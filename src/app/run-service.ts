@@ -63,6 +63,7 @@ import type {
 	HandoffInterruptedReviewingState,
 	HandoffMachine,
 	HandoffRunningState,
+	InterruptionReason,
 } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
 
@@ -249,7 +250,11 @@ export interface RunService {
 }
 
 /**
- * Builds the note recorded when a run ends without a usable report.
+ * Builds the note recorded when a run ends without a usable report, with the reason it names.
+ *
+ * The note and its machine-readable reason come from the same branch, so a session
+ * reader can classify an interruption without string-matching the note, and the two
+ * cannot disagree.
  *
  * A partial report is called out rather than silently dropped, because the user
  * saw text appear in the monitor and would otherwise wonder where it went.
@@ -260,30 +265,41 @@ function interruptionNote(reason: {
 	exitCode: number | undefined;
 	errorMessage: string | undefined;
 	stopReason: string | undefined;
-}): string {
+}): { note: string; reason: InterruptionReason } {
 	if (reason.aborted) {
-		return reason.hadPartialReport
-			? "The worker was stopped mid-run. Its partial output is not treated as a report."
-			: "The worker was stopped before it reported a result.";
+		return {
+			reason: "user-stopped",
+			note: reason.hadPartialReport
+				? "The worker was stopped mid-run. Its partial output is not treated as a report."
+				: "The worker was stopped before it reported a result.",
+		};
 	}
 	// Stated explicitly, because the user watched this text stream into the monitor and
 	// would otherwise read its demotion as the extension having lost the report.
 	const partialSuffix = reason.hadPartialReport
 		? " The text it had already produced is kept as partial output, not as a report."
 		: "";
-	if (reason.errorMessage !== undefined) return `The worker failed: ${reason.errorMessage}${partialSuffix}`;
+	if (reason.errorMessage !== undefined) {
+		return { reason: "worker-error", note: `The worker failed: ${reason.errorMessage}${partialSuffix}` };
+	}
 	if (reason.stopReason === WORKER_ERROR_STOP_REASON) {
-		return `The worker ended on an error rather than finishing its turn.${partialSuffix}`;
+		return {
+			reason: "error-stop",
+			note: `The worker ended on an error rather than finishing its turn.${partialSuffix}`,
+		};
 	}
 	if (reason.exitCode !== undefined && reason.exitCode !== 0) {
-		return reason.hadPartialReport
-			? `The worker exited with code ${reason.exitCode} before reporting a result.${partialSuffix}`
-			: `The worker exited with code ${reason.exitCode} without producing a report.`;
+		return {
+			reason: "nonzero-exit",
+			note: reason.hadPartialReport
+				? `The worker exited with code ${reason.exitCode} before reporting a result.${partialSuffix}`
+				: `The worker exited with code ${reason.exitCode} without producing a report.`,
+		};
 	}
 	if (reason.stopReason !== undefined) {
-		return `The worker stopped (${reason.stopReason}) without producing a report.`;
+		return { reason: "other-stop", note: `The worker stopped (${reason.stopReason}) without producing a report.` };
 	}
-	return "The worker produced no report.";
+	return { reason: "no-report", note: "The worker produced no report." };
 }
 
 /** The stop reason Pi reports when a worker's final message is an error rather than a turn. */
@@ -306,7 +322,7 @@ export function stderrTail(stderr: string, limit = MAX_STDERR_TAIL_CHARS): strin
 
 /** How a finished worker's outcome was classified, with the evidence it left behind. */
 export type OutcomeClassification =
-	{ kind: "completed" } | { kind: "interrupted"; note: string; partialReport: string };
+	{ kind: "completed" } | { kind: "interrupted"; note: string; reason: InterruptionReason; partialReport: string };
 
 /**
  * Decides whether a finished worker produced a result or died.
@@ -334,17 +350,14 @@ export function classifyOutcome(outcome: {
 
 	if (!died && report !== "") return { kind: "completed" };
 
-	return {
-		kind: "interrupted",
-		note: interruptionNote({
-			aborted: outcome.aborted,
-			hadPartialReport: report !== "",
-			exitCode: outcome.exitCode,
-			errorMessage: outcome.errorMessage,
-			stopReason: outcome.stopReason,
-		}),
-		partialReport: report,
-	};
+	const { note, reason } = interruptionNote({
+		aborted: outcome.aborted,
+		hadPartialReport: report !== "",
+		exitCode: outcome.exitCode,
+		errorMessage: outcome.errorMessage,
+		stopReason: outcome.stopReason,
+	});
+	return { kind: "interrupted", note, reason, partialReport: report };
 }
 
 /** Wires a worker run to the machine, Git, and the clock behind their ports. */
@@ -427,6 +440,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 				const tail = stderrTail(outcome.stderr);
 				const interrupted = machine.interruptRun({
 					note: classified.note,
+					reason: classified.reason,
 					// Measured, so it is kept: an interrupted run's tokens and cost were real, and
 					// dropping them is how a seven-hour run's cost became unknowable.
 					usage: outcome.usage,
@@ -574,6 +588,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 			if (report === "") {
 				const interrupted = machine.interruptRun({
 					note: "The handoff ran in another terminal and no report was supplied. Review the diff directly.",
+					reason: "external-no-report",
 				});
 				if (!interrupted.ok) return { kind: "refused", conflict: interrupted.error };
 				record();
@@ -671,7 +686,7 @@ export function createRunService(deps: RunServiceDeps): RunService {
 			const discarded = await git.discardSinceCheckpoint(cwd, checkpoint);
 			if (!discarded.ok) return err(discarded.error);
 
-			machine.reset();
+			machine.reset("discarded");
 			record();
 			return ok({
 				restoredPaths: discarded.value.restoredPaths,

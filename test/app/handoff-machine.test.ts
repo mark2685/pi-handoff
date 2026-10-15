@@ -403,6 +403,7 @@ describe("handoff session persistence", () => {
 			diffstat: null,
 			usage: null,
 			interruptionNote: "The worker was interrupted because this Pi session restarted.",
+			interruptionReason: "session-restarted",
 			awaitingReviewTurn: false,
 		});
 	});

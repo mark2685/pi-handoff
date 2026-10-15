@@ -25,7 +25,7 @@ import type {
 	ThinkingLevel,
 	Tier,
 } from "../domain/types.ts";
-import type { HandoffState } from "../app/handoff-machine.ts";
+import type { HandoffState, IdleReason, InterruptionReason } from "../app/handoff-machine.ts";
 import type { WorkerUsage } from "../ports/worker-runner.ts";
 
 const ThinkingLevelSchema = Type.Union([
@@ -179,7 +179,34 @@ const CapturedReviewSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-const IdleHandoffStateSchema = Type.Object({ kind: Type.Literal("idle") }, { additionalProperties: false });
+const IdleReasonSchema = Type.Union([
+	Type.Literal("cancelled"),
+	Type.Literal("draft-failed"),
+	Type.Literal("no-leftovers"),
+	Type.Literal("launch-failed"),
+	Type.Literal("discarded"),
+	Type.Literal("accepted"),
+]);
+
+const IdleHandoffStateSchema = Type.Object(
+	{
+		kind: Type.Literal("idle"),
+		// Optional so idle entries written before the reason was recorded still decode.
+		reason: Type.Optional(IdleReasonSchema),
+	},
+	{ additionalProperties: false },
+);
+
+const InterruptionReasonSchema = Type.Union([
+	Type.Literal("user-stopped"),
+	Type.Literal("worker-error"),
+	Type.Literal("error-stop"),
+	Type.Literal("nonzero-exit"),
+	Type.Literal("other-stop"),
+	Type.Literal("no-report"),
+	Type.Literal("session-restarted"),
+	Type.Literal("external-no-report"),
+]);
 
 const PendingDraftSchema = Type.Object(
 	{
@@ -266,6 +293,8 @@ const InterruptedReviewingHandoffStateSchema = Type.Object(
 		// meaning "never measured", so entries written before this still decode.
 		usage: Type.Union([WorkerUsageSchema, Type.Null()]),
 		interruptionNote: Type.String({ minLength: 1 }),
+		// Optional so entries recorded before the reason was persisted still decode.
+		interruptionReason: Type.Optional(InterruptionReasonSchema),
 		// Optional so entries recorded before crash evidence and the feedback-loop latch still decode.
 		partialReport: Type.Optional(Type.String({ minLength: 1 })),
 		stderrTail: Type.Optional(Type.String({ minLength: 1 })),
@@ -413,4 +442,6 @@ assertSchemaMatches<Static<typeof ModelChoiceSchema>, ModelChoice>(true);
 assertSchemaMatches<Static<typeof WorkerUsageSchema>, WorkerUsage>(true);
 assertSchemaMatches<Static<typeof ReviewVerdictSchema>, ReviewVerdict>(true);
 assertSchemaMatches<Static<typeof CapturedReviewSchema>, CapturedReview>(true);
+assertSchemaMatches<Static<typeof IdleReasonSchema>, IdleReason>(true);
+assertSchemaMatches<Static<typeof InterruptionReasonSchema>, InterruptionReason>(true);
 assertSchemaMatches<Static<typeof HandoffStateSchema>, HandoffState>(true);

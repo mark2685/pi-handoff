@@ -1142,3 +1142,84 @@ describe("classifyOutcome", () => {
 		assert.equal(classified.partialReport, "## Summary");
 	});
 });
+
+/**
+ * Every branch that builds an interruption note names exactly one machine-readable
+ * reason, so a session reader can classify a run without string-matching the note.
+ */
+describe("classifyOutcome interruption reasons", () => {
+	const clean = { report: "## Summary", aborted: false, exitCode: 0, stopReason: "endTurn", errorMessage: undefined };
+
+	/** The reason a classification carries, failing if the run was not interrupted. */
+	function reasonOf(outcome: Parameters<typeof classifyOutcome>[0]): string {
+		const classified = classifyOutcome(outcome);
+		assert.ok(classified.kind === "interrupted");
+		return classified.reason;
+	}
+
+	it("names a user stop, even when an error was also reported", () => {
+		assert.equal(reasonOf({ ...clean, aborted: true, errorMessage: "terminated" }), "user-stopped");
+	});
+
+	it("names a worker error message, including a provider connection failure", () => {
+		assert.equal(reasonOf({ ...clean, report: "", errorMessage: "Connection error." }), "worker-error");
+	});
+
+	it("names an error stop reason without an error message", () => {
+		assert.equal(reasonOf({ ...clean, stopReason: "error" }), "error-stop");
+	});
+
+	it("names a non-zero exit", () => {
+		assert.equal(reasonOf({ ...clean, report: "", exitCode: 2 }), "nonzero-exit");
+	});
+
+	it("names another stop reason that left no report", () => {
+		assert.equal(reasonOf({ ...clean, report: "", stopReason: "length" }), "other-stop");
+	});
+
+	it("names a clean exit with an empty report", () => {
+		assert.equal(reasonOf({ ...clean, report: "", stopReason: undefined }), "no-report");
+	});
+});
+
+describe("RunService interruption reasons on the persisted state", () => {
+	it("persists the classified reason next to the note", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ report: "", errorMessage: "Connection error." }) });
+		const outcome = await start(harness);
+
+		assert.equal(outcome.kind, "interrupted");
+		const persisted = harness.recorded.at(-1);
+		assert.ok(persisted?.kind === "reviewing" && persisted.completion === "interrupted");
+		assert.equal(persisted.interruptionReason, "worker-error");
+		assert.equal(persisted.interruptionNote, "The worker failed: Connection error.");
+		assert.ok(validateHandoffState(persisted).ok);
+	});
+
+	it("persists a user stop as user-stopped", async () => {
+		const harness = createHarness({ outcome: workerOutcome({ aborted: true }) });
+		await start(harness);
+		const persisted = harness.recorded.at(-1);
+		assert.ok(persisted?.kind === "reviewing" && persisted.completion === "interrupted");
+		assert.equal(persisted.interruptionReason, "user-stopped");
+	});
+
+	it("persists an external run brought back with no report as external-no-report", async () => {
+		const harness = createHarness();
+		await harness.service.startExternal({ cwd: CWD });
+		await harness.service.completeExternal({ cwd: CWD, report: "   " });
+
+		const persisted = harness.recorded.at(-1);
+		assert.ok(persisted?.kind === "reviewing" && persisted.completion === "interrupted");
+		assert.equal(persisted.interruptionReason, "external-no-report");
+		assert.ok(validateHandoffState(persisted).ok);
+	});
+
+	it("records a successful discard as discarded", async () => {
+		const harness = createHarness();
+		await start(harness);
+		const discarded = await harness.service.discard(CWD);
+
+		assert.ok(discarded.ok);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "discarded" });
+	});
+});

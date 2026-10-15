@@ -141,7 +141,7 @@ export function createReviewService(deps: ReviewServiceDeps): ReviewService {
 
 			// The record is not optional: see the module header on why an unrecorded
 			// reset would let a resumed session discard accepted work.
-			machine.reset();
+			machine.reset("accepted");
 			record();
 			return ok({ reportRecorded });
 		},

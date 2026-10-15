@@ -187,7 +187,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 			if (drafted.kind === "aborted") {
 				// `abandon` is idempotent, so this is safe even though the abandoned drafting call
 				// also abandons when it settles; see the note on DraftService.abandon.
-				service.abandon();
+				service.abandon("cancelled");
 				ctx.ui.notify("Handoff drafting cancelled", "info");
 				return;
 			}
@@ -207,7 +207,8 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 					unparseableMenu(),
 				);
 				if (retry !== "retry") {
-					service.abandon();
+					// Declining to retry ends a draft that failed to parse, not a working one.
+					service.abandon("draft-failed");
 					ctx.ui.notify("Handoff cancelled", "info");
 					return;
 				}
@@ -245,7 +246,8 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 				);
 				if (retry === "retry") continue;
 				if (retry === "cancel") {
-					service.abandon();
+					// The re-draft failed; cancelling here declines to retry it.
+					service.abandon("draft-failed");
 					ctx.ui.notify(
 						`Handoff cancelled; the answers were discarded. Run \`${HANDOFF_COMMAND}\` to start again.`,
 						"info",
@@ -294,7 +296,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 
 			if (selected === undefined || selected === "cancel") {
 				// Cancel leaves the /tmp prompt in place by design.
-				service.abandon();
+				service.abandon("cancelled");
 				ctx.ui.notify(`Handoff cancelled. Prompt left at ${view.promptPath}`, "info");
 				return;
 			}
@@ -349,7 +351,7 @@ export function createHandoffCommandHandler(deps: HandoffCommandDeps): HandoffCo
 					} else {
 						ctx.ui.notify(started.conflict.message, "warning");
 					}
-					service.abandon();
+					service.abandon("launch-failed");
 					return;
 				}
 

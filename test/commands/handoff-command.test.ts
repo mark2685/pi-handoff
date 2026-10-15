@@ -65,6 +65,8 @@ interface HarnessOptions {
 	selectResults?: (string | undefined)[];
 	/** Results returned by successive `ctx.ui.input` calls, in order. */
 	inputResults?: (string | undefined)[];
+	/** What Run externally's checkpoint attempt returns. */
+	startExternal?: () => Promise<unknown>;
 }
 
 interface Harness {
@@ -185,7 +187,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 	} as unknown as ExtensionContext;
 
 	const runService = {
-		startExternal: async () => ok(undefined),
+		startExternal: options.startExternal ?? (async () => ok(undefined)),
 		abortActiveRun: () => {},
 	} as unknown as RunService;
 
@@ -261,7 +263,7 @@ describe("draftLeftovers", () => {
 			items: ["Already-completed item"],
 		});
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "no-leftovers" });
 		assert.equal(harness.transcriptReads(), 0);
 		assert.ok(
 			harness.notifications.some(
@@ -410,7 +412,7 @@ describe("handle", () => {
 		assert.match(retry.userMessage, /A: In the README\./, "the retry must not ask the questions again");
 		assert.match(harness.selectCalls[0]?.title ?? "", /re-draft with your answers failed/);
 		// The retry reached the launch gate, whose Cancel is the last scripted selection.
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("keeps a dismissed retry prompt's answered state and resumes it with /handoff", async () => {
@@ -449,7 +451,7 @@ describe("handle", () => {
 			1,
 			"the resumed flow must re-draft directly instead of asking the question again",
 		);
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "cancelled" });
 	});
 
 	it("discards answers only when the retry prompt's explicit cancel is selected", async () => {
@@ -462,7 +464,7 @@ describe("handle", () => {
 
 		await harness.command.handle("fix the nits", harness.ctx);
 
-		assert.deepEqual(harness.machine.current(), { kind: "idle" });
+		assert.deepEqual(harness.machine.current(), { kind: "idle", reason: "draft-failed" });
 		assert.ok(
 			harness.notifications.some(({ message }) => message.includes("the answers were discarded")),
 			"expected the explicit discard to be stated",
@@ -492,5 +494,42 @@ describe("handle", () => {
 				message.includes('the --model override "bifrost-openai/gpt-5.6-terra:medium" was not used'),
 			),
 		);
+	});
+});
+
+/**
+ * Each way `/handoff` returns to idle before a run records why, so a session reader can
+ * tell a cancel from a failed draft without guessing from what came before the entry.
+ */
+describe("idle reasons recorded by /handoff", () => {
+	it("records a launch gate Cancel as cancelled", async () => {
+		const harness = createHarness({ gateSelections: ["cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "cancelled" });
+	});
+
+	it("records a questions gate Cancel as cancelled", async () => {
+		const harness = createHarness({ responses: [ok(questioningDraft())], gateSelections: ["cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "cancelled" });
+	});
+
+	it("records declining to retry an unparseable draft as draft-failed", async () => {
+		const harness = createHarness({ responses: [ok("not json")], selectResults: ["Cancel"] });
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "draft-failed" });
+	});
+
+	it("records a Run externally that could not take a checkpoint as launch-failed", async () => {
+		const harness = createHarness({
+			gateSelections: ["external"],
+			startExternal: async () => ({
+				kind: "checkpoint_failed",
+				failure: { kind: "not_repository", detail: "not a git repository" },
+			}),
+		});
+		await harness.command.handle("fix the nits", harness.ctx);
+		assert.deepEqual(harness.recorded.at(-1), { kind: "idle", reason: "launch-failed" });
+		assert.ok(validateHandoffState(harness.recorded.at(-1)).ok);
 	});
 });

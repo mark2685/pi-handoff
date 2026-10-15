@@ -222,6 +222,8 @@ Rendered through the gate frame (§5.10): identity and — once a review is capt
 
 Each transition appends a `handoff-state` custom entry (`pi.appendEntry(customType, data?)`, which returns `void`) containing the serialized machine state minus the child process handle. Writing entries is an `ExtensionAPI` capability rather than a session-manager call, because `ctx.sessionManager` is a read-only `ReadonlySessionManager` with no append method. On `session_start`, the latest entry is decoded; `running` is downgraded to `reviewing` with a note that the worker was interrupted (the child cannot survive a Pi restart), and `/handoff` reopens the appropriate gate. A bare legacy `drafting` state and `proposed` are downgraded to `idle` because the `/tmp` prompt file may be stale; `drafting` with an optional persisted pending questions-gate envelope is retained so `/handoff` can reopen that gate.
 
+Two optional fields and one separate entry exist for session readers, not for recovery. `idle` carries a `reason` (`cancelled`, `draft-failed`, `no-leftovers`, `launch-failed`, `discarded`, `accepted`), passed to `machine.reset` by whoever ends the handoff. An interrupted `reviewing` state carries an `interruptionReason`, and `interruptionNote()` in `run-service.ts` returns it together with the note so the two cannot drift. The result gate's chosen action goes in its own `handoff-event` custom entry (`{ kind: "result-gate-action", action, iteration }`), not in a state field: Leave this for later changes no state, and a field on `reviewing` would be carried, stale, through every later spread of that state. Rehydration reads only `handoff-state`.
+
 ### 5.7 Package layout
 
 ```

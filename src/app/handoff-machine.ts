@@ -21,9 +21,52 @@ import type { WorkerUsage } from "../ports/worker-runner.ts";
 /** Namespaced custom-session entry used to persist the active handoff state. */
 export const HANDOFF_STATE_ENTRY_TYPE = "handoff-state";
 
+/**
+ * Why a handoff returned to idle.
+ *
+ * - `cancelled`: the user cancelled the drafting loader, the questions gate, or the launch gate.
+ * - `draft-failed`: drafting produced no usable draft — a provider failure, an unparseable
+ *   envelope or failed answered re-draft the user chose not to retry, an empty session, or a
+ *   prompt file that could not be written.
+ * - `no-leftovers`: a leftovers follow-up's drafting model returned the `noLeftovers` exit.
+ * - `launch-failed`: Run externally copied the command but could not record the run.
+ * - `discarded`: Discard reverted the worker's changes.
+ * - `accepted`: Accept, or Accept and hand off leftovers, kept the working tree.
+ */
+export type IdleReason = "cancelled" | "draft-failed" | "no-leftovers" | "launch-failed" | "discarded" | "accepted";
+
 export interface HandoffIdleState {
 	readonly kind: "idle";
+	/**
+	 * Why the handoff ended, so a session reader can tell a cancel from a failure.
+	 *
+	 * Optional so entries written before it existed still decode, and absent from the
+	 * idle state a fresh or restored session starts in, which no handoff ended.
+	 */
+	readonly reason?: IdleReason;
 }
+
+/**
+ * Why a run was interrupted, mirroring the branches that build `interruptionNote`.
+ *
+ * - `user-stopped`: the user stopped the worker from the run monitor.
+ * - `worker-error`: the worker reported an error message, including provider and connection failures.
+ * - `error-stop`: the worker's final message carried the error stop reason.
+ * - `nonzero-exit`: the worker exited with a non-zero code.
+ * - `other-stop`: the worker stopped for another reason without producing a report.
+ * - `no-report`: the worker exited cleanly with an empty report.
+ * - `session-restarted`: the reviewing session restarted while a child-process worker ran.
+ * - `external-no-report`: an external run was brought back with no report supplied.
+ */
+export type InterruptionReason =
+	| "user-stopped"
+	| "worker-error"
+	| "error-stop"
+	| "nonzero-exit"
+	| "other-stop"
+	| "no-report"
+	| "session-restarted"
+	| "external-no-report";
 
 export interface HandoffDraftingState {
 	readonly kind: "drafting";
@@ -139,6 +182,11 @@ export interface HandoffInterruptedReviewingState {
 	/** Usage accumulated before the run ended, or null when nothing was measured. */
 	readonly usage: WorkerUsage | null;
 	readonly interruptionNote: string;
+	/**
+	 * The machine-readable cause behind `interruptionNote`, set where the note is built so
+	 * the two cannot drift. Optional so entries written before it existed still decode.
+	 */
+	readonly interruptionReason?: InterruptionReason;
 	/** Assistant text the worker emitted before it died. Never a report. */
 	readonly partialReport?: string;
 	/** Bounded tail of the worker's stderr, which usually names the real failure. */
@@ -195,6 +243,8 @@ export interface CompleteRunInput {
 export interface InterruptRunInput {
 	/** Human-readable reason, shown at the result gate and in the review turn. */
 	note: string;
+	/** The cause the note describes; every production caller sets one. */
+	reason?: InterruptionReason;
 	/**
 	 * Usage accumulated before the run ended.
 	 *
@@ -271,8 +321,13 @@ export interface HandoffMachine {
 	clearReviewTurn(review?: CapturedReview): Result<HandoffReviewingState, HandoffConflict>;
 	/** Replaces in-memory state with decoded, rehydrated persisted state. */
 	restore(state: HandoffState): void;
-	/** Returns to idle after Cancel, Accept, Discard, or a terminal failure. */
-	reset(): void;
+	/**
+	 * Returns to idle after Cancel, Accept, Discard, or a terminal failure.
+	 *
+	 * The reason is recorded on the idle state; it is omitted only where no handoff
+	 * ended, such as a session that restored nothing.
+	 */
+	reset(reason?: IdleReason): void;
 }
 
 function conflict(state: HandoffState, attempted: string, message: string): Result<never, HandoffConflict> {
@@ -503,6 +558,7 @@ export function createHandoffMachine(): HandoffMachine {
 				// Carried through the failure: the tokens were spent whether or not a report arrived.
 				usage: details.usage ?? null,
 				interruptionNote: details.note,
+				...(details.reason === undefined ? {} : { interruptionReason: details.reason }),
 				// Omitted rather than stored empty, so "absent" and "the worker said nothing" stay distinct.
 				...(partialReport === undefined || partialReport === "" ? {} : { partialReport }),
 				...(stderrTail === undefined || stderrTail === "" ? {} : { stderrTail }),
@@ -541,8 +597,8 @@ export function createHandoffMachine(): HandoffMachine {
 			state = next;
 		},
 
-		reset(): void {
-			state = IDLE;
+		reset(reason?: IdleReason): void {
+			state = reason === undefined ? IDLE : { kind: "idle", reason };
 		},
 	};
 }
@@ -551,7 +607,7 @@ export function createHandoffMachine(): HandoffMachine {
 export function serializeHandoffState(state: HandoffState): HandoffState {
 	switch (state.kind) {
 		case "idle":
-			return { kind: "idle" };
+			return state.reason === undefined ? { kind: "idle" } : { kind: "idle", reason: state.reason };
 		case "drafting":
 			return { ...state };
 		case "proposed":
@@ -609,6 +665,7 @@ export function rehydrateHandoffState(state: HandoffState): HandoffState {
 				diffstat: null,
 				usage: null,
 				interruptionNote: INTERRUPTED_WORKER_NOTE,
+				interruptionReason: "session-restarted",
 				...(state.autoReview === true ? { autoReview: true } : {}),
 				awaitingReviewTurn: false,
 			};

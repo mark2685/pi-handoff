@@ -529,8 +529,23 @@ describe("review-turn capture and reopen", () => {
 		await flush();
 
 		assert.deepEqual(uiCalls, ["custom", "custom"]);
-		const recorded = recorder.entries.at(-1)?.data as { review?: { text?: string } };
+		const states = recorder.entries.filter((entry) => entry.customType === "handoff-state");
+		const recorded = states.at(-1)?.data as { review?: { text?: string } };
 		assert.equal(recorded.review?.text, "The retry got there.");
+	});
+
+	/** Wired in the entry point, so a session reader can see which result-gate action was chosen. */
+	it("records each result-gate action as a handoff-event entry", async () => {
+		const { ctx } = await armReviewTurn({ customResults: ["review", "dismiss"] });
+		await fireHook(recorder, "agent_end", { type: "agent_end", messages: [assistantMessage("Looks right.")] }, ctx);
+		await fireHook(recorder, "agent_settled", { type: "agent_settled" }, ctx);
+		await flush();
+
+		const events = recorder.entries.filter((entry) => entry.customType === "handoff-event").map((entry) => entry.data);
+		assert.deepEqual(events, [
+			{ kind: "result-gate-action", action: "review", iteration: 1 },
+			{ kind: "result-gate-action", action: "dismiss", iteration: 1 },
+		]);
 	});
 
 	/**

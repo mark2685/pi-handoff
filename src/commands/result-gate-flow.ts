@@ -36,6 +36,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HandoffMachine } from "../app/handoff-machine.ts";
 import type { ReviewService } from "../app/review-service.ts";
 import type { RunOutcome, RunService } from "../app/run-service.ts";
+import {
+	NULL_HANDOFF_EVENT_RECORDER,
+	type HandoffEventRecorder,
+	type ResultGateAction,
+} from "../app/state-recorder.ts";
 import { normalizeReviewFeedback } from "../domain/draft/feedback.ts";
 import { formatModelChoice } from "../domain/draft/launch.ts";
 import { formatDiscardHeadline, formatDiscardPaths } from "../domain/report/discard.ts";
@@ -142,6 +147,12 @@ export interface ResultGateFlowDeps {
 	/** Re-checked before any spawn, so a vanished provider is caught at the click. */
 	isChoiceRunnable: (ctx: ExtensionContext, choice: ModelChoice | undefined) => boolean;
 	/**
+	 * Records which result-gate action the user chose, for session readers.
+	 *
+	 * Optional so tests and headless wiring that do not care can omit it.
+	 */
+	eventRecorder?: HandoffEventRecorder;
+	/**
 	 * Injects the review message into the reviewing session.
 	 *
 	 * Passed in rather than taken from `pi` directly so this module stays free of
@@ -211,6 +222,12 @@ export interface ResultGateFlow {
 /** Wires the result gate's surfaces to the machine and the two session-scoped services. */
 export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 	const { machine, runService, reviewService, clock, isChoiceRunnable, sendUserMessage, draftLeftovers } = deps;
+	const eventRecorder = deps.eventRecorder ?? NULL_HANDOFF_EVENT_RECORDER;
+
+	/** Records the action chosen at the gate deciding `iteration`. */
+	function recordAction(action: ResultGateAction, iteration: number): void {
+		eventRecorder.record({ kind: "result-gate-action", action, iteration });
+	}
 
 	/**
 	 * The armed review turn's result, held between `agent_end` and the turn's settle.
@@ -267,13 +284,14 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 	}
 
 	/** Discards the worker's changes, always reporting which paths were left alone. */
-	async function discardChanges(ctx: ExtensionContext): Promise<boolean> {
+	async function discardChanges(ctx: ExtensionContext, iteration: number): Promise<boolean> {
 		const confirmed = await selectOption(
 			(title, options) => ctx.ui.select(title, options),
 			"Discard the worker's changes?",
 			confirmDiscardMenu(),
 		);
 		if (confirmed !== "discard") return false;
+		recordAction("discard", iteration);
 
 		const discarded = await runService.discard(ctx.cwd);
 		if (!discarded.ok) {
@@ -395,6 +413,7 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 				const selected = await openResultGate(ctx, current);
 
 				if (selected === undefined || selected === "dismiss") {
+					recordAction("dismiss", current.iteration);
 					ctx.ui.notify(
 						`Review left pending. The worker's changes are still in the working tree, and \`${HANDOFF_COMMAND}\` reopens this review.`,
 						"info",
@@ -403,6 +422,7 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 				}
 
 				if (selected === "accept") {
+					recordAction("accept", current.iteration);
 					const accepted = reviewService.accept();
 					if (!accepted.ok) {
 						ctx.ui.notify(accepted.error.message, "warning");
@@ -424,6 +444,7 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 								? { slug: reviewing.draft.slug, prompt: reviewing.draft.prompt, items: parsedLeftovers.items }
 								: { slug: reviewing.draft.slug, prompt: reviewing.draft.prompt, reviewText };
 
+					recordAction("accept_leftovers", current.iteration);
 					const accepted = reviewService.accept();
 					if (!accepted.ok) {
 						ctx.ui.notify(accepted.error.message, "warning");
@@ -477,12 +498,13 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 				}
 
 				if (selected === "discard") {
-					const discarded = await discardChanges(ctx);
+					const discarded = await discardChanges(ctx, current.iteration);
 					if (discarded) return;
 					continue;
 				}
 
 				if (selected === "review") {
+					recordAction("review", current.iteration);
 					const armed = reviewService.beginReview();
 					if (!armed.ok) {
 						ctx.ui.notify(armed.error.message, "warning");
@@ -525,6 +547,7 @@ export function createResultGateFlow(deps: ResultGateFlowDeps): ResultGateFlow {
 					continue;
 				}
 
+				recordAction("feedback", current.iteration);
 				const rendered = await runWithMonitor(
 					ctx,
 					{

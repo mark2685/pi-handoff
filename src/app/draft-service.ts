@@ -36,8 +36,11 @@ import {
 	buildLeftoversUserMessage,
 	DRAFTING_SYSTEM_PROMPT,
 } from "../prompts/drafting-prompt.ts";
-import type { HandoffConflict, HandoffMachine } from "./handoff-machine.ts";
+import type { HandoffConflict, HandoffMachine, IdleReason } from "./handoff-machine.ts";
 import type { HandoffStateRecorder } from "./state-recorder.ts";
+
+/** The idle reasons a drafting flow can end with; Accept and Discard end at the result gate instead. */
+export type AbandonReason = Exclude<IdleReason, "accepted" | "discarded">;
 
 /** Structured questions win over prose; the marker remains a safety net for older model behavior. */
 function needsInput(draft: Draft): boolean {
@@ -163,8 +166,11 @@ export interface DraftService {
 	continueWithPrompt(prompt: string): Promise<Result<DraftOutcome, HandoffConflict>>;
 	/** Re-checks a choice against the live registry immediately before Run. */
 	isChoiceRunnable(choice: ModelChoice | undefined): boolean;
-	/** Returns to idle after Cancel, Run externally, or a terminal failure. */
-	abandon(): void;
+	/**
+	 * Returns to idle after Cancel, a failed Run externally, or a terminal failure,
+	 * recording why so a session reader can tell them apart.
+	 */
+	abandon(reason: AbandonReason): void;
 }
 
 /** Wires the drafting flow to the machine, its ports, and the shipped rubric. */
@@ -201,12 +207,13 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	 * `idle` entries within the same second, which reads in the session log as two
 	 * abandoned handoffs. Skipping an already-idle machine keeps one abandonment to
 	 * one record without making either caller responsible for guessing whether the
-	 * other already ran.
+	 * other already ran. Both callers of that race record `cancelled`, so the reason
+	 * does not depend on which one wins.
 	 */
-	function abandon(): void {
+	function abandon(reason: AbandonReason): void {
 		retainedDraft = undefined;
 		if (machine.current().kind === "idle") return;
-		machine.reset();
+		machine.reset(reason);
 		record();
 	}
 
@@ -265,7 +272,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 	async function finishDraft(draft: Draft): Promise<Result<DraftOutcome, HandoffConflict>> {
 		const written = await writePrompt(draft);
 		if (!written.ok) {
-			abandon();
+			abandon("draft-failed");
 			return ok({ kind: "write_failed", failure: written.error });
 		}
 
@@ -350,7 +357,8 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			const drafting = machine.current();
 			const pending = drafting.kind === "drafting" ? drafting.pendingDraft : undefined;
 			if (response.error.kind === "aborted" || pending === undefined) {
-				abandon();
+				// An abort is the user's cancel of the loader; anything else is a failed draft.
+				abandon(response.error.kind === "aborted" ? "cancelled" : "draft-failed");
 				return ok({ kind: "failed", failure: response.error, answersRetained: false });
 			}
 			// Mark and record this separately from the scope update before the call. A later
@@ -373,7 +381,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 		if ("noLeftovers" in parsed.value) {
 			// This envelope is legal only on the transcript-free leftovers path. It has no
 			// prompt to write or approve, so abandon before returning to the command loop.
-			abandon();
+			abandon("no-leftovers");
 			return ok({ kind: "no_leftovers", rationale: parsed.value.rationale });
 		}
 
@@ -400,7 +408,7 @@ export function createDraftService(deps: DraftServiceDeps): DraftService {
 			// hands off a conversation, so it is the only one an empty session can refuse.
 			const session = transcript.read();
 			if (session.kind === "empty") {
-				abandon();
+				abandon("draft-failed");
 				return ok({ kind: "empty_session" });
 			}
 

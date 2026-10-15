@@ -99,7 +99,7 @@ export async function runQuestionsGateFlow(
 		});
 
 		if (selected === undefined || selected === "cancel") {
-			service.abandon();
+			service.abandon("cancelled");
 			ctx.ui.notify(`Handoff cancelled. Prompt left at ${current.promptPath}`, "info");
 			return { kind: "cancelled" };
 		}
